@@ -1,0 +1,33 @@
+# editortweaks patch: vendored copy (see VENDORED.md). Workspace, profiles, examples and the
+# loader-only dependencies (brickworks_impl, min_hook_rs, wchar) are removed; this crate is only
+# built as a library dependency of editortweaks.
+[package]
+name = "brickrust"
+edition = "2021"
+license = "MIT"
+description = "A library which allows Brick Rigs modding"
+readme = "readme.md"
+repository = "https://github.com/KoT3isGood/brickrust"
+# first is brick rigs version
+version = "0.1.1"
+publish = false
+autoexamples = false
+
+[features]
+default=[]
+brmk=["brmk_1_10_7", "brickworks/brmk"]
+
+br_1_11=["br_symbols_1_11"]
+br_1_10_7=["br_symbols_1_10_7"]
+brmk_1_10_7=["brmk_symbols_1_10_7"]
+
+br_symbols_1_11=[]
+br_symbols_1_10_7=[]
+brmk_symbols_1_10_7=[]
+
+[dependencies]
+bitflags= "2.13.1"
+brickrust_macros = { version = "0.0.2", path = "macros" }
+brickworks = { version = "0.1.0", path = "brickworks" }
+inventory = "0.3.24"
+backtrace = "0.3"

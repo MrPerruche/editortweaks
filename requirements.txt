@@ -1,0 +1,2 @@
+# Dev tooling (tools/et.py). Everything except `disasm` runs on the standard library.
+capstone>=5.0

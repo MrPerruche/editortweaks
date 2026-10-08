@@ -1,0 +1,7 @@
+/target/
+/.venv/
+/.local/
+__pycache__/
+*.pyc
+
+CLAUDE.md

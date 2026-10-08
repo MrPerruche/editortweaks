@@ -1,0 +1,16 @@
+[package]
+name = "editortweaks"
+description = "Brick Rigs vehicle editor improvements (brickworks native mod)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lib]
+# Loaded by the brickworks loader via LoadLibrary; it only needs the C exports `mod_info`/`mod_init`.
+crate-type = ["cdylib"]
+
+[dependencies]
+brickrust.workspace = true
+brickworks.workspace = true
+windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_System_Threading", "Win32_UI_WindowsAndMessaging"] }

@@ -1,0 +1,12 @@
+{
+    // `cargo build` needs the project-local MinGW (dlltool + as) on PATH.
+    "terminal.integrated.env.windows": {
+        "PATH": "${workspaceFolder}\\.local\\toolchain\\mingw64\\bin;${env:PATH}"
+    },
+    "python.defaultInterpreterPath": "${workspaceFolder}\\.venv\\Scripts\\python.exe",
+    "rust-analyzer.check.command": "clippy",
+    "files.exclude": {
+        ".local": true,
+        "target": true
+    }
+}

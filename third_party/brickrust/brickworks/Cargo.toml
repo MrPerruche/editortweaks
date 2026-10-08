@@ -1,0 +1,24 @@
+[package]
+name = "brickworks"
+edition = "2021"
+version = "0.1.1"
+license = "MIT"
+description = "Brick Rigs mod loader"
+repository = "https://github.com/KoT3isGood/brickrust"
+publish = false
+
+# editortweaks patch: libloading/min_hook_rs are only used by the loader (brickworks_impl), which
+# isn't vendored. build.rs is removed; loader functions are linked via raw-dylib (src/iface.rs).
+[dependencies]
+brickrust_macros = { version = "0.0.2", path = "../macros" }
+inventory = "0.3.24"
+
+[features]
+brmk=[]
+
+[lib]
+crate-type = ["rlib"]
+
+[package.metadata.docs.rs]
+targets = ["x86_64-pc-windows-gnu"]
+default-target = "x86_64-pc-windows-gnu"

@@ -1,0 +1,5 @@
+# brickrust/brickworks are built and tested against the GNU ABI, so mods use it too.
+# This toolchain ships its own MinGW linker; no separate MinGW install is needed.
+[toolchain]
+channel = "stable-x86_64-pc-windows-gnu"
+components = ["rustfmt", "clippy"]

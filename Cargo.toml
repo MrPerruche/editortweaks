@@ -1,0 +1,25 @@
+[workspace]
+resolver = "3"
+members = ["crates/editortweaks"]
+# Vendored upstream code: used as path dependencies, but not formatted/linted as our own.
+exclude = ["third_party"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "GPL-3.0-or-later"
+publish = false
+
+[workspace.dependencies]
+# Vendored and patched copy of https://github.com/KoT3isGood/brickrust (see VENDORED.md there).
+brickrust = { path = "third_party/brickrust" }
+brickworks = { path = "third_party/brickrust/brickworks" }
+
+[profile.dev]
+# Unwinding out of a mod into game code is undefined behaviour; abort instead (matches brickrust).
+panic = "abort"
+
+[profile.release]
+panic = "abort"
+# Keep symbol info so panic backtraces in brickworks.txt show function names.
+debug = "line-tables-only"

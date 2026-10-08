@@ -1,0 +1,45 @@
+#![allow(non_upper_case_globals)]
+
+use core::mem::transmute;
+use brickrust_macros::sig;
+use brickworks::{patterns::*, set_module_name};
+
+use crate::ue::coreuobject::UObject;
+use crate::ue::fstring::*;
+
+
+set_module_name!(b"statics\0");
+
+#[cfg(not(feature = "brmk"))]
+lookup! {
+    // editortweaks patch: the pattern sits 0x2B bytes INTO the function; upstream had +0x2B,
+    // which lands mid-instruction in the next function (crashed on build 25633865).
+    pub const GetProjectVersion_ptr: unsafe extern "C" fn() -> FString =
+        LookupInfo::Binary(-0x2B, LookupMode::SignatureStart,sig!("48 8b 93 18 01 00 00 48 8b cf 48 81 c2 b8 00 00 00"));
+    pub const IsModdedAsset_ptr: unsafe extern "C" fn( asset: *mut UObject ) -> bool =
+        LookupInfo::Binary(0, LookupMode::SignatureStart, sig!("48 83 ec 58 48 85 c9 0f 84 ?? ?? ?? ??"));
+}
+#[cfg(feature = "brmk")]
+lookup! {
+    pub const GetProjectVersion_ptr: unsafe extern "C" fn() -> FString =
+        LookupInfo::ProcMangled("?GetProjectVersion@UBrickStatics@@SA?AVFString@@XZ");
+    pub const IsModdedAsset_ptr: unsafe extern "C" fn( asset: *mut UObject ) -> bool =
+        LookupInfo::ProcMangled("?IsModdedAsset@UBrickStatics@@SA_NPEBVUObject@@@Z");
+}
+/**
+ * > Returns the project version string
+ * Returns game version, for example `1.11.2`
+ */
+#[inline]
+pub unsafe fn GetProjectVersion() -> FString {
+    (GetProjectVersion_ptr.unwrap())()
+}
+
+/**
+ * > Returns true if the asset is part of a plugin/mod
+ * */
+#[inline]
+pub unsafe fn IsModdedAsset( asset: *mut UObject ) -> bool {
+    (IsModdedAsset_ptr.unwrap())(asset)
+}
+
