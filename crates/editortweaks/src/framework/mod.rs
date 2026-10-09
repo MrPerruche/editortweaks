@@ -2,5 +2,8 @@
 //! logging. Features never talk to the loader or install lifecycle hooks themselves.
 
 pub mod feature;
+pub mod hook;
 pub mod lifecycle;
 pub mod log;
+pub mod patch;
+pub mod sig;

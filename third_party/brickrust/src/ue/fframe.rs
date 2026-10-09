@@ -24,10 +24,11 @@ pub struct FFrame
     pub locals: *mut u8,
     _pad3: u64,
     _pad4: u64,
-    _pad5: u64,
-    _pad6: u64,
-    _pad7: u64,
-    _pad8: u64,
+    // editortweaks patch: `FlowStack` (a `TArray<uint32, TInlineAllocator<8>>`, 0x30 bytes) and
+    // `PreviousFrame` come before `OutParms`, at 0x78 in UE 4.27 (where the game's
+    // `FFrame::StepExplicitProperty` reads it). Upstream's pads put it at 0x60.
+    _flow_stack: [u64; 6],
+    _previous_frame: u64,
     pub out_params: *mut FOutParmRec,
 }
 

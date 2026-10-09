@@ -1,0 +1,72 @@
+//! Our own limits on property values instead of the game's: by default none besides a sanity cap
+//! (`rules::UNLIMITED`), so values typed into sliders aren't limited to the slider's range;
+//! [`rules`] sets limits for specific properties.
+//!
+//! The game limits numeric values in up to three places, each handled by a submodule:
+//! - [`slider`]: the slider widget clamps typed values to its range.
+//! - [`property`]: the numeric property clamps them again when storing them; the rules apply here.
+//! - [`brick_size`]: scalable bricks constrain their size to a per-type range; the rules apply
+//!   here too.
+//!
+//! Rules can depend on other properties of the object (a light's brightness on its direction):
+//! [`dependencies`] applies them again when those change.
+//!
+//! Nothing else re-clamps, so saved vehicles keep their values, also for players without the mod
+//! (until they edit that value). Arrow keys still stop at the slider's ends, and so does dragging
+//! unless `slider_drag` lifts that.
+
+mod brick_size;
+mod dependencies;
+mod limits;
+mod property;
+mod rules;
+mod slider;
+
+use crate::prelude::*;
+
+pub struct PropertyLimits;
+
+impl Feature for PropertyLimits {
+    fn id(&self) -> &'static str {
+        "property_limits"
+    }
+
+    fn on_load(&self) -> LoadResult {
+        // Resolve the required patterns before hooking anything, so a missing one leaves the
+        // game untouched. The brick size and dependency parts are optional: the rest still works
+        // without them.
+        let slider_target = slider::resolve()?;
+        let property_targets = property::resolve()?;
+        let brick_size_target = brick_size::resolve();
+        let dependencies_targets = dependencies::resolve();
+
+        // SAFETY: each target is the start of the function its pattern identifies, and each
+        // submodule's detours have exactly the signatures declared next to those patterns.
+        unsafe {
+            slider::install(slider_target)?;
+            property::install(property_targets)?;
+            match brick_size_target {
+                Ok(target) => brick_size::install(target)?,
+                Err(reason) => log!("brick sizes keep the game's limits: {reason}"),
+            }
+            match dependencies_targets {
+                Ok(targets) => dependencies::install(targets)?,
+                Err(reason) => log!(
+                    "limits depending on other properties only apply when their value is edited: {reason}"
+                ),
+            }
+        }
+        Ok(())
+    }
+
+    fn on_engine_init(&self) {
+        slider::on_engine_init();
+        brick_size::on_engine_init();
+    }
+}
+
+/// Whether sliders keep values set outside of their range (typed, or dragged by `slider_drag`).
+/// Known from engine init on.
+pub(crate) fn keeps_slider_values() -> bool {
+    slider::active()
+}

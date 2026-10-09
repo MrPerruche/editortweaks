@@ -165,6 +165,63 @@ def cmd_sigcheck(args: argparse.Namespace) -> None:
         raise SystemExit(1)
 
 
+def cmd_find(args: argparse.Namespace) -> None:
+    image = PeImage(Path(args.file) if args.file else paths.find_game().exe)
+    signature = sigs.Signature("pattern", 0, "SignatureStart", args.pattern, "cli")
+    exports = {rva: name for name, rva in image.exports().items()}
+    matches = [m.start() for m in signature.regex().finditer(image.image)]
+    for rva in matches[: args.limit]:
+        start = image.function_containing(rva)
+        where = f"in function 0x{start:X} +0x{rva - start:X}" if start is not None else "(no .pdata entry)"
+        name = f"  {exports[start]}" if start in exports else ""
+        print(f"0x{rva:08X} {image.section_of(rva):6} {where}{name}")
+    print(f"{len(matches)} match(es)")
+
+
+def cmd_xrefs(args: argparse.Namespace) -> None:
+    """Direct calls/jumps (E8/E9 rel32) to an RVA, with the calling function."""
+    import re
+    import struct
+
+    image = PeImage(Path(args.file) if args.file else paths.find_game().exe)
+    exports = {rva: name for name, rva in image.exports().items()}
+    target = int(args.rva, 16)
+    found = 0
+    for section in image.sections:
+        if section.name != ".text":
+            continue
+        data = image.image[section.rva : section.rva + section.size]
+        for m in re.finditer(rb"[\xE8\xE9]", data):
+            at = section.rva + m.start()
+            if at + 5 > section.rva + section.size:
+                break
+            if at + 5 + struct.unpack_from("<i", image.image, at + 1)[0] != target:
+                continue
+            start = image.function_containing(at)
+            name = exports.get(start, "") if start is not None else ""
+            kind = "call" if image.image[at] == 0xE8 else "jmp "
+            where = f"0x{start:X}+0x{at - start:X}" if start is not None else "?"
+            print(f"{kind} at 0x{at:08X}  in {where}  {name}")
+            found += 1
+    print(f"{found} reference(s)")
+
+
+def cmd_vtable(args: argparse.Namespace) -> None:
+    """Entries of a vtable (array of absolute code pointers) at an RVA."""
+    import struct
+
+    image = PeImage(Path(args.file) if args.file else paths.find_game().exe)
+    exports = {rva: name for name, rva in image.exports().items()}
+    rva = int(args.rva, 16)
+    for i in range(args.count):
+        pointer = struct.unpack_from("<Q", image.image, rva + 8 * i)[0]
+        target = pointer - image.image_base
+        if not 0 <= target < len(image.image) or not image.section_of(target).startswith(".text"):
+            print(f"  [{i:2}] +0x{8 * i:03X}  0x{pointer:X} (not code: end of vtable?)")
+            break
+        print(f"  [{i:2}] +0x{8 * i:03X}  0x{target:08X}  {exports.get(target, '')}")
+
+
 def cmd_exports(args: argparse.Namespace) -> None:
     image = PeImage(Path(args.dll))
     exports = image.exports()
@@ -176,17 +233,23 @@ def cmd_exports(args: argparse.Namespace) -> None:
 
 def cmd_disasm(args: argparse.Namespace) -> None:
     try:
-        import capstone
+        from etlib.disasm import Disassembler
     except ImportError:
         raise SystemExit("capstone missing: run this with .venv\\Scripts\\python.exe (see et.py setup)")
     image = PeImage(Path(args.file) if args.file else paths.find_game().exe)
-    rva = int(args.rva, 16)
-    md = capstone.Cs(capstone.CS_ARCH_X86, capstone.CS_MODE_64)
-    for count, insn in enumerate(md.disasm(image.image[rva : rva + args.count * 15], rva)):
-        if count >= args.count:
-            break
-        raw = insn.bytes.hex(" ")
-        print(f"0x{insn.address:08X}  {raw:<32} {insn.mnemonic} {insn.op_str}")
+    disassembler = Disassembler(image)
+    target = args.target
+    if not all(c in "0123456789abcdefABCDEF" for c in target.removeprefix("0x")):
+        # An export name (or unique substring of one), e.g. "SetValueInternal@UBrickSliderWidget".
+        matches = {name: rva for name, rva in image.exports().items() if target in name}
+        if len(matches) != 1:
+            raise SystemExit(f"{len(matches)} exports match {target!r}: {', '.join(list(matches)[:10])}")
+        (name, rva), = matches.items()
+        print(name)
+    else:
+        rva = int(target, 16)
+    for line in disassembler.lines(rva, args.count):
+        print(line)
 
 
 # --- CLI ------------------------------------------------------------------------------------
@@ -225,13 +288,30 @@ def main() -> None:
     p.add_argument("--exe", help="exe to check (default: the installed game)")
     p.set_defaults(func=cmd_sigcheck)
 
+    p = sub.add_parser("find", help="search a byte pattern; shows each match's enclosing function")
+    p.add_argument("pattern", help='hex bytes, ?? for wildcards, e.g. "48 8b ?? 0f 2f"')
+    p.add_argument("--file", help="PE file (default: the game exe)")
+    p.add_argument("--limit", type=int, default=20)
+    p.set_defaults(func=cmd_find)
+
+    p = sub.add_parser("xrefs", help="direct calls/jumps to an RVA, with their functions")
+    p.add_argument("rva", help="hex RVA of the called function")
+    p.add_argument("--file", help="PE file (default: the game exe)")
+    p.set_defaults(func=cmd_xrefs)
+
+    p = sub.add_parser("vtable", help="list the function pointers of a vtable")
+    p.add_argument("rva", help="hex RVA of the vtable")
+    p.add_argument("-n", "--count", type=int, default=40)
+    p.add_argument("--file", help="PE file (default: the game exe)")
+    p.set_defaults(func=cmd_vtable)
+
     p = sub.add_parser("exports", help="list a DLL's exports (e.g. BRMK modules)")
     p.add_argument("dll")
     p.add_argument("filter", nargs="?", default="")
     p.set_defaults(func=cmd_exports)
 
-    p = sub.add_parser("disasm", help="disassemble at an RVA (needs the venv)")
-    p.add_argument("rva", help="hex RVA, e.g. 136C0D0")
+    p = sub.add_parser("disasm", help="annotated disassembly at an RVA or export (needs the venv)")
+    p.add_argument("target", help="hex RVA (e.g. 136C0D0) or a unique substring of an export name")
     p.add_argument("-n", "--count", type=int, default=20, help="instructions")
     p.add_argument("--file", help="PE file (default: the game exe)")
     p.set_defaults(func=cmd_disasm)

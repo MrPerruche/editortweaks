@@ -3,7 +3,21 @@
 
 use crate::framework::feature::Feature;
 
+mod camera_speed;
 mod hello;
+mod move_slowdown;
+mod precise_sliders;
+mod property_limits;
+mod slider_drag;
+mod slider_formulas;
 
 /// All features, in load order.
-pub static ALL: &[&dyn Feature] = &[&hello::Hello];
+pub static ALL: &[&dyn Feature] = &[
+    &hello::Hello,
+    &property_limits::PropertyLimits,
+    &precise_sliders::PreciseSliders,
+    &slider_formulas::SliderFormulas,
+    &slider_drag::SliderDrag,
+    &camera_speed::CameraSpeed,
+    &move_slowdown::MoveSlowdown,
+];

@@ -21,6 +21,17 @@ pub struct FFieldVariant
     b_is_uobject: bool,
 }
 
+// editortweaks patch: read access to the owner; upstream keeps both fields private.
+impl FFieldVariant
+{
+    /// The owning object (the class or struct declaring a property), or null if the owner is
+    /// another field.
+    pub fn as_uobject(&self) -> *mut UObjectBase
+    {
+        if self.b_is_uobject { unsafe { self.container.object } } else { core::ptr::null_mut() }
+    }
+}
+
 impl fmt::Debug for FFieldVariant
 {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {

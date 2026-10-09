@@ -28,6 +28,10 @@ Every patch is marked with an `editortweaks patch` comment.
 5. `src/lib.rs`, `brickworks/src/lib.rs`, `macros/src/lib.rs`: `#![allow(warnings)]`.
 6. `src/br/statics.rs`: `GetProjectVersion_ptr` offset `0x2B` -> `-0x2B`. The pattern is inside
    the function, 0x2B bytes after its start; the upstream value jumped into the next function.
+7. `src/ue/ffield.rs`: `FFieldVariant::as_uobject()`, read access to a field's owner (upstream
+   keeps both fields private).
+8. `src/ue/fframe.rs`: `FFrame::out_params` moved from 0x60 to 0x78 (UE 4.27's layout, checked
+   against the game's `FFrame::StepExplicitProperty`); upstream's `set_output` wrote nowhere useful.
 
 ## Updating
 

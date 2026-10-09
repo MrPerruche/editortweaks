@@ -6,6 +6,7 @@
 
 mod features;
 mod framework;
+mod game;
 mod platform;
 mod prelude;
 
