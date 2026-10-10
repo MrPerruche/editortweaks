@@ -3,6 +3,8 @@
 //! instead of the property's own range, so the rest of `ClampValue` (axis locks) still applies; then
 //! the rule's adjustment, if any, runs on the result. The panel's sliders still show the property's
 //! own range: the panel asks for it outside of `ClampValue`.
+//!
+//! A value from a slider drag also stops at its rule's `drag_min` here ([`stop_drag`]).
 
 use core::ffi::c_void;
 use std::cell::RefCell;
@@ -110,6 +112,8 @@ unsafe extern "C" fn clamp_value_detour(
     if let Some(Resolved { edit, limits, rule }) = clamping.and_then(|c| c.resolved) {
         // SAFETY: `out` is the caller's value buffer, just filled in by the original.
         let value = unsafe { &mut (*out).data };
+        // SAFETY: the arguments of this ClampValue call.
+        unsafe { stop_drag(property, container, rule, &limits, input, value) };
         limits::adjust(&edit, &limits, rule, value);
     }
     // A drag stopped at the limits carries on from the value kept (`slider_drag`).
@@ -169,6 +173,43 @@ unsafe fn answer(clamping: &mut Clamping, range: &mut NumericRange) {
         data: limits.max,
         num_used: 3,
     };
+}
+
+/// Stops a slider drag at the rule's `drag_min`: raises the components the drag moves that are
+/// below it. Those are the ones holding the value the slider sends that this edit changes, so a
+/// component the drag doesn't move keeps its value: another axis, or one the panel copied from the
+/// first of several edited objects.
+///
+/// # Safety
+/// `property` and `container` must be the arguments of the `ClampValue` call in progress, `input`
+/// the value it's storing and `value` the clamped one.
+unsafe fn stop_drag(
+    property: *const c_void,
+    container: *const c_void,
+    rule: Option<&Rule>,
+    limits: &Limits,
+    input: &NumericValue,
+    value: &mut [f32; 3],
+) {
+    let Some(drag_min) = rule.and_then(|rule| rule.drag_min) else {
+        return;
+    };
+    let Some(dragged) = super::slider::dragged_value() else {
+        return; // typed, or not from a slider
+    };
+    // SAFETY: per the contract; ClampValue runs before the value is stored, so this is the one
+    // the object holds before the edit.
+    let Some(current) = (unsafe { numeric_property::current_value(property, container) }) else {
+        return;
+    };
+    let used = usize::from(input.num_used).min(3);
+    let components = value.iter_mut().zip(input.data).zip(current.data);
+    for (((component, requested), before), max) in components.zip(limits.max).take(used) {
+        let moved = requested == dragged && requested != before;
+        if moved && *component < drag_min {
+            *component = drag_min.min(max);
+        }
+    }
 }
 
 fn all_finite(value: &NumericValue) -> bool {

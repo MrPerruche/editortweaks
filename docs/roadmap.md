@@ -22,8 +22,22 @@ likely approach are first guesses, to be revised as the editor gets reverse engi
   slider's; both in the shown unit.
 - **Camera speed**: exponential speed steps. Done 2026-10-09 as `features/camera_speed`
   (slowest, fastest and step count in its constants).
-- **Slower moves**: Ctrl (1/10) and Alt (1/100) slow down moving bricks with the mouse. Done
-  2026-10-09 as `features/move_slowdown` (factors in its constants).
+- **Slower moves**: Ctrl slows down moving bricks and turning the camera with the mouse, Shift
+  moving bricks by a gizmo handle. Done 2026-10-09 as `features/move_slowdown` (factors in its
+  constants). Shift replaced Alt (2026-10-10, Alt is the resize tool's key); it leaves the camera
+  and G/dragged moves alone (there it's the game's "move perpendicular").
+- **Rebindable keys**: the mod's keys in the game's own input settings. Done 2026-10-10 as
+  `features/keybinds`: the editor's category gets an "Editor tweaks" section (resize bricks, snap
+  resizing, slow moves, slow gizmo moves, keep dragging sliders), saved with the game's keys. Not
+  rebindable: Shift/Ctrl during an Alt-drag (the game's own slider keys) and the resize tool's mouse
+  buttons (the game's `Select` / `MoveCamera`, rebindable there).
+- **Precise moves**: no more 89.99999° and places a hair off after moving or turning groups of
+  bricks. Started 2026-10-10 as `features/precise_moves`: every move is computed again in `f64`
+  from the game's own inputs (stored places, the move's drag and turn as the game snaps them), only
+  the result rounded to `f32`; no rounding to steps (an earlier version snapped to 0.01°/0.001 cm,
+  dropped). The fold when a gizmo handle is released (`ApplyAccumulatedInput`) is kept in `f64`
+  too (the first test still gave 89.99999° without it). Not yet: mirror mode counterparts (they
+  stay as the game computes them) and mirroring a selection (`MirrorBrickEditorObject`).
 - **More view modes**: started 2026-10-10 as `features/view_modes` (Z or the panel's list; colors
   in each mode's constants):
   - "Mirror": bricks with a mirror-mode counterpart green, their own mirror image (on the plane)
@@ -36,8 +50,18 @@ likely approach are first guesses, to be revised as the editor gets reverse engi
 - **Drag to select**: box selection.
 - **Advanced resizing**:
   - Scale gizmo.
-  - Push/extend the edges of scalable bricks.
-  - Snap scalable brick faces and edges to other bricks' faces and edges.
+  - Push/extend the edges of scalable bricks. Started 2026-10-10 as `features/brick_resize`: in
+    the editor (not moving), Alt shows the box of the brick under the mouse and the face, edge or
+    corner the mouse is on (also just outside the box; selected bricks first, then the one in
+    front); Alt + drag resizes the brick by it (the opposite part stays; a corner keeps
+    proportions; the camera stays still), one undo step, mirror counterpart along.
+  - Snap scalable brick faces and edges to other bricks' faces and edges: Ctrl while dragging
+    (onto a face: proportions kept, to its plane; onto an edge or corner: to the point under the
+    mouse); right clicks look deeper along the mouse for bricks behind. Next: the same while moving
+    bricks (see `docs/re/editor-input.md`).
+  - The tool computes in `f64` in the vehicle's space from stored values (a scalable brick's box
+    from its size), rounding only the results to `f32`: its first version worked in the world in
+    `f32` and gave sizes like 110.000545 cm for 110.
 - **Reference previews**: import 3D models and images as non-brick previews.
   - View mode showing the distance between the model and the bricks; opacity setting.
 

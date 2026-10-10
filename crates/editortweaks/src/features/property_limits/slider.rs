@@ -4,6 +4,9 @@
 //! Values only get the widest limit here (±`SAFE_MAX`): the property they're stored into applies
 //! the rules (`property`). Dragging and arrow keys clamp to the range themselves before calling it
 //! (`slider_drag` can remove that from dragging).
+//!
+//! While a drag (or an arrow key) sets a slider's value, [`dragged_value`] tells the property what
+//! that value is, for rules stopping drags earlier than typed values (`Rule::drag_min`).
 
 use core::ffi::c_void;
 use std::cell::Cell;
@@ -11,12 +14,19 @@ use std::sync::OnceLock;
 
 use super::limits::SAFE_MAX;
 use crate::framework::hook;
-use crate::game::slider::{self, RangeFields, SetValueInternalFn};
+use crate::game::slider::{self, RangeFields, SetValueInternalFn, ValueFields};
 use crate::prelude::*;
 
 static ORIGINAL: OnceLock<SetValueInternalFn> = OnceLock::new();
 /// Set once reflection is available; until then (or if it fails) nothing changes.
 static RANGE: OnceLock<RangeFields> = OnceLock::new();
+/// Set once reflection is available; until then (or if it fails) drags go as far as typed values.
+static VALUE: OnceLock<ValueFields> = OnceLock::new();
+
+thread_local! {
+    /// The slider whose value a drag or an arrow key is setting on this thread, if any.
+    static DRAGGED: Cell<Option<*mut c_void>> = const { Cell::new(None) };
+}
 
 pub(super) fn resolve() -> Result<*const u8, String> {
     slider::SET_VALUE_INTERNAL.resolve()
@@ -48,6 +58,12 @@ pub(super) fn on_engine_init() {
         }
         Err(reason) => log!("inactive: {reason}"),
     }
+    match slider::value_fields() {
+        Ok(fields) => {
+            let _ = VALUE.set(fields);
+        }
+        Err(reason) => log!("drags go as far as typed values: {reason}"),
+    }
 }
 
 /// Whether slider values are being unclamped (the other parts only matter if they are).
@@ -55,7 +71,37 @@ pub(super) fn active() -> bool {
     RANGE.get().is_some()
 }
 
+/// The value a slider drag or arrow key is setting right now (on this thread), as the slider sends
+/// it on (snapped); `None` while setting a typed value, or anything not from a slider.
+pub(super) fn dragged_value() -> Option<f32> {
+    let slider = DRAGGED.get()?;
+    let fields = VALUE.get()?;
+    // SAFETY: the slider whose SetValueInternal runs on this thread, so alive; it stores the new
+    // value before sending it on.
+    Some(unsafe { fields.value(slider) })
+}
+
 unsafe extern "C" fn detour(
+    this: *mut c_void,
+    value: f32,
+    clamp_and_snap: usize,
+    broadcast: usize,
+    event_type: usize,
+) -> u8 {
+    // Drags and arrow keys send interactive changes; typed values and mouse releases commit.
+    let dragged = (event_type as u8 == slider::INTERACTIVE).then_some(this);
+    let previous = DRAGGED.replace(dragged);
+    // SAFETY: the caller's arguments, unchanged.
+    let result = unsafe { set_value(this, value, clamp_and_snap, broadcast, event_type) };
+    DRAGGED.set(previous);
+    result
+}
+
+/// `SetValueInternal`, keeping values outside of the slider's range.
+///
+/// # Safety
+/// The arguments of a `SetValueInternal` call.
+unsafe fn set_value(
     this: *mut c_void,
     value: f32,
     clamp_and_snap: usize,

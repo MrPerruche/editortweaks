@@ -12,6 +12,7 @@
 //! - `.min(x)` / `.max(x)`: the same limit for every component;
 //! - `.min_each([x, y, z])` / `.max_each([x, y, z])`: one limit per component;
 //! - `.vanilla_min()` / `.vanilla_max()` / `.vanilla()`: keep the game's limits;
+//! - `.drag_min(x)`: dragging a slider stops at `x`, above `.min`: lower values can only be typed;
 //! - `.adjust(function)`: run `function` on each new value, for limits depending on several
 //!   components or on other properties (see `brick_size` below);
 //! - `.depends_on(&["Other"])`: for an `adjust` reading other properties (floats and vectors
@@ -38,10 +39,12 @@ pub const UNLIMITED: f32 = 1.0e15;
 pub const DEFAULT: Rule = rule("", "");
 
 pub const RULES: &[Rule] = &[
-    // Brick size (cm): never below the game's minimum; no fixed maximum besides a sanity cap, but a
-    // budget of connector points (see `brick_size`), which depends on the connector spacing.
+    // Brick size (cm): no fixed limits besides a sanity cap either way, but a budget of connector
+    // points (see `brick_size`), which depends on the connector spacing. Dragging stops at 0:
+    // negative sizes (the brick mirrored along that axis, still with connectors) can only be typed.
     rule("ScalableBrick", "BrickSize")
-        .min(0.0)
+        .min(-MAX_BRICK_SIZE)
+        .drag_min(0.0)
         .max(MAX_BRICK_SIZE)
         .adjust(brick_size)
         .depends_on(&["ConnectorSpacing"]),
@@ -68,7 +71,7 @@ fn light_brightness(edit: &Edit, brightness: &mut [f32; 3]) {
     }
 }
 
-/// Largest brick size per axis, in cm: a million kilometres.
+/// Largest brick size per axis either way, in cm: a million kilometres.
 const MAX_BRICK_SIZE: f32 = 1.0e11;
 
 /// Most connector points one brick may have. Bricks in the billions make vehicles lag when they
@@ -79,7 +82,8 @@ const MAX_CONNECTOR_POINTS: f64 = 50.0e6;
 const BRICK_GRID: f32 = 10.0;
 
 /// Keeps a brick within [`MAX_CONNECTOR_POINTS`]: if its new size has more, the axes that grew
-/// shrink together until it fits (all axes if none grew).
+/// shrink together until it fits (all axes if none grew). Negative sizes count by their magnitude,
+/// and keep their sign while shrinking.
 fn brick_size(edit: &Edit, size: &mut [f32; 3]) {
     // Faces without connectors don't count. If the spacing can't be read, assume the densest.
     let spacing = edit
@@ -91,7 +95,7 @@ fn brick_size(edit: &Edit, size: &mut [f32; 3]) {
 
     // While a new size is being stored, the property still holds the previous one.
     let before = edit.read::<[f32; 3]>("BrickSize").unwrap_or(*size);
-    let mut grown: [bool; 3] = core::array::from_fn(|axis| size[axis] > before[axis]);
+    let mut grown: [bool; 3] = core::array::from_fn(|axis| size[axis].abs() > before[axis].abs());
     if !grown.contains(&true) {
         grown = [true; 3];
     }
@@ -99,8 +103,8 @@ fn brick_size(edit: &Edit, size: &mut [f32; 3]) {
     let scaled = |scale: f32| -> [f32; 3] {
         core::array::from_fn(|axis| {
             if grown[axis] {
-                let snapped = (size[axis] * scale / BRICK_GRID).floor() * BRICK_GRID;
-                snapped.max(min[axis])
+                let snapped = (size[axis].abs() * scale / BRICK_GRID).floor() * BRICK_GRID;
+                snapped.max(min[axis]).copysign(size[axis])
             } else {
                 size[axis]
             }

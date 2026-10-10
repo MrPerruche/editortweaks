@@ -7,6 +7,9 @@ Signatures are read straight from the Rust sources, so there's a single source o
   match in a code section, mapped to its function's start through .pdata, like `framework::sig`.
 - our `StringRefSig { name: "...", text: "..." }` declarations (mode "StringRef"): the function(s)
   loading the address of that UTF-16 string with `lea r64, [rip + disp32]`; there must be one.
+- our `CodeShape { name: "...", shape: "..." }` declarations (mode "Shape"): a leaf function's
+  whole code, which the mod finds through a vtable at run time; at least one function (at a
+  function boundary) must have it. Several identical ones are fine.
 """
 
 from __future__ import annotations
@@ -30,6 +33,10 @@ _FUNCTION_SIG = re.compile(
 )
 _STRING_REF_SIG = re.compile(
     r'StringRefSig\s*\{\s*name:\s*"(?P<name>[^"]+)",.*?text:\s*"(?P<text>[^"]+)"',
+    re.S,
+)
+_CODE_SHAPE = re.compile(
+    r'CodeShape\s*\{\s*name:\s*"(?P<name>[^"]+)",.*?shape:\s*"(?P<pattern>[^"]+)"',
     re.S,
 )
 # `lea r64, [rip + disp32]`: REX.W (48 or 4C), 8D, ModRM with mod 00 and r/m 101.
@@ -63,7 +70,7 @@ class Result:
             return "MISSING"
         if not self.looks_like_function:
             return "NOT-FUNC"
-        if len(self.targets) == 1:
+        if len(self.targets) == 1 or self.signature.mode == "Shape":
             return "OK"
         return "SAME" if len(set(self.targets)) == 1 else "AMBIGUOUS"
 
@@ -88,6 +95,8 @@ def find_signatures(roots: list[Path]) -> list[Signature]:
             for m in _STRING_REF_SIG.finditer(text):
                 # The pattern holds the string itself.
                 signatures.append(Signature(m["name"], 0, "StringRef", m["text"], source(m)))
+            for m in _CODE_SHAPE.finditer(text):
+                signatures.append(Signature(m["name"], 0, "Shape", m["pattern"], source(m)))
     return signatures
 
 
@@ -113,6 +122,14 @@ def string_references(image: PeImage, text: str) -> list[int]:
 def resolve(image: PeImage, signature: Signature) -> list[int]:
     if signature.mode == "StringRef":
         return string_references(image, signature.pattern)
+    if signature.mode == "Shape":
+        targets = []
+        for section in (s for s in image.sections if s.executable):
+            code = image.image[section.rva : section.rva + section.size]
+            for match in signature.regex().finditer(code):
+                if is_function_start(image, section.rva + match.start()):
+                    targets.append(section.rva + match.start())
+        return targets
     if signature.mode == "Function":
         targets = []
         for section in (s for s in image.sections if s.executable):

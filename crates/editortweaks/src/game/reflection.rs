@@ -5,10 +5,14 @@
 use core::ffi::c_void;
 use core::marker::PhantomData;
 
-use brickrust::ue::coreuobject::{GObjects, UObjectBase, UObjectVTable};
+use brickrust::ue::coreuobject::{
+    EObjectFlags, FStaticConstructObjectParameters, GObjects, StaticConstructObject_Internal,
+    UObjectBase, UObjectVTable,
+};
 use brickrust::ue::fframe::FFrame;
 use brickrust::ue::fname::FName;
 use brickrust::ue::fproperty::FProperty;
+use brickrust::ue::tarray::TArray;
 use brickrust::ue::uclass::{UClass, UFunction, UStruct};
 
 use crate::framework::sig;
@@ -197,6 +201,157 @@ pub unsafe fn struct_type(property: *const FProperty) -> *const UStruct {
     }
 }
 
+/// The property of an `ArrayProperty`'s elements, or null for other property types.
+///
+/// # Safety
+/// `property` must be a live property record.
+pub unsafe fn array_inner(property: *const FProperty) -> *const FProperty {
+    // SAFETY: per the contract; UE 4.27's `FArrayProperty` adds `FProperty* Inner` right after the
+    // `FProperty` fields, like `FStructProperty` its struct (see `struct_type`).
+    unsafe {
+        if !is_kind(property, "ArrayProperty") {
+            return core::ptr::null();
+        }
+        *property.add(1).cast::<*const FProperty>()
+    }
+}
+
+/// The size of one `ustruct` (as `UStruct::GetStructureSize`): its properties' size rounded up to
+/// its alignment, also the distance between array elements.
+///
+/// # Safety
+/// `ustruct` must be a live, linked struct.
+pub unsafe fn struct_size(ustruct: *const UStruct) -> usize {
+    // SAFETY: per the contract.
+    let (size, alignment) = unsafe { ((*ustruct).properties_size, (*ustruct).min_alignment) };
+    (size as usize).next_multiple_of(usize::try_from(alignment).unwrap_or(1).max(1))
+}
+
+/// A reflected `bool` field (`BoolProperty`): a C++ `bool`, or one bit of a bitfield like
+/// `uint8 bShift : 1`.
+#[derive(Clone, Copy, Debug)]
+pub struct BoolField {
+    /// Offset of the byte holding it.
+    offset: usize,
+    /// The bits set for `true` (`ByteMask`).
+    set: u8,
+    /// The bits it covers (`FieldMask`).
+    covered: u8,
+}
+
+/// The `BoolProperty` `name` of `ustruct`; see [`struct_field`].
+pub fn bool_field(ustruct: *const UStruct, name: &'static str) -> Result<BoolField, String> {
+    let property = struct_field(ustruct, name, "BoolProperty", 1)?;
+    // SAFETY: a live BoolProperty record. UE 4.27's `FBoolProperty` adds `FieldSize`, `ByteOffset`,
+    // `ByteMask` and `FieldMask` (a byte each) right after the `FProperty` fields.
+    let ([_, byte_offset, set, covered], offset) = unsafe {
+        (
+            property.add(1).cast::<[u8; 4]>().read(),
+            (*property).offset_internal,
+        )
+    };
+    if set == 0 || covered == 0 {
+        return Err(format!("field '{name}': unexpected bool layout"));
+    }
+    Ok(BoolField {
+        offset: offset as usize + usize::from(byte_offset),
+        set,
+        covered,
+    })
+}
+
+impl BoolField {
+    /// The field's value in the struct at `base`.
+    ///
+    /// # Safety
+    /// `base` must point to a live instance of the field's struct.
+    pub unsafe fn get(&self, base: *const u8) -> bool {
+        // SAFETY: per the contract; the byte lies within the struct.
+        unsafe { base.add(self.offset).read() & self.covered != 0 }
+    }
+
+    /// Sets the field in the struct at `base`, keeping the bitfield's other bits, like
+    /// `FBoolProperty::SetPropertyValue`.
+    ///
+    /// # Safety
+    /// `base` must point to a live instance of the field's struct.
+    pub unsafe fn set(&self, base: *mut u8, value: bool) {
+        // SAFETY: per the contract; the byte lies within the struct.
+        unsafe {
+            let byte = base.add(self.offset);
+            let bits = if value { self.set } else { 0 };
+            byte.write((byte.read() & !self.covered) | bits);
+        }
+    }
+}
+
+/// One entry of `UEnum::Names` (`TPair<FName, int64>`).
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct EnumEntry {
+    pub name: FName,
+    pub value: i64,
+}
+
+/// Offset of `UEnum::Names` (a `TArray<TPair<FName, int64>>`) in UE 4.27 shipping builds: after
+/// `UField` (0x30 bytes) and `CppType` (an `FString`). The game's `CycleViewMode` (0xCD48B0) reads
+/// it there.
+pub const ENUM_NAMES: usize = 0x40;
+
+/// The value of the entry `entry` (its full name, e.g. `"EInputRowType::PressReleaseAction"`) of
+/// the reflected enum `name`.
+pub fn enum_value(name: &'static str, entry: &str) -> Result<i64, String> {
+    let found = find_object(name, "Enum").ok_or(format!("enum {name} not found"))?;
+    // SAFETY: a live UEnum (checked by class name), whose entries are live names; read only.
+    unsafe {
+        let names = &*found
+            .cast::<u8>()
+            .add(ENUM_NAMES)
+            .cast::<TArray<EnumEntry>>();
+        let count = usize::try_from(names.num)
+            .ok()
+            .filter(|&count| count <= 1024 && (count == 0 || !names.data.is_null()))
+            .ok_or(format!("{name}: unexpected entries"))?;
+        core::slice::from_raw_parts(names.data, count)
+            .iter()
+            .find(|found| name_is(&found.name, entry))
+            .map(|found| found.value)
+            .ok_or(format!("{name}: no entry {entry}"))
+    }
+}
+
+/// A new object of `class` called `name` inside `outer` (`StaticConstructObject_Internal`, what
+/// `NewObject` calls), with `flags` (`EObjectFlags`); null if the engine made none.
+///
+/// # Safety
+/// `class` must be a live class that can be instantiated, `outer` a live object, and `name` unused
+/// inside `outer`. Game thread only.
+pub unsafe fn new_object(
+    class: *const UClass,
+    outer: *mut UObjectBase,
+    name: FName,
+    flags: EObjectFlags,
+) -> *mut UObjectBase {
+    let mut parameters = FStaticConstructObjectParameters {
+        class,
+        outer,
+        name,
+        set_flags: flags,
+        internal_flags: 0,
+        copy_transients: false,
+        archetype: false,
+        template: core::ptr::null(),
+        instance_graph: core::ptr::null(),
+        external_package: core::ptr::null(),
+    };
+    // SAFETY: per the contract; the loader resolved the lookup at start (brickrust's own hooks
+    // depend on it), and it's read by value, without a reference to the `static mut`.
+    unsafe {
+        let construct = StaticConstructObject_Internal.typed;
+        construct(&mut parameters)
+    }
+}
+
 /// The class or struct that declares `property`, or null if the property is part of another field
 /// (e.g. the elements of an array).
 ///
@@ -233,6 +388,18 @@ pub unsafe fn class_of(object: *const c_void) -> *const UStruct {
     }
 }
 
+/// The default object of `class` (its CDO), if it has one of its own.
+///
+/// # Safety
+/// `class` must be a live class.
+pub unsafe fn default_object(class: *const UClass) -> Option<*mut UObjectBase> {
+    // SAFETY: per the contract; the default object is null or a live object.
+    unsafe {
+        let defaults = (*class).ClassDefaultObject;
+        (!defaults.is_null() && class_of(defaults.cast()) == class.cast()).then_some(defaults)
+    }
+}
+
 /// The name of a class or struct, e.g. `ScalableBrick`.
 ///
 /// # Safety
@@ -253,6 +420,68 @@ pub unsafe fn with_parents(ustruct: *const UStruct) -> impl Iterator<Item = *con
         let parent = unsafe { (*current).super_struct };
         (!parent.is_null()).then_some(parent)
     })
+}
+
+/// `FImplementedInterface`: an interface a class implements, and where its objects keep the
+/// interface's vtable pointer.
+#[repr(C)]
+struct ImplementedInterface {
+    class: *const UStruct,
+    pointer_offset: i32,
+    implemented_by_k2: bool,
+}
+
+/// Offset of `UClass::Interfaces` (a `TArray<FImplementedInterface>`) in UE 4.27 shipping builds:
+/// after the class default object (0x118, see brickrust's `UClass`), the sparse class data, the
+/// function maps (`FuncMap`, `SuperFuncMap`, 0x50 bytes each) and their lock.
+const CLASS_INTERFACES: usize = 0x1D8;
+
+/// The most interfaces a class plausibly lists itself, to tell a misplaced array.
+const MAX_INTERFACES: usize = 64;
+
+/// Where objects of `class` keep the C++ interface `interface` (e.g. `"BrickPropertyInterface"`):
+/// its offset in them, as `UObject::GetInterfaceAddress` finds it (each class lists the interfaces
+/// it adds; parents are searched too).
+///
+/// # Safety
+/// `class` must be a live class.
+pub unsafe fn interface_offset(class: *const UStruct, interface: &str) -> Option<usize> {
+    // SAFETY: per the contract; the arrays are checked to look like `TArray`s of interfaces
+    // before their entries are read, and each entry's class is a live class.
+    unsafe {
+        // The class's fields up to its default object are where brickrust expects them, so the
+        // ones after them (the interfaces) are where this expects them.
+        default_object(class.cast())?;
+        // An interface's vtable pointer lies within the object.
+        let object_size = usize::try_from((*class).properties_size).ok()?;
+        for class in with_parents(class) {
+            let array = &*class
+                .cast::<u8>()
+                .add(CLASS_INTERFACES)
+                .cast::<TArray<ImplementedInterface>>();
+            let count = usize::try_from(array.num).ok()?;
+            if count > MAX_INTERFACES || array.num > array.max {
+                return None;
+            }
+            if count == 0 {
+                continue;
+            }
+            if array.data.is_null() || !array.data.is_aligned() {
+                return None;
+            }
+            for entry in core::slice::from_raw_parts(array.data, count) {
+                if entry.class.is_null() || !is_class(entry.class) {
+                    return None;
+                }
+                if name_is(struct_name(entry.class), interface) {
+                    return usize::try_from(entry.pointer_offset)
+                        .ok()
+                        .filter(|offset| offset + size_of::<usize>() <= object_size);
+                }
+            }
+        }
+        None
+    }
 }
 
 /// The reflected function (`UFUNCTION`) `name` of `class` or its parents.
@@ -298,12 +527,26 @@ pub fn native_thunk(function: *const UFunction) -> Result<*const u8, String> {
     Ok(thunk)
 }
 
+/// The offset of the parameter `name` of `function` (called `function_name` in errors), checked to
+/// be a `kind` property of `size` bytes; see [`struct_field`].
+pub fn parameter_offset(
+    function: *const UFunction,
+    function_name: &str,
+    name: &'static str,
+    kind: &'static str,
+    size: i32,
+) -> Result<usize, String> {
+    struct_field_offset(function.cast(), name, kind, size)
+        .map_err(|reason| format!("{function_name}: {reason}"))
+}
+
 /// A buffer for the parameters of a reflected call (see [`call`]), zeroed and aligned for vectors.
 #[repr(C, align(16))]
 pub struct Parameters([u8; Parameters::SIZE]);
 
 impl Parameters {
-    pub const SIZE: usize = 0x40;
+    /// Room for an `FHitResult` (0x88 bytes) and a few more parameters.
+    pub const SIZE: usize = 0x100;
 
     pub fn new() -> Self {
         Self([0; Self::SIZE])

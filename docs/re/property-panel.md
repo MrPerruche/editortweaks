@@ -196,7 +196,9 @@ at bit `4 * axis + 2 * positive` (`UBrickStatics::GetScalableBrickConnectorSpaci
 0x1CD670, shift helper 0x142E80). `EConnectorSpacing`: None, Default 30 cm, Half 15 cm, Third
 10 cm, Double 60 cm, Triple 90 cm, Quadruple 120 cm (distance switch BRMK 0x1587C0); faces only
 use the first four. The game's largest brick (9000 cm cube, Third everywhere) has 4.86 million
-points.
+points. Negative sizes (typed with the mod, or edited into the file; vanilla loads them as they
+are) mirror the brick along that axis, and it still connects (seen in game): the mod's connector
+budget counts such sides by their magnitude.
 
 ## Before and after a brick property is written (game build 25831956)
 

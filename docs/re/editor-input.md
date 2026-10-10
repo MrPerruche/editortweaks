@@ -1,8 +1,9 @@
 # Editor input: camera speed and move mode
 
-How the vehicle editor's camera speed steps and mouse-driven brick moves work. Found in BRMK 1.11.6
-(`BrickRigsModKitSteam-BrickRigs.dll` exports, content assets), confirmed in game 1.11.7 (build
-25831956). Used by `features/camera_speed` and `features/move_slowdown`.
+How the vehicle editor's camera speed steps, mouse movement and mouse-driven brick moves work.
+Found in BRMK 1.11.6 (`BrickRigsModKitSteam-BrickRigs.dll` exports, content assets), confirmed in
+game 1.11.7 (build 25831956). Used by `features/camera_speed`, `features/move_slowdown`,
+`features/mouse_moves` and `features/brick_resize`.
 
 ## Input bindings
 
@@ -29,6 +30,10 @@ properties `DefaultMappings: [{bShift, bCtrl, bAlt, bCmd, Key, Scale}]`):
 | Row | Keys |
 |---|---|
 | `MovePerpendicular` | LeftShift (held) |
+| `MoveCamera` | RightMouseButton (held) |
+| `PivotCamera` | MiddleMouseButton, SpaceBar (held) |
+| `Select` | LeftMouseButton |
+| `MouseMoveRight` / `MouseMoveUp` | MouseX / MouseY (scale 1) |
 | `ToggleSnapping` | SpaceBar |
 | `MoveSelection` | G |
 | `AddToSelection` | Shift + LeftMouseButton |
@@ -38,7 +43,45 @@ properties `DefaultMappings: [{bShift, bCtrl, bAlt, bCmd, Key, Scale}]`):
 | `RemoveFromEditorGroup` / `RemoveFromWeldGroup` | Ctrl + Alt + G / W |
 
 No editor row uses Ctrl or Alt alone, so holding them while dragging is free (Shift isn't).
-Action names and descriptions: `Content/Localization/StringTables/Input.csv`.
+Action names and descriptions: `Content/Localization/StringTables/Input.csv`. How rows become
+bindings, how players rebind them and how the mod adds its own: `input-bindings.md`.
+
+## Mouse movement and the camera
+
+The engine reports the mouse's movement (MouseX/MouseY) only while the viewport has the mouse
+captured, i.e. while a mouse button is held over the 3D view (UE 4.27 `FSceneViewport::OnMouseMove`
+accumulates `MouseDelta` only then), with the default axis sensitivity 0.07 per pixel
+(`BaseInput.ini`; `move_slowdown` logged 0.07 for a one-pixel move). Whether the cursor stays visible
+meanwhile depends on the input mode (`UEditorInputComponent::GetInputMode`, BRMK 0x23A2C0: no cursor
+while the camera is moved, or while the mode's virtual +0x338 says so; otherwise shown); the resize
+tool logs which it sees.
+
+Both rows reach `UEditorInputComponent::Axis_MouseMoveRight` / `Up` (BRMK 0x2282C0 / 0x2285A0):
+
+```text
+Mode = this->Mode (weak pointer, +0x208), if a UBrickEditorMoveMode;
+if (!(this->CameraFlags & 4) && Mode) {          // +0x210 (game +0x200): MoveCamera or PivotCamera
+    if (Params.Mode == Real) Mode->AddMouseMoveInput(Axis, AxisValue * EditorMouseMoveSensitivity * k);
+    return Handled;
+}
+return Axis_ViewYaw(Params, MouseSensitivity);   // Pitch for Up
+```
+
+`UBaseInputComponent::Axis_ViewYaw` (BRMK 0x228DB0) adds the value to the player controller's yaw
+input (`AddYawInput`, vtable +0xD18) unless it ignores look input (+0x8C0); the input component's
+own check (vtable +0x540) returns true for every input component. So without a move mode, holding
+any mouse button and moving the mouse turns the editor's camera (seen in game 2026-10-10: the
+first resize drags turned it): the resize tool takes that
+movement while it drags (`features/mouse_moves`, shared with `move_slowdown`, since the loader hooks
+a function only once). `Action_MoveCamera` / `Action_PivotCamera` (BRMK 0x222710 / 0x223110) set bits
+0 / 1 of +0x210 and call `UpdateCameraMode` (0x261F80), which sets bit 2 (4) when either is set.
+In the game the overrides call `HandleStealMouseMove` (0xDE3CC0), whose flag test gives the offset
+(signature `editor_input::STEAL_MOUSE_MOVE`, `CameraFlags`). The resize tool takes the right button
+(`Action_MoveCamera`, hooked) while it drags, so the camera mode doesn't start then.
+
+The editor creates its input component in `ABrickEditor::EnableInput` (BRMK 0x9C9A0) with itself as
+the outer (`StaticConstructObject_Internal`, stored in `AActor::InputComponent`), so a handler's
+editor is its component's outer (`game::editor_mode::EditorModes::editor_of`).
 
 ## Camera speed
 
@@ -95,11 +138,32 @@ assumed.
   from 0xDD2950 (X) and 0xDD2B50 (Y), `UEditorInputComponent` vtable slots at 0x3904BE8 / BE0).
   The game's thunks: `execAxis_MouseMoveRight` 0xF71540 (virtual call +0x440), `Up` 0xF71650,
   found through the class's native function table (name string, then thunk).
-- `IsInPrecisionMoveMode` (0xBC650) exists but is unrelated to speed (no gizmo axis chosen).
+- The gizmo axis (`FBrickEditorGizmoAxis`, not reflected) is the move mode's first own field: BRMK
+  +0x40/+0x44, game +0x38/+0x3C (after `UBrickEditorMode::BrickEditor`, reflected, BRMK +0x38, game
+  +0x30): the axis (4 bytes, `EAxis`: 1 X, 2 Y, 3 Z; `TickMode` picks the unit vector by it) and a
+  type (1 byte): 1 follows the mouse in the plane across the axis (the only branch of `TickMode`,
+  BRMK 0xF19A0, reading the perpendicular flag), 3 rotates around the axis (adds to the rotation
+  angle of that axis), other values for the gizmo's arrows. G (`Action_MoveSelection`, 0x222BB0)
+  starts a move by {Z, 1} through `HandleStartMoveOrSetGizmoAxis` (0x23F010), the default mode's
+  `MoveSelection` and the move mode's `BeginMode`. `GetGizmoAxis` (0xAEF90) returns its address;
+  `SetGizmoAxis` (0xE7E40) sets it. Two leaf functions test it: `IsInPrecisionMoveMode` (0xBC650,
+  not virtual, inlined in the game): `Axis == 0 || Type == 0`; `ShouldCaptureMouse` (0xEAD40,
+  virtual; game 0xD08E20, its only pointer at `.rdata` 0x38D8398 in the move mode's vtable): the
+  opposite. Leaf functions have no `.pdata` entry, so the mod finds it by its whole code
+  (`editor_mode::SHOULD_CAPTURE_MOUSE`, a `CodeShape`) among the virtual functions of the move
+  mode's default object, and reads the two offsets from it. The game has no RTTI: vtables follow
+  one another directly in `.rdata`. (The first version took the two fields the other way around,
+  so it took G's move for a gizmo one.)
+- `Action_MovePerpendicular` (BRMK 0x222A40) sets bit 0x10 of the move mode's flags byte (BRMK
+  +0x48, right after the gizmo axis; read by `GetMouseMovePerpendicular`, 0xB0D30) while Shift is
+  held, in any move mode; only type 1 moves use it. `move_slowdown` slows down by Shift only moves
+  of the other types (`EditorModes::moving` is `ByGizmo`), and never while the camera is moved.
 
 ## Snapping while moving (explored 2026-10-10, not used yet)
 
-Looked into for face/edge snapping (roadmap "Advanced resizing"); nothing here is used yet.
+Looked into for face/edge snapping while moving (roadmap "Advanced resizing"); the move-mode
+parts aren't used yet. The resize tool's pieces (undo operations, moving bricks from code, line
+drawing, the left click) are in `editor-operations.md`.
 
 - `virtual FBrickEditorSnappingOffset ABrickEditor::GetMoveSnappingOffset(const
   FGetMoveSnappingOffsetParams&) const` (BRMK 0xB0DA0) returns no offset: zero vectors at +0 and
@@ -116,13 +180,6 @@ Looked into for face/edge snapping (roadmap "Advanced resizing"); nothing here i
   `Angle`, `EditorGridSnappingDistance` / `Angle`.
 - `UBrickEditorMoveMode::EffectiveMoveLocation` / `EffectiveMoveRotation` are reflected properties
   (BRMK `__PPO__` exports). The functions that apply a move (`GetEffectiveObjectTransform`,
-  `SanitizeObjectTransform`, `UBrickEditorObject::SetMoveTransform`) and the undo scopes
-  (`ABrickEditor::StartScopedOperation` / `FinishScopedOperation` / `PostModify`) are not.
-- Reflected and useful for geometry: `UBrickEditorObject::GetWorldTransform`,
-  `GetBrickEditorObjectSpawnTransform`, `GetBrickEditorObjectLocalBounds` (see
-  `editor-view-modes.md`), `UScalableBrick::BrickSize`. Engine: `UWorld::LineBatcher` /
-  `PersistentLineBatcher` / `ForegroundLineBatcher` and `APlayerController::
-  DeprojectMousePositionToWorld` / `ProjectWorldLocationToScreen` names are in the shipping exe
-  (drawing lines in the viewport: unverified that the shipping game renders the batchers).
+  `SanitizeObjectTransform`, `UBrickEditorObject::SetMoveTransform`) are not.
 - `ABrickEditor::GetHoveredObject` and `GetObjectAtScreenPosition` (the editor's own picking) are
-  not reflected.
+  not reflected; the resize tool picks among the bricks' boxes itself.

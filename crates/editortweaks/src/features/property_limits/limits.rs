@@ -62,6 +62,8 @@ pub struct Rule {
     pub property: &'static str,
     pub min: Bound,
     pub max: Bound,
+    /// Where dragging a slider stops on the low side, if above `min` (see [`Rule::drag_min`]).
+    pub drag_min: Option<f32>,
     pub adjust: Option<Adjust>,
     /// Other properties of the same object that `adjust` reads (see `dependencies`).
     pub depends_on: &'static [&'static str],
@@ -85,6 +87,7 @@ pub const fn rule(class: &'static str, property: &'static str) -> Rule {
         property,
         min: Bound::Unlimited,
         max: Bound::Unlimited,
+        drag_min: None,
         adjust: None,
         depends_on: &[],
     }
@@ -143,6 +146,15 @@ impl Rule {
     /// Keep the game's range: the property isn't unclamped at all.
     pub const fn vanilla(self) -> Self {
         self.vanilla_min().vanilla_max()
+    }
+
+    /// Dragging a slider stops at `min` (every component), above the rule's minimum: values below
+    /// it can only be typed. A drag starting below it jumps to it.
+    pub const fn drag_min(self, min: f32) -> Self {
+        Self {
+            drag_min: Some(min),
+            ..self
+        }
     }
 
     /// Run `adjust` on every value once it's within the range.

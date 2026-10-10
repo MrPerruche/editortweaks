@@ -7,6 +7,7 @@
 mod features;
 mod framework;
 mod game;
+mod math;
 mod platform;
 mod prelude;
 

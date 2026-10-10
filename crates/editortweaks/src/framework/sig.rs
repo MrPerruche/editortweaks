@@ -4,7 +4,8 @@
 //! then looked up in the exe's unwind table (`.pdata`), which lists every non-leaf function.
 //! So code added before the pattern in a game update doesn't break it, unlike "match + offset".
 //! Patterns must match exactly once; `et.py sigcheck` checks them against a new game build.
-//! A [`StringRefSig`] finds a function by a string constant it uses instead.
+//! A [`StringRefSig`] finds a function by a string constant it uses instead, and a [`CodeShape`]
+//! checks a leaf function found another way (they aren't in `.pdata`).
 
 use std::sync::OnceLock;
 
@@ -152,8 +153,73 @@ impl SigMatch {
     }
 }
 
+/// The whole code of a small leaf function, with holes for the values to read from it. Leaf
+/// functions (no calls, no stack frame) have no unwind entry, so a [`FunctionSig`] can't find
+/// them; a shape is checked against a function found another way instead, e.g. among a class's
+/// virtual functions. Keep the `name: "...", shape: "..."` shape: `et.py sigcheck` parses these
+/// declarations.
+pub struct CodeShape {
+    pub name: &'static str,
+    pub shape: &'static str,
+}
+
+impl CodeShape {
+    /// Whether the game code at `address` has this shape.
+    pub fn matches(&self, address: *const u8) -> bool {
+        let Ok(pattern) = parse_pattern(self.shape) else {
+            return false;
+        };
+        GameImage::get()
+            .code_at(address, pattern.len())
+            .is_some_and(|code| {
+                pattern
+                    .iter()
+                    .zip(code)
+                    .all(|(want, have)| want.is_none_or(|w| w == *have))
+            })
+    }
+}
+
+/// The targets of the direct calls (`call rel32`, E8) in `function`'s main part (its unwind table
+/// entry), in order, e.g. to find a leaf function through its caller. Every E8 byte counts, also
+/// inside other instructions, so check the targets (e.g. with a [`CodeShape`]).
+pub fn direct_calls(function: *const u8) -> Vec<*const u8> {
+    let image = GameImage::get();
+    let Some(rva) = (function as usize)
+        .checked_sub(image.base as usize)
+        .and_then(|rva| u32::try_from(rva).ok())
+    else {
+        return Vec::new();
+    };
+    let Ok(index) = image.functions.binary_search_by_key(&rva, |entry| entry[0]) else {
+        return Vec::new();
+    };
+    let length = image.functions[index][1].saturating_sub(rva) as usize;
+    let Some(code) = image.code_at(function, length) else {
+        return Vec::new();
+    };
+    code.windows(5)
+        .enumerate()
+        .filter(|(_, bytes)| bytes[0] == 0xE8)
+        .map(|(at, bytes)| {
+            let relative = i32::from_le_bytes([bytes[1], bytes[2], bytes[3], bytes[4]]);
+            function
+                .wrapping_add(at + 5)
+                .wrapping_offset(relative as isize)
+        })
+        .filter(|&target| is_code(target))
+        .collect()
+}
+
+/// Whether `address` lies in the game exe's code. Unlike [`is_function_start`], this holds for
+/// leaf functions too, e.g. to check a pointer read from a vtable before calling it.
+pub fn is_code(address: *const u8) -> bool {
+    GameImage::get().code_at(address, 1).is_some()
+}
+
 /// Whether `address` is where a function of the game exe starts (per its unwind table), e.g. to
-/// check a code pointer read from game data before hooking it.
+/// check a code pointer read from game data before hooking it. Leaf functions aren't listed there:
+/// see [`is_code`].
 pub fn is_function_start(address: *const u8) -> bool {
     let image = GameImage::get();
     let Some(rva) = (address as usize)
@@ -246,6 +312,16 @@ impl GameImage {
         sections.iter().map(|&(rva, size)| {
             // SAFETY: the image's sections are mapped and readable for their virtual size.
             unsafe { std::slice::from_raw_parts(self.base.add(rva as usize), size as usize) }
+        })
+    }
+
+    /// The `length` bytes of code at `address`, if they all lie in one of the code sections.
+    fn code_at(&self, address: *const u8, length: usize) -> Option<&'static [u8]> {
+        let rva = (address as usize).checked_sub(self.base as usize)?;
+        self.code_sections().find_map(|code| {
+            let start = self.rva_of(code.as_ptr()) as usize;
+            let offset = rva.checked_sub(start)?;
+            code.get(offset..offset.checked_add(length)?)
         })
     }
 

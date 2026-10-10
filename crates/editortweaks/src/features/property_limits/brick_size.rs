@@ -1,6 +1,8 @@
 //! Scalable bricks constrain their size to a per-type range whenever it's modified
 //! (`ConstraintBrickSize`, see `game::scalable_brick`). This applies the `BrickSize` rule instead,
-//! which can still use the game's limits (it keeps the minimum).
+//! which can still use the game's limits (its connector budget shrinks sizes down to the game's
+//! minimum at most). The rule's `drag_min` already applied when the panel stored the size
+//! (`property`).
 
 use core::ffi::c_void;
 use std::sync::OnceLock;

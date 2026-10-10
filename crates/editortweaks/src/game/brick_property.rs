@@ -10,9 +10,12 @@ use core::ffi::c_void;
 use brickrust::ue::coreuobject::UObjectBase;
 use brickrust::ue::fname::FName;
 use brickrust::ue::tarray::TArray;
+use brickrust::ue::tshared::FWeakObjectPtr;
+use brickrust::ue::uclass::UStruct;
 
-use crate::framework::sig::FunctionSig;
+use crate::framework::sig::{self, FunctionSig};
 use crate::game::numeric_property::Container;
+use crate::game::reflection;
 
 /// `bool FBrickPropertyEditInfo::CanModify(const FBrickPropertyContainer&)` (our name; BRMK
 /// 0x3102A0, game RVA 0xE5C810): whether the edited property may be written to the container's
@@ -76,6 +79,26 @@ pub unsafe fn post_modify(interface: *mut c_void, event: &mut ChangedEvent) {
     }
 }
 
+/// Where objects of `class` keep their `IBrickPropertyInterface` (see [`object_of`]): its offset in
+/// them, from reflection, checked on `object` (one of them) to lead back to it.
+///
+/// # Safety
+/// `object` must be a live object of `class`. Game thread only.
+pub unsafe fn interface_offset(class: *const UStruct, object: *mut UObjectBase) -> Option<usize> {
+    // SAFETY: per the contract; the vtable pointer is checked to lead to game code in the
+    // `_getUObject` slot before it's called (a leaf function, `lea rax, [rcx - offset]; ret`, so
+    // not in the exe's function table).
+    unsafe {
+        let offset = reflection::interface_offset(class, "BrickPropertyInterface")?;
+        let interface = object.cast::<u8>().add(offset).cast::<c_void>();
+        let vtable = *interface.cast::<*const *const u8>();
+        if vtable.is_null() || !sig::is_code(*vtable.add(GET_UOBJECT_SLOT)) {
+            return None;
+        }
+        (object_of(interface) == object).then_some(offset)
+    }
+}
+
 /// `FBrickPropertyChangedEvent`, as far as known: the names of the properties leading to the
 /// changed value, and which of them is this object's. An empty path means everything changed. The
 /// game's `FName` is 8 bytes (BRMK's 12).
@@ -86,14 +109,64 @@ pub unsafe fn post_modify(interface: *mut c_void, event: &mut ChangedEvent) {
 ///     return Event.Path.Num() == 0;
 /// }
 /// ```
+///
+/// Then (BRMK 1.11.6, same in the game as far as used): the edited objects (read by
+/// `ABrickEditor::OnAnyPropertyModified`), the object the edit started from
+/// (`UBrickEditorObject::IsPostModifyBrickPropertyMirrored`: a mirrored copy's source) and how it
+/// changed, [`INTERACTIVE`] while a slider is dragged, when bricks skip their slow updates (e.g. a
+/// scalable brick's connectors and aerodynamics).
 #[repr(C)]
 pub struct ChangedEvent {
     _unknown: [u8; 0x18],
     path: TArray<FName>,
     level: i32,
+    objects: TArray<FWeakObjectPtr>,
+    source: FWeakObjectPtr,
+    kind: u8,
 }
 
+/// [`ChangedEvent`]'s kind while a value is being dragged; others are final.
+const INTERACTIVE: u8 = 2;
+/// The kind of a final change made here (anything but [`INTERACTIVE`] is handled alike).
+const FINAL: u8 = 0;
+
 impl ChangedEvent {
+    /// Runs `f` with an event telling that `property` of an object changed, `interactive`ly (while
+    /// dragging: more changes follow) or not. The event names no objects and no source: an edit
+    /// started on the object itself.
+    pub fn with_property(property: FName, interactive: bool, f: impl FnOnce(&mut Self)) {
+        /// The event, with room for fields beyond those known, zeroed like the known unused ones.
+        #[repr(C)]
+        struct Padded {
+            event: ChangedEvent,
+            _rest: [u8; 0x40],
+        }
+        let mut path = [property];
+        let mut padded = Padded {
+            event: ChangedEvent {
+                _unknown: [0; 0x18],
+                path: TArray {
+                    data: path.as_mut_ptr(),
+                    num: 1,
+                    max: 1,
+                },
+                level: 0,
+                objects: TArray {
+                    data: core::ptr::null_mut(),
+                    num: 0,
+                    max: 0,
+                },
+                source: FWeakObjectPtr {
+                    object_index: 0,
+                    object_serial_number: 0,
+                },
+                kind: if interactive { INTERACTIVE } else { FINAL },
+            },
+            _rest: [0; 0x40],
+        };
+        f(&mut padded.event);
+    }
+
     /// The changed property, or `None` if everything changed.
     pub fn property(&self) -> Option<FName> {
         let level = usize::try_from(self.level).ok()?;

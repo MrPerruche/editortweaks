@@ -5,15 +5,14 @@
 use core::ffi::c_void;
 use core::mem::offset_of;
 
-/// `FModifierKeysState` bits for the left and right Shift and Alt keys (Control is 0b1100).
+/// `FModifierKeysState` bits for the left and right Shift keys (Control is 0b1100, Alt 0b11_0000).
 pub const SHIFT: u16 = 0b00_0011;
-pub const ALT: u16 = 0b11_0000;
 
 /// `FPointerEvent` (a mouse event): `FInputEvent`'s fields, then the positions in screen space.
 #[repr(C)]
 pub struct PointerEvent {
     _vtable: *const c_void,
-    /// `FInputEvent::ModifierKeys`: e.g. the [`SHIFT`] and [`ALT`] bits.
+    /// `FInputEvent::ModifierKeys`: e.g. the [`SHIFT`] bits.
     pub modifier_keys: u16,
     _input_event: [u8; 0x0E],
     pub screen_space_position: [f32; 2],

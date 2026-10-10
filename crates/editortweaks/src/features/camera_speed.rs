@@ -23,7 +23,7 @@ const SLOWEST: f32 = 5.0;
 /// Fastest editor camera speed, in cm/s (the game's: 24000, i.e. 240 m/s).
 const FASTEST: f32 = 192_000.0;
 /// Speed steps from the slowest to the fastest speed (the game's: 20). Each step multiplies the
-/// speed by `(FASTEST / SLOWEST)^(1 / STEPS)`: ×1.36 with the values above.
+/// speed by `(FASTEST / SLOWEST)^(1 / STEPS)`: ×1.36 with the comments' values above.
 const STEPS: u16 = 30;
 
 const _: () = assert!(SLOWEST > 0.0 && FASTEST >= SLOWEST && STEPS > 0);

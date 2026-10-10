@@ -13,7 +13,7 @@
 //!
 //! Nothing else re-clamps, so saved vehicles keep their values, also for players without the mod
 //! (until they edit that value). Arrow keys still stop at the slider's ends, and so does dragging
-//! unless `slider_drag` lifts that.
+//! unless `slider_drag` lifts that; a rule's `drag_min` then stops drags before typed values.
 
 mod brick_size;
 mod dependencies;

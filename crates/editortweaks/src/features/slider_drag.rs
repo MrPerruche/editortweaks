@@ -1,14 +1,15 @@
 //! Dragging sliders further.
 //!
-//! - Alt-drag: while Alt is held during a drag, the value keeps changing as long as the mouse is
-//!   away from where Alt was pressed: faster the farther it is (four times as fast at twice the
-//!   distance) and the larger the value is (10 to 100 takes as long as 100 to 1000), see
-//!   [`ALT_DRAG_SPEED`]. Shift and Control slow it down, as they do normal drags. Releasing Alt
-//!   carries on as a normal drag from there.
+//! - Alt-drag: while Alt ([`keybinds::KEEP_DRAGGING_SLIDERS`], rebindable) is held during a drag,
+//!   the value keeps changing as long as the mouse is away from where Alt was pressed: faster the
+//!   farther it is (four times as fast at twice the distance) and the larger the value is (10 to 100
+//!   takes as long as 100 to 1000), see [`ALT_DRAG_SPEED`]. Shift and Control slow it down, as they
+//!   do normal drags (the game's own keys for that, which stay). Releasing Alt carries on as a
+//!   normal drag from there.
 //! - With [`LIFT_SLIDER_LIMITS`], no drag stops at the slider's ends (plain, Shift, Ctrl or Alt):
-//!   values only stop at the property's own limits (`property_limits` and its rules). In absolute
-//!   mode (the value under the cursor), dragging past an end carries on proportionally. Arrow keys
-//!   still stop at the ends.
+//!   values only stop at the property's own limits (`property_limits` and its rules, some of which
+//!   stop drags before typed values: `drag_min`). In absolute mode (the value under the cursor),
+//!   dragging past an end carries on proportionally. Arrow keys still stop at the ends.
 //!
 //! How: the slider's mouse move handler (`game::slider_drag`) is hooked. Its clamp to the slider's
 //! range is removed from its code; `property_limits` then keeps the out-of-range value when it's
@@ -23,6 +24,7 @@ use std::cell::{Cell, RefCell};
 use std::sync::OnceLock;
 use std::time::Instant;
 
+use super::keybinds;
 use super::property_limits;
 use crate::framework::hook;
 use crate::game::numeric_property::NumericValue;
@@ -208,14 +210,8 @@ unsafe extern "C" fn on_mouse_move(
         return call();
     }
     // SAFETY: the caller's event and geometry, valid during the call.
-    let (modifier_keys, moved, width) = unsafe {
-        (
-            (*event).modifier_keys,
-            (*event).cursor_delta[0],
-            (*geometry).absolute_width(),
-        )
-    };
-    if modifier_keys & slate::ALT == 0 {
+    let (moved, width) = unsafe { ((*event).cursor_delta[0], (*geometry).absolute_width()) };
+    if !keybinds::KEEP_DRAGGING_SLIDERS.is_held() {
         ALT_DRAG.take();
         return drag_step(sliders, slider, call);
     }
@@ -384,7 +380,7 @@ fn alt_drag_tick() {
     };
     // SAFETY: still in the object array, so alive, and a slider (it was being dragged).
     let dragging = unsafe { sliders.drag.is_dragging(slider) };
-    if !dragging || !keyboard::is_alt_down() {
+    if !dragging || !keybinds::KEEP_DRAGGING_SLIDERS.is_held() {
         // Released: a further mouse move drags normally from here.
         ALT_DRAG.take();
         return;

@@ -7,17 +7,22 @@
 
 use core::ffi::c_void;
 
+use brickrust::ue::coreuobject::UObjectBase;
 use brickrust::ue::fproperty::FProperty;
 use brickrust::ue::uclass::UClass;
 
+use crate::framework::sig::FunctionSig;
 use crate::game::reflection;
 
 /// `FBrActionResult Axis_MouseMoveRight(const FBrActionParams&)` and `Axis_MouseMoveUp`: the mouse's
-/// movement while moving or rotating bricks in move mode (G or the gizmo). The editor's versions
-/// (`HandleStealMouseMove(Params, Axis)` in the game, inlined in BRMK) multiply
-/// `Params.AxisValue` (MouseX or MouseY) by the user's `EditorMouseMoveSensitivity` and add it to
-/// the move mode's input (`UBrickEditorMoveMode::AddMouseMoveInput`), which moves the selection by
-/// it on its next tick (`TickMode`). Nothing else adds mouse input to move mode.
+/// movement (`Params.AxisValue`: the engine's MouseX or MouseY, see [`AXIS_PER_PIXEL`]), which the
+/// engine reports while a mouse button is held over the 3D view. The editor's versions
+/// (`HandleStealMouseMove(Params, Axis)` in the game, inlined in BRMK): in a move mode (G or the
+/// gizmo), multiply it by the user's `EditorMouseMoveSensitivity` and add it to the mode's input
+/// (`UBrickEditorMoveMode::AddMouseMoveInput`), which moves the selection by it on its next tick
+/// (`TickMode`); otherwise, or while the camera is moved (right or middle button), pass it to
+/// `Axis_ViewYaw`/`Axis_ViewPitch`, which turn the camera. Nothing else adds mouse input to move
+/// mode.
 pub struct MouseMoveAxes {
     /// `EditorInputComponent`.
     class: *const UClass,
@@ -35,6 +40,61 @@ pub struct Axis {
     params: *const FProperty,
 }
 
+/// How far the mouse axes go per pixel the mouse moves: the engine's default sensitivity of MouseX
+/// and MouseY (`BaseInput.ini`), which the game keeps (a one-pixel move reads 0.07). Up is
+/// positive.
+pub const AXIS_PER_PIXEL: f32 = 0.07;
+
+/// `UEditorInputComponent::HandleStealMouseMove(Params, Axis)` (game RVA 0xDE3CC0; inlined in BRMK's
+/// `Axis_MouseMoveRight`/`Up`, 0x2282C0), which both mouse axis handlers call (see
+/// [`MouseMoveAxes`]): the movement goes to the move mode unless the camera is moved, a flag of the
+/// input component:
+///
+/// ```text
+/// Mode = this->Mode (a weak pointer), if a UBrickEditorMoveMode;
+/// if (!(this->CameraFlags & 4) && Mode) { ...AddMouseMoveInput...; return Handled; }
+/// return Axis_ViewYaw(...);   // or Pitch: turns the camera
+/// ```
+///
+/// The camera flags (a byte; game +0x200, BRMK +0x210): bit 0 while `MoveCamera` is held (right
+/// button), bit 1 while `PivotCamera` is (middle button, Space), bit 2 when either is
+/// (`UpdateCameraMode`).
+pub const STEAL_MOUSE_MOVE: FunctionSig = FunctionSig {
+    name: "UEditorInputComponent::HandleStealMouseMove",
+    // The camera flags tested (their offset at +2), the mode checked, `Params.Mode == Real`, then
+    // the call getting the user settings.
+    pattern: "f6 86 ?? ?? 00 00 04 75 ?? 48 85 ff 74 ?? 80 7d 00 01 75 ?? e8",
+};
+
+/// Whether the editor's camera is being moved or pivoted (after load).
+pub struct CameraFlags {
+    /// Offset of the camera flags in the editor's input component.
+    offset: usize,
+}
+
+/// Set in [`CameraFlags`] while the camera is moved or pivoted.
+const CAMERA_MOVING: u8 = 4;
+
+pub fn camera_flags() -> Result<CameraFlags, String> {
+    let found = STEAL_MOUSE_MOVE.locate()?;
+    // SAFETY: displacement bytes inside the matched pattern.
+    let offset = unsafe { found.address.add(2).cast::<u32>().read_unaligned() };
+    Ok(CameraFlags {
+        offset: offset as usize,
+    })
+}
+
+impl CameraFlags {
+    /// Whether `input`'s camera is moved or pivoted (the mouse turns it rather than moving bricks).
+    ///
+    /// # Safety
+    /// `input` must be a live editor input component.
+    pub unsafe fn moving(&self, input: *const UObjectBase) -> bool {
+        // SAFETY: per the contract; the offset comes from the game's own check.
+        unsafe { input.cast::<u8>().add(self.offset).read() & CAMERA_MOVING != 0 }
+    }
+}
+
 // SAFETY: reflection records and game code live as long as the game; only used on the game thread.
 unsafe impl Send for MouseMoveAxes {}
 unsafe impl Sync for MouseMoveAxes {}
@@ -44,6 +104,8 @@ pub fn mouse_move_axes() -> Result<MouseMoveAxes, String> {
         .ok_or("class EditorInputComponent not found")?;
     let right = axis(class, "Axis_MouseMoveRight")?;
     let up = axis(class, "Axis_MouseMoveUp")?;
+    returns_action_result(class, "Axis_MouseMoveRight")?;
+    returns_action_result(class, "Axis_MouseMoveUp")?;
     // SAFETY: `axis` checked that the parameter is an FBrActionParams, a reflected struct.
     let axis_value = unsafe {
         reflection::struct_field_offset(
@@ -61,8 +123,8 @@ pub fn mouse_move_axes() -> Result<MouseMoveAxes, String> {
     })
 }
 
-/// The axis handler `name`, whose first parameter is its `FBrActionParams` (`Mode`,
-/// `bIsSecondaryAction`, `AxisValue`).
+/// The input handler (axis or action) `name`, whose first parameter is its `FBrActionParams`
+/// (`Mode`, `bIsSecondaryAction`, `AxisValue`).
 fn axis(class: *const UClass, name: &'static str) -> Result<Axis, String> {
     let function = reflection::find_function(class, name)?;
     let thunk = reflection::native_thunk(function).map_err(|e| format!("{name}: {e}"))?;
@@ -78,6 +140,167 @@ fn axis(class: *const UClass, name: &'static str) -> Result<Axis, String> {
             .ok_or(format!("{name}: first parameter isn't an FBrActionParams"))?
     };
     Ok(Axis { thunk, params })
+}
+
+/// Checks that the input handler `name` returns an `FBrActionResult` starting with its outcome (a
+/// 1-byte enum), which [`set_handled`] writes.
+fn returns_action_result(class: *const UClass, name: &'static str) -> Result<(), String> {
+    let function = reflection::find_function(class, name)?;
+    // SAFETY: a live function record; its return value's struct is a live reflected struct.
+    unsafe {
+        let result = reflection::find_property(function.cast(), "ReturnValue");
+        let returned = if result.is_null() {
+            core::ptr::null()
+        } else {
+            reflection::struct_type(result)
+        };
+        if returned.is_null()
+            || !reflection::name_is(reflection::struct_name(returned), "BrActionResult")
+        {
+            return Err(format!("{name}: doesn't return an FBrActionResult"));
+        }
+        let first = reflection::properties(returned).find(|&field| (*field).offset_internal == 0);
+        if !first.is_some_and(|field| (*field).element_size == 1) {
+            return Err(format!("{name}: FBrActionResult changed its layout"));
+        }
+    }
+    Ok(())
+}
+
+/// Marks a call of an input handler's thunk as handled without running the game's handler: sets
+/// the outcome in its return value, which the caller made (the thunk only assigns to it).
+///
+/// # Safety
+/// `result` must be the return value pointer the thunk was called with, of a handler checked by
+/// [`returns_action_result`].
+unsafe fn set_handled(result: *mut c_void) {
+    // SAFETY: per the contract; the return value is a constructed FBrActionResult whose first
+    // field is its 1-byte outcome.
+    unsafe {
+        if !result.is_null() {
+            result.cast::<u8>().write(HANDLED);
+        }
+    }
+}
+
+/// `FBrActionResult Action_Select(const FBrActionParams&)` (`UBaseEditorInputComponent`, BRMK
+/// 0x223B50): the left mouse button in the editor, pressed and released. It calls
+/// `HandleSelect(Params, false)` (BRMK 0x23EF50):
+///
+/// ```text
+/// Mode = Editor->CurrentEditorMode;
+/// if (!Mode || !Editor->PlayerController) return { Result 2 };
+/// if (Params.Mode == 1) {                         // EBrActionMode::Real (not a test)
+///     GetMousePosition(X, Y);
+///     if (Params.bReleased == 0) Mode->PressObjectAtScreenPosition({X, Y}, false);   // vtable
+///     else Mode->ReleaseObjectAtScreenPosition({X, Y}, false);
+/// }
+/// return { Result 0 };                            // handled
+/// ```
+///
+/// `bReleased` (our name) is the byte at +8 of `FBrActionParams`, after its reflected fields.
+pub const SELECT: &str = "Action_Select";
+
+/// `FBrActionResult Action_MoveCamera(const FBrActionParams&)` (`UEditorInputComponent`, BRMK
+/// 0x222710): the right mouse button in the editor, pressed and released. While it's held, bit 0
+/// of the component's camera flags is set (see [`CameraFlags`]), then `UpdateCameraMode`: the mouse
+/// turns the camera, WASD moves it, the cursor hides.
+pub const MOVE_CAMERA: &str = "Action_MoveCamera";
+
+/// The handler of a button's action, e.g. [`SELECT`] or [`MOVE_CAMERA`]: called when the button is
+/// pressed and when it's released (`FBrActionParams` byte +8, see [`SELECT`]).
+pub struct ButtonAction {
+    /// `EditorInputComponent` (the editor's input, which the handlers belong to).
+    class: *const UClass,
+    /// The exec thunk.
+    pub thunk: *const u8,
+    /// Its `const FBrActionParams&` parameter.
+    params: *const FProperty,
+}
+
+// SAFETY: reflection records and game code live as long as the game; only used on the game thread.
+unsafe impl Send for ButtonAction {}
+unsafe impl Sync for ButtonAction {}
+
+/// The button's state in a call to a [`ButtonAction`].
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Click {
+    Pressed,
+    Released,
+}
+
+/// `EBrActionMode::Real` in `FBrActionParams::Mode`: the input happened (the other value is a test
+/// of whether it would be handled).
+const REAL: u8 = 1;
+/// Where `FBrActionParams` keeps whether the button was released (see [`SELECT`]), and its
+/// size: after `Mode` (+0), `bIsSecondaryAction` (+1) and `AxisValue` (+4).
+const RELEASED: usize = 8;
+const ACTION_PARAMS_SIZE: u32 = 0xC;
+/// `FBrActionResult`'s first byte when the action was handled.
+const HANDLED: u8 = 0;
+
+/// The button action handler `name` (e.g. [`SELECT`]) of the editor's input.
+pub fn button_action(name: &'static str) -> Result<ButtonAction, String> {
+    let class = reflection::find_class("EditorInputComponent")
+        .ok_or("class EditorInputComponent not found")?;
+    let action = axis(class, name)?;
+    // SAFETY: live reflection records: the function's parameters and their structs.
+    unsafe {
+        let params = reflection::struct_type(action.params);
+        let mode = reflection::struct_field_offset(params, "Mode", "EnumProperty", 1)
+            .or_else(|_| reflection::struct_field_offset(params, "Mode", "ByteProperty", 1))?;
+        let axis_value = reflection::struct_field_offset(params, "AxisValue", "FloatProperty", 4)?;
+        if mode != 0 || axis_value != 4 || (*params).properties_size != ACTION_PARAMS_SIZE {
+            return Err(format!("{name}: FBrActionParams changed its layout"));
+        }
+        returns_action_result(class, name)?;
+        Ok(ButtonAction {
+            class,
+            thunk: action.thunk,
+            params: action.params,
+        })
+    }
+}
+
+impl ButtonAction {
+    /// Whether `object` is an editor input component.
+    ///
+    /// # Safety
+    /// `object` must be a live object.
+    pub unsafe fn is_editor_input(&self, object: *const c_void) -> bool {
+        // SAFETY: per the contract.
+        unsafe { reflection::with_parents(reflection::class_of(object)) }
+            .any(|class| class == self.class.cast())
+    }
+
+    /// What a call of the thunk does with the button, if it's a real input called through
+    /// `ProcessEvent` (as the input system's calls are).
+    ///
+    /// # Safety
+    /// `stack` must be the frame the thunk was called with.
+    pub unsafe fn click(&self, stack: *const c_void) -> Option<Click> {
+        // SAFETY: per the contract; the parameter is an FBrActionParams of the checked size.
+        unsafe {
+            let params = reflection::native_call_parameter(stack, self.params)?;
+            if params.read() != REAL {
+                return None;
+            }
+            Some(if params.add(RELEASED).read() == 0 {
+                Click::Pressed
+            } else {
+                Click::Released
+            })
+        }
+    }
+
+    /// Marks the call as handled without running the game's handler (see [`set_handled`]).
+    ///
+    /// # Safety
+    /// `result` must be the return value pointer the thunk was called with.
+    pub unsafe fn handled(&self, result: *mut c_void) {
+        // SAFETY: per the contract; `button_action` checked the return value.
+        unsafe { set_handled(result) }
+    }
 }
 
 impl MouseMoveAxes {
@@ -103,5 +326,15 @@ impl MouseMoveAxes {
             let params = reflection::native_call_parameter(stack, axis.params)?;
             Some(params.add(self.axis_value).cast::<f32>())
         }
+    }
+
+    /// Marks a call of a mouse axis thunk as handled without running the game's handler: the
+    /// movement neither moves bricks nor turns the camera (see [`set_handled`]).
+    ///
+    /// # Safety
+    /// `result` must be the return value pointer the thunk was called with.
+    pub unsafe fn handled(&self, result: *mut c_void) {
+        // SAFETY: per the contract; `mouse_move_axes` checked the return values.
+        unsafe { set_handled(result) }
     }
 }

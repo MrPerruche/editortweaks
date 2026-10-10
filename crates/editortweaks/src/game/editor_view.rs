@@ -12,14 +12,13 @@ use core::ffi::c_void;
 
 use brickrust::ue::coreuobject::UObjectBase;
 use brickrust::ue::fmalloc;
-use brickrust::ue::fname::FName;
 use brickrust::ue::tarray::TArray;
 use brickrust::ue::tshared::FWeakObjectPtr;
 use brickrust::ue::uclass::{UFunction, UStruct};
 
 use crate::framework::sig::{FunctionSig, SigMatch, StringRefSig};
 use crate::game::kismet;
-use crate::game::reflection::{self, Getter, Parameters};
+use crate::game::reflection::{self, ENUM_NAMES, EnumEntry, Getter, Parameters};
 use crate::game::text::Text;
 use crate::game::weak_object;
 
@@ -40,8 +39,8 @@ use crate::game::weak_object;
 /// calls [`PRIMITIVE_DATA`]. One more caller (0xCB8810).
 pub const MATERIAL_OVERRIDE: FunctionSig = FunctionSig {
     name: "UBrick::GetEditorMaterialOverride",
-    // GetBrickStaticInfo() (call at +3), the hidden check on EditorParams (its offset at +14), the
-    // early return, GetViewMode() (call at +0x2F), then the switch.
+    // GetBrickStaticInfo() (call at +3), the hidden check on EditorParams (its offset at +14, the
+    // flags' at +22), the early return, GetViewMode() (call at +0x2F), then the switch.
     pattern: "48 8b f9 e8 ?? ?? ?? ?? 48 8b d8 48 8b 47 ?? 48 85 c0 74 ?? f6 40 ?? 18 74 ?? 48 8b 83 ?? ?? ?? ?? 48 8b 5c 24 ?? 48 83 c4 ?? 5f c3 48 8b cf e8 ?? ?? ?? ?? 0f b6 c8 83 e9 02 74",
 };
 
@@ -207,6 +206,10 @@ type StaticInfoFn = unsafe extern "C" fn(brick: *const UObjectBase) -> *const u8
 const EDITOR_MASK: u8 = 0x18;
 const IN_EDITOR: u8 = 0x08;
 
+/// `EditorParams` flags of a hidden editor object (`GetEditorMaterialOverride`'s check, the byte's
+/// offset read from it).
+const HIDDEN: u8 = 0x18;
+
 /// Offset of the mirrored object (an `FWeakObjectPtr`) in an editor object's `EditorParams`: where
 /// `UpdateMirroredObjects` assigns it (game 0xCB6D68: `mov rcx, [object + 0x40]` straight into
 /// `FWeakObjectPtr::operator=`). 8 in BRMK, whose `EditorParams` has an editor-only field first.
@@ -225,6 +228,8 @@ pub struct EditorCode {
     flags: usize,
     /// Offset of an editor object's `EditorParams` pointer.
     editor_params: usize,
+    /// Offset of the flags byte in `EditorParams` (see [`EditorCode::is_hidden`]).
+    params_flags: usize,
 }
 
 // SAFETY: points into the game's code; only used on the game thread (and while loading).
@@ -259,6 +264,7 @@ pub fn editor_code() -> Result<EditorCode, String> {
             static_info: core::mem::transmute::<*const u8, StaticInfoFn>(static_info),
             flags: usize::from(*data.address.add(3)),
             editor_params: usize::from(*material.address.add(14)),
+            params_flags: usize::from(*material.address.add(22)),
         })
     }
 }
@@ -294,6 +300,24 @@ impl EditorCode {
             }
             let pointer = params.add(MIRRORED_OBJECT).cast::<FWeakObjectPtr>().read();
             weak_object::resolve(pointer)
+        }
+    }
+
+    /// Whether `object` is hidden in the editor (H, or hidden by the view mode): the flags
+    /// `GetEditorMaterialOverride` checks to give it the hidden material.
+    ///
+    /// # Safety
+    /// `object` must be a live editor object (`UBrickEditorObject`). Game thread only.
+    pub unsafe fn is_hidden(&self, object: *const UObjectBase) -> bool {
+        // SAFETY: per the contract; `EditorParams` is null or points to the object's parameters,
+        // and both offsets come from the game's own check.
+        unsafe {
+            let params = object
+                .cast::<u8>()
+                .add(self.editor_params)
+                .cast::<*const u8>()
+                .read();
+            !params.is_null() && params.add(self.params_flags).read() & HIDDEN != 0
         }
     }
 
@@ -500,19 +524,6 @@ impl SetCustomPrimitiveData {
         }
     }
 }
-
-/// One entry of `UEnum::Names` (`TPair<FName, int64>`).
-#[repr(C)]
-#[derive(Clone, Copy)]
-struct EnumEntry {
-    name: FName,
-    value: i64,
-}
-
-/// Offset of `UEnum::Names` (a `TArray<TPair<FName, int64>>`) in UE 4.27 shipping builds: after
-/// `UField` (0x30 bytes) and `CppType` (an `FString`). The game's `CycleViewMode` (0xCD48B0) reads
-/// it there.
-const ENUM_NAMES: usize = 0x40;
 
 /// Adds the view mode `EBrickEditorViewMode::<name>` and returns its value. The view mode cycle
 /// (`UBrickEditorDefaultMode::CycleViewMode`) steps through the enum's entries except the last
