@@ -72,7 +72,8 @@ fn axis(class: *const UClass, name: &'static str) -> Result<Axis, String> {
             .next()
             .filter(|&params| {
                 let ustruct = reflection::struct_type(params);
-                !ustruct.is_null() && reflection::struct_name(ustruct).equals_str("BrActionParams")
+                !ustruct.is_null()
+                    && reflection::name_is(reflection::struct_name(ustruct), "BrActionParams")
             })
             .ok_or(format!("{name}: first parameter isn't an FBrActionParams"))?
     };

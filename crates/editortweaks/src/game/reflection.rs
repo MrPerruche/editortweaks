@@ -3,6 +3,7 @@
 //! matter. Only usable after engine init (see `Feature::on_engine_init`).
 
 use core::ffi::c_void;
+use core::marker::PhantomData;
 
 use brickrust::ue::coreuobject::{GObjects, UObjectBase, UObjectVTable};
 use brickrust::ue::fframe::FFrame;
@@ -15,9 +16,43 @@ use crate::framework::sig;
 /// `FProperty::PropertyFlags` bit of a function's return value (`CPF_ReturnParm`).
 pub const RETURN_PARAMETER: u64 = 0x400;
 
+/// Whether `name` is `text`, ignoring ASCII case like Unreal's name comparisons. The engine stores
+/// each name once, in the case it was first made with: the game's parameters `InString` are named
+/// "inString", which some other code made first.
+///
+/// # Safety
+/// `name` must be a valid name (of the live name pool).
+pub unsafe fn name_is(name: &FName, text: &str) -> bool {
+    // SAFETY: per the contract; an entry holds `len` characters, of one or two bytes.
+    unsafe {
+        let (chars, len, wide) = name.as_sptr2();
+        let len = usize::from(len);
+        if len != text.len() {
+            return false;
+        }
+        if wide {
+            core::slice::from_raw_parts(chars.cast::<u16>(), len)
+                .iter()
+                .zip(text.bytes())
+                .all(|(&char, byte)| {
+                    u8::try_from(char).is_ok_and(|c| c.eq_ignore_ascii_case(&byte))
+                })
+        } else {
+            core::slice::from_raw_parts(chars, len).eq_ignore_ascii_case(text.as_bytes())
+        }
+    }
+}
+
 /// The native class called `name`, without its `U`/`A` prefix (e.g. `"BrickSliderWidget"`).
 /// Walks every live object, so call it once and keep the result.
 pub fn find_class(name: &'static str) -> Option<*const UClass> {
+    find_object(name, "Class").map(|object| object as *const UClass)
+}
+
+/// The first live object called `name` whose class is called `class` (e.g. an enum: `"Enum"`; a
+/// class's default object: `"Default__KismetStringLibrary"`, `"KismetStringLibrary"`). Walks every
+/// live object, so call it once and keep the result.
+pub fn find_object(name: &'static str, class: &'static str) -> Option<*mut UObjectBase> {
     // SAFETY: runs on the game thread after engine init; GObjects slots hold live objects or null,
     // and every object has a valid class pointer.
     unsafe {
@@ -30,15 +65,18 @@ pub fn find_class(name: &'static str) -> Option<*const UClass> {
             .find(|&object| {
                 !object.is_null()
                     && (*object).name_private.comparison_index == wanted.comparison_index
+                    && (*object).name_private.number == wanted.number
                     && !(*object).class_private.is_null()
-                    && (*(*object).class_private)
-                        .ustruct
-                        .ufield
-                        .uobject
-                        .name_private
-                        .equals_str("Class")
+                    && name_is(
+                        &(*(*object).class_private)
+                            .ustruct
+                            .ufield
+                            .uobject
+                            .name_private,
+                        class,
+                    )
             })
-            .map(|object| object as *const UClass)
+            .map(|object| object.cast())
     }
 }
 
@@ -112,7 +150,7 @@ pub unsafe fn find_property(ustruct: *const UStruct, name: &'static str) -> *con
     // SAFETY: per the contract.
     unsafe { properties(ustruct) }
         // SAFETY: `properties` only yields live property records.
-        .find(|&property| unsafe { (*property).field.name_private.equals_str(name) })
+        .find(|&property| unsafe { name_is(&(*property).field.name_private, name) })
         .unwrap_or(core::ptr::null())
 }
 
@@ -139,7 +177,7 @@ pub unsafe fn is_kind(property: *const FProperty, kind: &'static str) -> bool {
     // SAFETY: per the contract; a property's class record lives as long as the program.
     unsafe {
         let class = (*property).field.class_private;
-        !class.is_null() && (*class).name.equals_str(kind)
+        !class.is_null() && name_is(&(*class).name, kind)
     }
 }
 
@@ -260,6 +298,32 @@ pub fn native_thunk(function: *const UFunction) -> Result<*const u8, String> {
     Ok(thunk)
 }
 
+/// A buffer for the parameters of a reflected call (see [`call`]), zeroed and aligned for vectors.
+#[repr(C, align(16))]
+pub struct Parameters([u8; Parameters::SIZE]);
+
+impl Parameters {
+    pub const SIZE: usize = 0x40;
+
+    pub fn new() -> Self {
+        Self([0; Self::SIZE])
+    }
+
+    /// Whether the parameters of `function` fit.
+    ///
+    /// # Safety
+    /// `function` must be a live function record.
+    pub unsafe fn fit(function: *const UFunction) -> bool {
+        // SAFETY: per the contract.
+        let size = unsafe { (*function.cast::<UStruct>()).properties_size };
+        usize::try_from(size).is_ok_and(|size| size <= Self::SIZE)
+    }
+
+    pub fn as_mut_ptr(&mut self) -> *mut u8 {
+        self.0.as_mut_ptr()
+    }
+}
+
 /// Calls the reflected function `function` on `object` through `ProcessEvent`, as Blueprints do.
 /// `params` holds the function's parameters at their reflected offsets (see [`properties`]); the
 /// return value is written there too.
@@ -319,6 +383,59 @@ pub unsafe fn native_call_parameter(
             record = (*record).next;
         }
         None
+    }
+}
+
+/// A reflected function without parameters returning a `T`: an object pointer (`"ObjectProperty"`),
+/// or a small struct read as plain data, e.g. an `FVector` as `[f32; 3]` (`"StructProperty"`).
+pub struct Getter<T> {
+    function: *const UFunction,
+    /// Offset of the return value in the parameters.
+    result: usize,
+    returns: PhantomData<T>,
+}
+
+impl<T: Copy> Getter<T> {
+    /// The function `name` of `class`, checked to return a `kind` property of `T`'s size.
+    pub fn find(
+        class: *const UClass,
+        name: &'static str,
+        kind: &'static str,
+    ) -> Result<Self, String> {
+        let function = find_function(class, name)?;
+        // SAFETY: a live function record; its only parameter must be the return value.
+        unsafe {
+            let mut parameters = properties(function.cast());
+            match (parameters.next(), parameters.next()) {
+                (Some(result), None)
+                    if (*result).property_flags & RETURN_PARAMETER != 0
+                        && is_kind(result, kind)
+                        && (*result).element_size as usize == size_of::<T>()
+                        && Parameters::fit(function) =>
+                {
+                    Ok(Self {
+                        function,
+                        result: (*result).offset_internal as usize,
+                        returns: PhantomData,
+                    })
+                }
+                _ => Err(format!("{name}: unexpected parameters")),
+            }
+        }
+    }
+
+    /// # Safety
+    /// `object` must be a live object whose class has this function (any object of the class for a
+    /// static function, e.g. its default object), and every value the function returns must be a
+    /// valid `T`. Game thread only.
+    pub unsafe fn call(&self, object: *mut UObjectBase) -> T {
+        let mut parameters = Parameters::new();
+        // SAFETY: per the contract; the result lies within the checked parameter size.
+        unsafe {
+            let base = parameters.as_mut_ptr();
+            call(object, self.function, base);
+            base.add(self.result).cast::<T>().read_unaligned()
+        }
     }
 }
 

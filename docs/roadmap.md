@@ -24,6 +24,15 @@ likely approach are first guesses, to be revised as the editor gets reverse engi
   (slowest, fastest and step count in its constants).
 - **Slower moves**: Ctrl (1/10) and Alt (1/100) slow down moving bricks with the mouse. Done
   2026-10-09 as `features/move_slowdown` (factors in its constants).
+- **More view modes**: started 2026-10-10 as `features/view_modes` (Z or the panel's list; colors
+  in each mode's constants):
+  - "Mirror": bricks with a mirror-mode counterpart green, their own mirror image (on the plane)
+    green and gray, a mirror image mirror mode doesn't link (a property differs, or both on the
+    plane) orange, the others gray.
+  - "Duplicates": bricks with copies at their place (same type, place, rotation, size) red, deeper
+    the more copies relative to the vehicle's most, the others gray.
+  `game/editor_view` adds view modes and paints bricks with any color, so other view modes (e.g.
+  the reference model distance below) can reuse it.
 - **Drag to select**: box selection.
 - **Advanced resizing**:
   - Scale gizmo.

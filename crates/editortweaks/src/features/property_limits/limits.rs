@@ -170,8 +170,9 @@ impl Rule {
     pub unsafe fn matches_class(&self, class: *const UStruct) -> bool {
         // SAFETY: per the contract; parents are live as long as their children.
         self.class.is_empty()
-            || unsafe { reflection::with_parents(class) }
-                .any(|class| unsafe { reflection::struct_name(class).equals_str(self.class) })
+            || unsafe { reflection::with_parents(class) }.any(|class| unsafe {
+                reflection::name_is(reflection::struct_name(class), self.class)
+            })
     }
 }
 
@@ -298,10 +299,7 @@ impl Edit {
     fn matches(&self, rule: &Rule) -> bool {
         // SAFETY: `property` and `class` are live (see `new`).
         unsafe {
-            (*self.property)
-                .field
-                .name_private
-                .equals_str(rule.property)
+            reflection::name_is(&(*self.property).field.name_private, rule.property)
                 && rule.matches_class(self.class)
         }
     }

@@ -5,6 +5,8 @@ Signatures are read straight from the Rust sources, so there's a single source o
   resolve like brickworks does: the FIRST match in the image wins, then offset/mode is applied.
 - our `FunctionSig { name: "...", pattern: "..." }` declarations (mode "Function"): the single
   match in a code section, mapped to its function's start through .pdata, like `framework::sig`.
+- our `StringRefSig { name: "...", text: "..." }` declarations (mode "StringRef"): the function(s)
+  loading the address of that UTF-16 string with `lea r64, [rip + disp32]`; there must be one.
 """
 
 from __future__ import annotations
@@ -26,6 +28,12 @@ _FUNCTION_SIG = re.compile(
     r'FunctionSig\s*\{\s*name:\s*"(?P<name>[^"]+)",.*?pattern:\s*"(?P<pattern>[^"]+)"',
     re.S,
 )
+_STRING_REF_SIG = re.compile(
+    r'StringRefSig\s*\{\s*name:\s*"(?P<name>[^"]+)",.*?text:\s*"(?P<text>[^"]+)"',
+    re.S,
+)
+# `lea r64, [rip + disp32]`: REX.W (48 or 4C), 8D, ModRM with mod 00 and r/m 101.
+_RIP_LEA = re.compile(rb"[\x48\x4c]\x8d[\x05\x0d\x15\x1d\x25\x2d\x35\x3d]", re.S)
 
 
 @dataclass(frozen=True)
@@ -77,10 +85,34 @@ def find_signatures(roots: list[Path]) -> list[Signature]:
                 )
             for m in _FUNCTION_SIG.finditer(text):
                 signatures.append(Signature(m["name"], 0, "Function", m["pattern"], source(m)))
+            for m in _STRING_REF_SIG.finditer(text):
+                # The pattern holds the string itself.
+                signatures.append(Signature(m["name"], 0, "StringRef", m["text"], source(m)))
     return signatures
 
 
+def string_references(image: PeImage, text: str) -> list[int]:
+    """Start of the function containing each `lea` of the UTF-16 string `text` (-1 if none)."""
+    needle = text.encode("utf-16-le") + b"\x00\x00"
+    strings = {
+        m.start()
+        for m in re.finditer(re.escape(needle), image.image)
+        if m.start() % 2 == 0 and not image.section_of(m.start()).startswith(".text")
+    }
+    functions = []
+    for section in (s for s in image.sections if s.executable):
+        code = image.image[section.rva : section.rva + section.size]
+        for m in _RIP_LEA.finditer(code):
+            at = section.rva + m.start()
+            if at + 7 + struct.unpack_from("<i", image.image, at + 3)[0] in strings:
+                start = image.function_containing(at)
+                functions.append(start if start is not None else -1)
+    return functions
+
+
 def resolve(image: PeImage, signature: Signature) -> list[int]:
+    if signature.mode == "StringRef":
+        return string_references(image, signature.pattern)
     if signature.mode == "Function":
         targets = []
         for section in (s for s in image.sections if s.executable):
@@ -107,7 +139,7 @@ def check(image: PeImage, signatures: list[Signature]) -> list[Result]:
         targets = resolve(image, sig)
         if sig.mode == "SignatureStart":
             function_ok = not targets or is_function_start(image, targets[0])
-        elif sig.mode == "Function":
+        elif sig.mode in ("Function", "StringRef"):
             function_ok = -1 not in targets  # every match must be inside a known function
         else:
             function_ok = True

@@ -5,6 +5,10 @@
 
 pub mod brick_property;
 pub mod editor_input;
+pub mod editor_object;
+pub mod editor_view;
+pub mod kismet;
+pub mod mirror_mode;
 pub mod numeric_property;
 pub mod property_widget;
 pub mod reflection;

@@ -4,6 +4,7 @@
 //! then looked up in the exe's unwind table (`.pdata`), which lists every non-leaf function.
 //! So code added before the pattern in a game update doesn't break it, unlike "match + offset".
 //! Patterns must match exactly once; `et.py sigcheck` checks them against a new game build.
+//! A [`StringRefSig`] finds a function by a string constant it uses instead.
 
 use std::sync::OnceLock;
 
@@ -44,7 +45,7 @@ impl FunctionSig {
         if matches.next().is_some() {
             return Err(format!("{}: pattern matches more than once", self.name));
         }
-        let rva = (first as usize - image.base as usize) as u32;
+        let rva = image.rva_of(first);
         let start = image.function_containing(rva).ok_or_else(|| {
             format!(
                 "{}: match at RVA 0x{rva:X} isn't inside a known function",
@@ -56,6 +57,98 @@ impl FunctionSig {
             // SAFETY: `start` is an RVA from the image's own exception directory.
             function: unsafe { image.base.add(start as usize) },
         })
+    }
+}
+
+/// The one game function loading the address of a UTF-16 string constant, e.g. a string table key
+/// it looks up (`TEXT("Name_ViewMode_Default")`). Keys rarely change between game versions, unlike
+/// code, so this survives updates better than a byte pattern. Every reference must be in a single
+/// function. Keep the `name: "...", text: "..."` shape: `et.py sigcheck` parses these declarations.
+pub struct StringRefSig {
+    pub name: &'static str,
+    pub text: &'static str,
+}
+
+impl StringRefSig {
+    pub fn resolve(&self) -> Result<*const u8, String> {
+        let image = GameImage::get();
+        let needle: Vec<Option<u8>> = self
+            .text
+            .encode_utf16()
+            .chain([0])
+            .flat_map(u16::to_le_bytes)
+            .map(Some)
+            .collect();
+        let strings: Vec<u32> = image
+            .data_sections()
+            .flat_map(|data| find_all(data, &needle))
+            .map(|found| image.rva_of(found))
+            .filter(|rva| rva % 2 == 0)
+            .collect();
+        if strings.is_empty() {
+            return Err(format!("{}: string \"{}\" not found", self.name, self.text));
+        }
+        // `lea r64, [rip + disp32]`: REX.W (48 or 4C), 8D, ModRM with mod 00 and r/m 101.
+        let mut functions: Vec<u32> = Vec::new();
+        for code in image.code_sections() {
+            for at in 0..code.len().saturating_sub(7) {
+                if !matches!(code[at], 0x48 | 0x4C)
+                    || code[at + 1] != 0x8D
+                    || code[at + 2] & 0xC7 != 0x05
+                {
+                    continue;
+                }
+                let displacement =
+                    i32::from_le_bytes([code[at + 3], code[at + 4], code[at + 5], code[at + 6]]);
+                let rva = image.rva_of(code[at..].as_ptr());
+                let target = (rva + 7).wrapping_add_signed(displacement);
+                if strings.contains(&target) {
+                    let function = image.function_containing(rva).ok_or_else(|| {
+                        format!(
+                            "{}: reference at RVA 0x{rva:X} outside functions",
+                            self.name
+                        )
+                    })?;
+                    if !functions.contains(&function) {
+                        functions.push(function);
+                    }
+                }
+            }
+        }
+        match functions[..] {
+            // SAFETY: an RVA from the image's own exception directory.
+            [function] => Ok(unsafe { image.base.add(function as usize) }),
+            [] => Err(format!(
+                "{}: string \"{}\" not referenced",
+                self.name, self.text
+            )),
+            _ => Err(format!(
+                "{}: string \"{}\" referenced by {} functions",
+                self.name,
+                self.text,
+                functions.len()
+            )),
+        }
+    }
+}
+
+impl SigMatch {
+    /// The function called by the `call rel32` (E8) instruction `offset` bytes into the match, if it
+    /// is one and calls the start of a game function.
+    ///
+    /// # Safety
+    /// `offset + 5` must lie within the matched pattern.
+    pub unsafe fn call_target(&self, offset: usize) -> Option<*const u8> {
+        // SAFETY: per the contract, the instruction lies in the matched (mapped) code.
+        unsafe {
+            let call = self.address.add(offset);
+            if *call != 0xE8 {
+                return None;
+            }
+            let relative = call.add(1).cast::<i32>().read_unaligned() as isize;
+            let target = call.add(5).wrapping_offset(relative);
+            is_function_start(target).then_some(target)
+        }
     }
 }
 
@@ -80,6 +173,8 @@ struct GameImage {
     base: *const u8,
     /// (rva, size) of executable sections.
     code: Vec<(u32, u32)>,
+    /// (rva, size) of readable, non-executable sections (constants, strings, ...).
+    data: Vec<(u32, u32)>,
     /// (begin, end, unwind info) RVAs from the exception directory, sorted by begin.
     functions: &'static [[u32; 3]],
 }
@@ -110,28 +205,53 @@ impl GameImage {
             let (pdata_rva, pdata_size) = (read_u32(exception_dir), read_u32(exception_dir + 4));
 
             const IMAGE_SCN_MEM_EXECUTE: u32 = 0x2000_0000;
-            let code = (0..section_count)
+            const IMAGE_SCN_MEM_READ: u32 = 0x4000_0000;
+            // (rva, virtual size, characteristics) of each section.
+            let sections: Vec<(u32, u32, u32)> = (0..section_count)
                 .map(|i| optional + optional_size + i * 40)
-                .filter(|&s| read_u32(s + 36) & IMAGE_SCN_MEM_EXECUTE != 0)
-                .map(|s| (read_u32(s + 12), read_u32(s + 8)))
+                .map(|s| (read_u32(s + 12), read_u32(s + 8), read_u32(s + 36)))
                 .collect();
+            let with = |wanted: u32, unwanted: u32| {
+                sections
+                    .iter()
+                    .filter(|&&(_, _, flags)| flags & wanted == wanted && flags & unwanted == 0)
+                    .map(|&(rva, size, _)| (rva, size))
+                    .collect()
+            };
             let functions = std::slice::from_raw_parts(
                 base.add(pdata_rva as usize) as *const [u32; 3],
                 pdata_size as usize / 12,
             );
             GameImage {
                 base,
-                code,
+                code: with(IMAGE_SCN_MEM_EXECUTE, 0),
+                data: with(IMAGE_SCN_MEM_READ, IMAGE_SCN_MEM_EXECUTE),
                 functions,
             }
         }
     }
 
     fn code_sections(&self) -> impl Iterator<Item = &'static [u8]> + '_ {
-        self.code.iter().map(|&(rva, size)| {
-            // SAFETY: executable sections are mapped and readable for `size` bytes.
+        self.sections(&self.code)
+    }
+
+    fn data_sections(&self) -> impl Iterator<Item = &'static [u8]> + '_ {
+        self.sections(&self.data)
+    }
+
+    fn sections<'a>(
+        &'a self,
+        sections: &'a [(u32, u32)],
+    ) -> impl Iterator<Item = &'static [u8]> + 'a {
+        sections.iter().map(|&(rva, size)| {
+            // SAFETY: the image's sections are mapped and readable for their virtual size.
             unsafe { std::slice::from_raw_parts(self.base.add(rva as usize), size as usize) }
         })
+    }
+
+    /// The RVA of an address inside the image.
+    fn rva_of(&self, address: *const u8) -> u32 {
+        (address as usize - self.base as usize) as u32
     }
 
     /// Start RVA of the function containing `rva`, following chained entries (code the compiler

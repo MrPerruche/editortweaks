@@ -1,7 +1,32 @@
 //! Holding on to a `UObject` across frames without keeping a dangling pointer, like Unreal's
 //! `TWeakObjectPtr`: the object is alive while its slot in the global object array still holds it.
+//! Also reading the game's own weak pointers ([`resolve`]).
 
 use brickrust::ue::coreuobject::{GObjects, UObjectBase};
+use brickrust::ue::tshared::FWeakObjectPtr;
+
+/// `EInternalObjectFlags` of objects about to be destroyed: `PendingKill` and `Unreachable`.
+const DYING: i32 = (1 << 29) | (1 << 28);
+
+/// The object a game `FWeakObjectPtr` refers to, if it still exists, like `FWeakObjectPtr::Get`:
+/// its slot in the global object array must still hold an object with the same serial number.
+/// Game thread only.
+pub fn resolve(pointer: FWeakObjectPtr) -> Option<*mut UObjectBase> {
+    // SAFETY: the object array lives as long as the game, and every slot below its count is
+    // allocated; only the slot is read.
+    unsafe {
+        let array = &GObjects().array;
+        if pointer.object_serial_number == 0 || !(0..array.Count()).contains(&pointer.object_index)
+        {
+            return None;
+        }
+        let item = &*array.Get(pointer.object_index);
+        let alive = !item.object.is_null()
+            && item.serial == pointer.object_serial_number
+            && item.flags & DYING == 0;
+        alive.then_some(item.object.cast())
+    }
+}
 
 pub struct WeakObject {
     object: *mut UObjectBase,

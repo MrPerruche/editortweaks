@@ -96,3 +96,33 @@ assumed.
   The game's thunks: `execAxis_MouseMoveRight` 0xF71540 (virtual call +0x440), `Up` 0xF71650,
   found through the class's native function table (name string, then thunk).
 - `IsInPrecisionMoveMode` (0xBC650) exists but is unrelated to speed (no gizmo axis chosen).
+
+## Snapping while moving (explored 2026-10-10, not used yet)
+
+Looked into for face/edge snapping (roadmap "Advanced resizing"); nothing here is used yet.
+
+- `virtual FBrickEditorSnappingOffset ABrickEditor::GetMoveSnappingOffset(const
+  FGetMoveSnappingOffsetParams&) const` (BRMK 0xB0DA0) returns no offset: zero vectors at +0 and
+  +0xC, 0 at +0x18, an identity `FQuat` at +0x20 (0x30 bytes). `AVehicleEditor` overrides it (BRMK
+  0xB0DE0) with connector snapping: it reads two floats from the parameters, +0x60 (squared and
+  compared: a distance, likely `EditorBrickSnappingDistance`) and +0x64 (`cosf`: an angle, likely
+  `EditorBrickSnappingAngle`), takes an array through the pointer at +0x8 (count read at +8), and
+  runs a query over 12 entries of 0x18 bytes with callbacks (helpers 0x437610 and 0x42D410,
+  unexported). Neither function is reflected, and the shipping exe has no string naming it (the
+  stat name is compiled out): finding it in the game means a vtable slot of `AVehicleEditor` or a
+  signature.
+- The user's snapping settings are reflected `UBrickUserSettings` properties (names present in
+  the shipping exe): `bEditorSnappingEnabled` (Space toggles it), `EditorBrickSnappingDistance` /
+  `Angle`, `EditorGridSnappingDistance` / `Angle`.
+- `UBrickEditorMoveMode::EffectiveMoveLocation` / `EffectiveMoveRotation` are reflected properties
+  (BRMK `__PPO__` exports). The functions that apply a move (`GetEffectiveObjectTransform`,
+  `SanitizeObjectTransform`, `UBrickEditorObject::SetMoveTransform`) and the undo scopes
+  (`ABrickEditor::StartScopedOperation` / `FinishScopedOperation` / `PostModify`) are not.
+- Reflected and useful for geometry: `UBrickEditorObject::GetWorldTransform`,
+  `GetBrickEditorObjectSpawnTransform`, `GetBrickEditorObjectLocalBounds` (see
+  `editor-view-modes.md`), `UScalableBrick::BrickSize`. Engine: `UWorld::LineBatcher` /
+  `PersistentLineBatcher` / `ForegroundLineBatcher` and `APlayerController::
+  DeprojectMousePositionToWorld` / `ProjectWorldLocationToScreen` names are in the shipping exe
+  (drawing lines in the viewport: unverified that the shipping game renders the batchers).
+- `ABrickEditor::GetHoveredObject` and `GetObjectAtScreenPosition` (the editor's own picking) are
+  not reflected.

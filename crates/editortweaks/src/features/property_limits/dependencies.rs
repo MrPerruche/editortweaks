@@ -213,7 +213,7 @@ unsafe fn limit_dependents(
     let dependents = unsafe { dependents(reflection::class_of(object.cast())) };
     let is_changed = |name: &'static str| {
         // SAFETY: names in the game's name table live as long as the game.
-        unsafe { changed.equals_str(name) }
+        unsafe { reflection::name_is(&changed, name) }
     };
     let affected: Vec<&Dependent> = dependents
         .iter()
@@ -420,6 +420,7 @@ unsafe fn float_count(property: *const FProperty) -> Option<usize> {
             return Some(1);
         }
         let ustruct = reflection::struct_type(property);
-        (!ustruct.is_null() && reflection::struct_name(ustruct).equals_str("Vector")).then_some(3)
+        (!ustruct.is_null() && reflection::name_is(reflection::struct_name(ustruct), "Vector"))
+            .then_some(3)
     }
 }

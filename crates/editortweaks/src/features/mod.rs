@@ -10,6 +10,7 @@ mod precise_sliders;
 mod property_limits;
 mod slider_drag;
 mod slider_formulas;
+mod view_modes;
 
 /// All features, in load order.
 pub static ALL: &[&dyn Feature] = &[
@@ -20,4 +21,5 @@ pub static ALL: &[&dyn Feature] = &[
     &slider_drag::SliderDrag,
     &camera_speed::CameraSpeed,
     &move_slowdown::MoveSlowdown,
+    &view_modes::ViewModes,
 ];

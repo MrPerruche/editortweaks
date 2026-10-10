@@ -13,7 +13,7 @@ Conventions:
 | Steam build | Date | Exe size | `sigcheck` | Notes |
 |---|---|---|---|---|
 | 25633865 (public) | 2026-10-08 | 81,198,080 | 16 OK, 1 SAME, 2 AMBIGUOUS, 0 MISSING | First build used. UE 4.27.2. Upstream `GetProjectVersion` offset fixed (vendored patch 6). |
-| 25831956 (public) | 2026-10-09 | 81,198,080 | 29 OK, 1 SAME, 2 AMBIGUOUS, 0 MISSING | Hotfix, still 1.11.7. Code moved (e.g. `SetValueInternal` 0xF39340 -> 0xF393E0, `ClampValue` 0xD01BD0 -> 0xD01C00); every signature still matched and the mod ran unchanged. New signatures checked against both builds. Exe kept in `.local/game-builds/`. |
+| 25831956 (public) | 2026-10-09 | 81,198,080 | 35 OK, 1 SAME, 2 AMBIGUOUS, 0 MISSING | Hotfix, still 1.11.7. Code moved (e.g. `SetValueInternal` 0xF39340 -> 0xF393E0, `ClampValue` 0xD01BD0 -> 0xD01C00); every signature still matched and the mod ran unchanged. New signatures checked against both builds. Exe kept in `.local/game-builds/`. |
 
 Lesson from `GetProjectVersion` (crashed the game on first launch): its pattern is inside the
 function and upstream applied the offset in the wrong direction, landing mid-instruction in the next
