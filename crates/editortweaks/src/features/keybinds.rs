@@ -23,8 +23,8 @@ use crate::game::text::Text;
 use crate::platform::keyboard;
 use crate::prelude::*;
 
-/// Shows the box of the brick under the mouse while held; clicking then resizes it
-/// (`brick_resize`).
+/// Shows the box of the brick under the mouse while held; clicking then resizes it, or moves it
+/// while moving bricks with the gizmo showing (`brick_resize`).
 pub static RESIZE_BRICKS: Keybind = Keybind::new(
     "EditorTweaks_ResizeBricks",
     "Fast editing",
@@ -32,12 +32,30 @@ pub static RESIZE_BRICKS: Keybind = Keybind::new(
     &["LeftAlt", "RightAlt"],
 );
 
-/// Snaps the dragged part to other bricks while held during a resize (`brick_resize`).
+/// While held with [`RESIZE_BRICKS`], bricks' models replace their boxes: what the mouse points at,
+/// drags and snaps to are the faces, edges and vertices of the models (`brick_resize`).
+pub static MODEL_EDITING: Keybind = Keybind::new(
+    "EditorTweaks_ModelEditing",
+    "Fast editing on models",
+    "Hold while fast editing to use the faces, edges and vertices of bricks' models instead of their boxes.",
+    &["ThumbMouseButton"],
+);
+
+/// Snaps the dragged part to other bricks while held during a resize or move (`brick_resize`).
 pub static SNAP_RESIZE: Keybind = Keybind::new(
     "EditorTweaks_SnapResize",
-    "Snap resizing",
-    "Hold while fast editing to snap a brick to faces, edges and corners.",
+    "Fast editing snapping",
+    "Hold while fast editing to snap to other bricks: corners, middles, intersections, edges and faces. Moved bricks also turn to match faces and edges.",
     &["LeftControl", "RightControl"],
+);
+
+/// Each press while a moved brick snaps and turns to match the target turns it the next way that
+/// matches (`brick_resize`).
+pub static NEXT_ORIENTATION: Keybind = Keybind::new(
+    "EditorTweaks_NextOrientation",
+    "Fast editing next orientation",
+    "Press while moving bricks with fast editing snapping to turn them the next way that matches the face or edge they snap to.",
+    &["R"],
 );
 
 /// Slows down mouse moves of bricks and of the camera while held (`move_slowdown`).
@@ -65,9 +83,11 @@ pub static KEEP_DRAGGING_SLIDERS: Keybind = Keybind::new(
 );
 
 /// Every keybind, in the order the settings list them.
-static ALL: [&Keybind; 5] = [
+static ALL: [&Keybind; 7] = [
     &RESIZE_BRICKS,
+    &MODEL_EDITING,
     &SNAP_RESIZE,
+    &NEXT_ORIENTATION,
     &SLOW_MOVES,
     &SLOW_GIZMO_MOVES,
     &KEEP_DRAGGING_SLIDERS,

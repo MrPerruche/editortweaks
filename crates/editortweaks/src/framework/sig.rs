@@ -234,7 +234,30 @@ pub fn is_function_start(address: *const u8) -> bool {
         .is_ok()
 }
 
-/// The game's main module as mapped in memory.
+/// Another module of the game (a DLL it loaded, e.g. PhysX's), to check that code pointers read
+/// from game data lead into it before calling them.
+pub struct Module(GameImage);
+
+impl Module {
+    /// The loaded module called `name` (e.g. `"PhysX3Common_x64.dll"`), if it is loaded. Only for
+    /// modules the game keeps loaded until it quits.
+    pub fn find(name: &str) -> Option<Self> {
+        let wide: Vec<u16> = name.encode_utf16().chain([0]).collect();
+        // SAFETY: a NUL-terminated name; a loaded module's PE headers are mapped while it's loaded,
+        // which per the contract is as long as the game runs.
+        unsafe {
+            let base = GetModuleHandleW(wide.as_ptr());
+            (!base.is_null()).then(|| Self(GameImage::parse(base as *const u8)))
+        }
+    }
+
+    /// Whether `address` lies in the module's code.
+    pub fn is_code(&self, address: *const u8) -> bool {
+        self.0.code_at(address, 1).is_some()
+    }
+}
+
+/// A module (the game's main one, or [`Module`]) as mapped in memory.
 struct GameImage {
     base: *const u8,
     /// (rva, size) of executable sections.

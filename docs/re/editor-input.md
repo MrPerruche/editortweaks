@@ -146,7 +146,10 @@ assumed.
   angle of that axis), other values for the gizmo's arrows. G (`Action_MoveSelection`, 0x222BB0)
   starts a move by {Z, 1} through `HandleStartMoveOrSetGizmoAxis` (0x23F010), the default mode's
   `MoveSelection` and the move mode's `BeginMode`. `GetGizmoAxis` (0xAEF90) returns its address;
-  `SetGizmoAxis` (0xE7E40) sets it. Two leaf functions test it: `IsInPrecisionMoveMode` (0xBC650,
+  `SetGizmoAxis` (0xE7E40) sets it. During a move, `HandleStartMoveOrSetGizmoAxis` sets the axis it's
+  given ({Z, 1} for G) unless the move already has it; then it sets the second one it's given
+  instead ({Z, 0} for G): G during a G move frees the mouse and shows the gizmo (the precision move
+  mode below), G again goes back. Two leaf functions test it: `IsInPrecisionMoveMode` (0xBC650,
   not virtual, inlined in the game): `Axis == 0 || Type == 0`; `ShouldCaptureMouse` (0xEAD40,
   virtual; game 0xD08E20, its only pointer at `.rdata` 0x38D8398 in the move mode's vtable): the
   opposite. Leaf functions have no `.pdata` entry, so the mod finds it by its whole code
@@ -159,11 +162,21 @@ assumed.
   held, in any move mode; only type 1 moves use it. `move_slowdown` slows down by Shift only moves
   of the other types (`EditorModes::moving` is `ByGizmo`), and never while the camera is moved.
 
-## Snapping while moving (explored 2026-10-10, not used yet)
+- The precision move mode (no axis, or type 0: the mouse is free, the gizmo shows; `Moving::Precisely`
+  in `game::editor_mode`): the move mode's `PressObjectAtScreenPosition` (BRMK 0xC8180) only acts on
+  a gizmo handle, the one `ABrickEditor::GetGizmoAxisAtScreenPosition` (0xAEFA0) finds there if it's
+  the hovered one (editor +0x4E0/+0x4E4): `SetGizmoAxis` with it. `ReleaseObjectAtScreenPosition`
+  (0xD58B0) ends a handle's drag (flag 0x20 and an axis with a type: `SetGizmoAxis(none)`, the move
+  goes on) or else ends the move (`EnterDefaultEditorMode`, the commit). So a click off the gizmo
+  ends the move. The editor's default mode instead marks the hovered object pressed on a press and
+  selects on the release (`UBrickEditorMode`, 0xC8150 / 0xD57E0).
 
-Looked into for face/edge snapping while moving (roadmap "Advanced resizing"); the move-mode
-parts aren't used yet. The resize tool's pieces (undo operations, moving bricks from code, line
-drawing, the left click) are in `editor-operations.md`.
+## Snapping while moving (explored 2026-10-10)
+
+Looked into for face/edge snapping while moving (roadmap "Advanced resizing"). The resize tool's
+moving (2026-10-11) doesn't go through the game's brick snapping: it gives the move its own place
+(see `editor-operations.md`, "Moving the bricks of a move from code"), as do its other pieces (undo
+operations, moving bricks from code, line drawing, the left click).
 
 - `virtual FBrickEditorSnappingOffset ABrickEditor::GetMoveSnappingOffset(const
   FGetMoveSnappingOffsetParams&) const` (BRMK 0xB0DA0) returns no offset: zero vectors at +0 and
@@ -173,8 +186,8 @@ drawing, the left click) are in `editor-operations.md`.
   `EditorBrickSnappingAngle`), takes an array through the pointer at +0x8 (count read at +8), and
   runs a query over 12 entries of 0x18 bytes with callbacks (helpers 0x437610 and 0x42D410,
   unexported). Neither function is reflected, and the shipping exe has no string naming it (the
-  stat name is compiled out): finding it in the game means a vtable slot of `AVehicleEditor` or a
-  signature.
+  stat name is compiled out). In the game: the editor's vtable +0x688, read from `TickMode`'s call
+  (see `editor-operations.md`, "Moving the bricks of a move from code"); `brick_resize` hooks it.
 - The user's snapping settings are reflected `UBrickUserSettings` properties (names present in
   the shipping exe): `bEditorSnappingEnabled` (Space toggles it), `EditorBrickSnappingDistance` /
   `Angle`, `EditorGridSnappingDistance` / `Angle`.

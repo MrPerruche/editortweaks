@@ -14,7 +14,9 @@ use crate::game::reflection;
 /// `virtual bool UBrickEditorMoveMode::ShouldCaptureMouse() const` (BRMK 0xEAD40, game RVA
 /// 0xD08E20): whether the mode moves bricks by a gizmo axis, its first own field, an
 /// `FBrickEditorGizmoAxis` (not reflected): the axis (4 bytes, `EAxis`: 1 X, 2 Y, 3 Z) and how
-/// bricks move by it (1 byte, see [`FREE_MOVE`]), 0 for none.
+/// bricks move by it (1 byte, see [`FREE_MOVE`]), 0 for none. Without one, the mouse is free and
+/// the gizmo shows: G during a G move switches between the two (`HandleStartMoveOrSetGizmoAxis`,
+/// BRMK 0x23F010: {Z, 1} and {Z, 0}).
 ///
 /// ```text
 /// return GizmoAxis.Axis != 0 && GizmoAxis.Type != 0;
@@ -42,6 +44,9 @@ pub enum Moving {
     Freely,
     /// By a gizmo handle (along or around an axis).
     ByGizmo,
+    /// Not moving them for now: the mouse is free and the gizmo shows, to grab one of its handles
+    /// (the game's precision move mode; a click elsewhere ends the move).
+    Precisely,
     /// In a move mode, but how wasn't found (see [`SHOULD_CAPTURE_MOUSE`]).
     Somehow,
 }
@@ -186,11 +191,25 @@ impl EditorModes {
             let mode = mode.cast::<u8>();
             let axis = mode.add(offsets.axis).cast::<u32>().read_unaligned();
             let kind = mode.add(offsets.kind).read();
-            Some(if axis != 0 && kind == FREE_MOVE {
+            Some(if axis == 0 || kind == 0 {
+                Moving::Precisely
+            } else if kind == FREE_MOVE {
                 Moving::Freely
             } else {
                 Moving::ByGizmo
             })
+        }
+    }
+
+    /// `editor`'s current mode if it's a move mode.
+    ///
+    /// # Safety
+    /// `editor` must be a live `ABrickEditor`.
+    pub unsafe fn move_mode(&self, editor: *const UObjectBase) -> Option<*mut UObjectBase> {
+        // SAFETY: per the contract.
+        unsafe {
+            let mode = self.current(editor);
+            (!mode.is_null() && self.is_a(mode, self.move_mode)).then_some(mode)
         }
     }
 

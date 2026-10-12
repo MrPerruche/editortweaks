@@ -9,7 +9,9 @@
 //! rotations, and the move as the move mode keeps it (its place and rotation, the mouse's drag and
 //! turn snapped like the game snaps them, the brick snapping adjustment; see `game::move_mode`).
 //! Only the final result is rounded, to the `f32` the game stores: the one nearest the exact
-//! result, so a turn that should give 90° gives 90°. Nothing is rounded to steps or "cleaned".
+//! result, so a turn that should give 90° gives 90°. Nothing is rounded to steps; only the `f64`
+//! noise of turning near zero (below 1e-9) is stored as zero, which `f32` would otherwise keep
+//! (`math::narrow_settled`).
 //!
 //! The move mode also rounds midway: when the gizmo's axis changes (releasing a gizmo handle,
 //! grabbing another), it folds the input so far into the move's own place and rotation, in `f32`.
@@ -25,6 +27,10 @@
 //!
 //! How: `UBrickEditorMoveMode::SanitizeObjectTransform`, the last step of every brick's move, and
 //! `ApplyAccumulatedInput`, the fold, are hooked; their results are replaced after they run.
+//!
+//! Other features moving bricks through the move mode use the same math ([`effective`],
+//! [`carried`]) and give the move its place through [`place_move`], which keeps it exact the same
+//! way.
 
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Mutex, Once, OnceLock, PoisonError};
@@ -52,11 +58,10 @@ pub struct PreciseMoves;
 
 static ORIGINAL_SANITIZE: OnceLock<SanitizeFn> = OnceLock::new();
 static ORIGINAL_APPLY_INPUT: OnceLock<ApplyInputFn> = OnceLock::new();
-static FOUND: OnceLock<MoveMode> = OnceLock::new();
 /// Set once the offsets are checked against reflection; until then the hooks change nothing.
 static READY: AtomicBool = AtomicBool::new(false);
 
-/// The last fold, in `f64`.
+/// The last fold (or place given by [`place_move`]), in `f64`.
 static FOLD: Mutex<Option<Fold>> = Mutex::new(None);
 
 /// A fold of a move's input into its own place and rotation.
@@ -83,9 +88,8 @@ impl Feature for PreciseMoves {
     }
 
     fn on_load(&self) -> LoadResult {
-        let found = move_mode::find()?;
+        let found = move_mode::shared()?;
         let (sanitize, apply_input) = (found.sanitize, found.apply_input);
-        let _ = FOUND.set(found);
         // SAFETY: each target is the start of the function its signature names, and each detour
         // has that function's signature.
         unsafe {
@@ -105,20 +109,22 @@ impl Feature for PreciseMoves {
     }
 
     fn on_engine_init(&self) {
-        match FOUND.get().map(MoveMode::check) {
-            Some(Ok(())) => {
+        match move_mode::shared().map(MoveMode::check) {
+            Ok(Ok(())) => {
                 READY.store(true, Ordering::Relaxed);
                 log!("active");
             }
-            Some(Err(reason)) => log!("inactive: {reason}"),
-            None => {}
+            Ok(Err(reason)) => log!("inactive: {reason}"),
+            Err(_) => {}
         }
     }
 }
 
 /// The offsets, once checked.
 fn found() -> Option<&'static MoveMode> {
-    FOUND.get().filter(|_| READY.load(Ordering::Relaxed))
+    move_mode::shared()
+        .ok()
+        .filter(|_| READY.load(Ordering::Relaxed))
 }
 
 unsafe extern "C" fn sanitize_detour(
@@ -154,14 +160,14 @@ unsafe extern "C" fn apply_input_detour(mode: *mut UObjectBase) {
 
 /// A place and rotation in `f64`.
 #[derive(Clone, Copy, Debug)]
-struct Place {
-    location: Vec3,
-    rotation: Quat,
+pub struct Place {
+    pub location: Vec3,
+    pub rotation: Quat,
 }
 
 impl Place {
     /// A stored location and rotator.
-    fn stored(location: Vector, rotation: Vector) -> Self {
+    pub fn stored(location: Vector, rotation: Vector) -> Self {
         Self {
             location: math::widen(location),
             rotation: Quat::from_rotator(math::widen(rotation)),
@@ -219,10 +225,10 @@ unsafe fn replace(
         rotation: Quat::widen(moved.rotation),
     };
     let input = with_input(&current, base(mode, &current));
-    let mut place = moved_place(&adjusted(&input, &current.adjustment), &reference, &brick);
+    let mut place = carried(&adjusted(&input, &current.adjustment), &reference, &brick);
     // The panel's numbers are the reference brick's move without the brick snapping adjustment.
     if object == current.reference.cast_const() {
-        let unadjusted = moved_place(&input, &reference, &brick);
+        let unadjusted = carried(&input, &reference, &brick);
         if unadjusted.apart(&game) < place.apart(&game) {
             place = unadjusted;
         }
@@ -241,10 +247,10 @@ unsafe fn replace(
     let before = *out;
     // Like the game, leave what it kept as it was (or as the move began).
     if out.rotation != rotation && Some(out.rotation) != effective_rotation {
-        out.rotation = math::narrow(place.rotation.to_rotator());
+        out.rotation = math::narrow_settled(place.rotation.to_rotator());
     }
     if out.location != location && Some(out.location) != effective_location {
-        out.location = math::narrow(place.location);
+        out.location = math::narrow_settled(place.location);
     }
     if out.rotation != before.rotation || out.location != before.location {
         LOG_EXACT.call_once(|| {
@@ -284,8 +290,8 @@ unsafe fn replace_fold(found: &MoveMode, mode: *mut UObjectBase, before: &Move) 
         log_mismatch("a fold", &exact, &game, before, None);
         return;
     }
-    let location = math::narrow(exact.location);
-    let rotation = math::narrow(exact.rotation.to_rotator());
+    let location = math::narrow_settled(exact.location);
+    let rotation = math::narrow_settled(exact.rotation.to_rotator());
     // SAFETY: per the contract; the game is done with them until the next input.
     unsafe { found.set_place(mode, location, rotation) };
     *fold = Some(Fold {
@@ -304,15 +310,16 @@ unsafe fn replace_fold(found: &MoveMode, mode: *mut UObjectBase, before: &Move) 
     });
 }
 
-/// Where `current` starts from: its own place and rotation, as last folded in `f64` while they're
-/// still the ones that fold gave the game; else as the game keeps them (when the move began, the
-/// reference brick's stored place and rotation).
+/// Where `current` starts from: its own place and rotation, as last folded (or given by
+/// [`place_move`]) in `f64` while they're still the ones the game was given then; else as the game
+/// keeps them (when the move began, the reference brick's stored place and rotation). A move
+/// beginning where the last one left its reference brick starts from the same exact place, which
+/// rounds to the same.
 fn base(mode: *const UObjectBase, current: &Move) -> Place {
     let fold = *FOLD.lock().unwrap_or_else(PoisonError::into_inner);
     match fold {
         Some(fold)
-            if current.folded
-                && fold.mode == mode as usize
+            if fold.mode == mode as usize
                 && fold.location == current.location
                 && fold.rotation == current.rotation =>
         {
@@ -320,6 +327,34 @@ fn base(mode: *const UObjectBase, current: &Move) -> Place {
         }
         _ => Place::stored(current.location, current.rotation),
     }
+}
+
+/// Where the move `current` of `mode` puts its reference brick now, input and brick snapping
+/// included, in `f64`.
+pub fn effective(mode: *const UObjectBase, current: &Move) -> Place {
+    adjusted(
+        &with_input(current, base(mode, current)),
+        &current.adjustment,
+    )
+}
+
+/// Puts the move of `mode` at `place` (where it puts its reference brick), with no input or brick
+/// snapping on top (see `MoveMode::replace`): the game gets the nearest `f32` values, `place` is
+/// kept for the bricks' places computed from them.
+///
+/// # Safety
+/// `mode` must be a live move mode. Game thread only.
+pub unsafe fn place_move(found: &MoveMode, mode: *mut UObjectBase, place: Place) {
+    let location = math::narrow_settled(place.location);
+    let rotation = math::narrow_settled(place.rotation.to_rotator());
+    // SAFETY: per the contract.
+    unsafe { found.replace(mode, location, rotation) };
+    *FOLD.lock().unwrap_or_else(PoisonError::into_inner) = Some(Fold {
+        mode: mode as usize,
+        location,
+        rotation,
+        exact: place,
+    });
 }
 
 /// Where the move puts the reference brick before brick snapping, from `base`:
@@ -378,8 +413,9 @@ fn adjusted(moved: &Place, adjustment: &Adjustment) -> Place {
 }
 
 /// Where a brick at `brick` goes when the reference brick goes from `reference` to `moved`: it
-/// keeps its place relative to it (`GetEffectiveObjectTransform`).
-fn moved_place(moved: &Place, reference: &Place, brick: &Place) -> Place {
+/// keeps its place relative to it (`GetEffectiveObjectTransform`, for bricks that aren't mirror
+/// mode counterparts).
+pub fn carried(moved: &Place, reference: &Place, brick: &Place) -> Place {
     let back = reference.rotation.inverse();
     let relative = back.rotate(math::sub(brick.location, reference.location));
     Place {

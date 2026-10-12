@@ -7,7 +7,7 @@
 
 use crate::game::editor_object::{Transform, Vector};
 use crate::math::{self, Quat};
-pub use crate::math::{Vec3, add, dot, length, normalized, scale, sub};
+pub use crate::math::{Vec3, add, cross, dot, length, normalized, scale, sub};
 
 /// A ray: its origin and unit direction.
 #[derive(Clone, Copy)]
@@ -19,6 +19,11 @@ pub struct Ray {
 /// The point `distance` along `ray`.
 pub fn along(ray: &Ray, distance: f64) -> Vec3 {
     add(ray.origin, scale(ray.direction, distance))
+}
+
+/// The point `share` of the way from `start` to `end`.
+pub fn lerp([start, end]: [Vec3; 2], share: f64) -> Vec3 {
+    add(start, scale(sub(end, start), share))
 }
 
 /// A place and rotation: a brick's own axes and origin in the vehicle, or the vehicle's in the
@@ -158,6 +163,30 @@ pub fn ray_box(ray: &Ray, bounds: &Bounds) -> Option<(f64, usize, bool)> {
         exit = exit.min(far);
     }
     (enter.0 >= 0.0 && enter.0 <= exit).then_some(enter)
+}
+
+/// Whether the segment between `ends` meets the box (both in the box's frame).
+pub fn segment_box(ends: [Vec3; 2], bounds: &Bounds) -> bool {
+    // The part of the segment inside the box, as shares of its length.
+    let (mut enter, mut exit) = (0.0f64, 1.0f64);
+    let sides = bounds.min.iter().zip(&bounds.max);
+    for ((&start, &end), (&min, &max)) in ends[0].iter().zip(&ends[1]).zip(sides) {
+        let along = end - start;
+        if along.abs() < 1e-12 {
+            if start < min || start > max {
+                return false;
+            }
+            continue;
+        }
+        let to_min = (min - start) / along;
+        let to_max = (max - start) / along;
+        enter = enter.max(to_min.min(to_max));
+        exit = exit.min(to_min.max(to_max));
+        if enter > exit {
+            return false;
+        }
+    }
+    true
 }
 
 /// How far along the line through `point` along `direction` (length 1) its point closest to the

@@ -14,9 +14,13 @@
 //! Nothing else re-clamps, so saved vehicles keep their values, also for players without the mod
 //! (until they edit that value). Arrow keys still stop at the slider's ends, and so does dragging
 //! unless `slider_drag` lifts that; a rule's `drag_min` then stops drags before typed values.
+//!
+//! [`highlight`] colors sliders showing values outside of the game's range, and differently those
+//! outside of the rules too.
 
 mod brick_size;
 mod dependencies;
+mod highlight;
 mod limits;
 mod property;
 mod rules;
@@ -39,6 +43,7 @@ impl Feature for PropertyLimits {
         let property_targets = property::resolve()?;
         let brick_size_target = brick_size::resolve();
         let dependencies_targets = dependencies::resolve();
+        let highlight_target = highlight::resolve();
 
         // SAFETY: each target is the start of the function its pattern identifies, and each
         // submodule's detours have exactly the signatures declared next to those patterns.
@@ -55,6 +60,12 @@ impl Feature for PropertyLimits {
                     "limits depending on other properties only apply when their value is edited: {reason}"
                 ),
             }
+            match highlight_target {
+                Ok(target) => highlight::install(target)?,
+                Err(reason) => {
+                    log!("values outside of the game's range aren't highlighted: {reason}")
+                }
+            }
         }
         Ok(())
     }
@@ -62,6 +73,7 @@ impl Feature for PropertyLimits {
     fn on_engine_init(&self) {
         slider::on_engine_init();
         brick_size::on_engine_init();
+        highlight::on_engine_init();
     }
 }
 

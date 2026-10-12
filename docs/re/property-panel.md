@@ -81,6 +81,62 @@ values in them itself.
 The slider's range comes from `UpdateValue` -> (BRMK 0x3883F0) -> `SetValueRange(Range.Min[i],
 Range.Max[i])`, where the range is the property's virtual `GetValueRange` (vtable +0xA0).
 
+## UNumericPropertyWidget::UpdateValue (game build 25831956)
+
+Virtual, `UpdateValue(const FBrickPropertyChangedEvent*)`: BRMK export 0x3FD440, game 0xF03680
+(0xF035E0 in 25633865; pattern in `crates/editortweaks/src/game/property_widget.rs`). Fills the row's sliders from the
+first edited object whenever the panel shows or refreshes the property; not during a slider drag.
+In order: the value through a helper (game 0xEAE1B0, BRMK 0x3826C0: builds the first object's
+container, calls the property's getter), the value type, the property's `GetValueRange` with that
+container, the Blueprint event `UpdateNumericProperty(ValueType, NumSliders)`, then BRMK 0x3883F0
+setting each slider's range and value (`SetValue` stores `Value` and calls `UpdateSliderValue`,
+not `SetValueInternal`).
+
+Found in the game through `OnSliderValueChanged`: its exec thunk is in the class's native function
+table (`{"AreAxesLocked", thunk}, {"LockAxes", ...}, {"OnSliderValueChanged", 0xFE6470}`; a second
+table with the same names belongs to another class and has a one-parameter thunk), which calls
+0xEEAAC0; that one's first call is the value helper, whose only other caller is `UpdateValue`.
+
+## Color styles and warnings (BRMK 1.11.6, game build 25831956)
+
+Brick Rigs widgets pick colors by `EBrickUIColorStyle`: Default 0, Selected 1, Foreground 2,
+Highlight 3, Positive 4, Negative 5, Neutral 6, Custom 7 (enum params, from the
+`EBrickUIColorStyle::Default` string's reference). Many widgets have `SetColorStyle` (reflected,
+`execSetColorStyle` exists for 12 classes). `UButtonWidgetBase::SetColorStyle` (BRMK 0x44EEB0)
+stores the style in the reflected `ColorStyle` (+0x410 BRMK, +0x278 game: property params found
+from the `"ColorStyle"` string's references) and, once constructed, calls
+`UpdateButtonStyleInternal`, which calls the virtual `UpdateButtonStyle(ColorStyle, BrushState)`.
+`UBrickSliderWidget::UpdateButtonStyle_Implementation` (BRMK 0x45EB60) passes the style to its fill
+border (`UBrickBorder::SetColorStyle`, brush state, brush style) and to its text box (Neutral
+becomes Default there). `property_limits::highlight` uses this: sliders outside of the game's range
+get `Highlight`, outside of the rules too `Negative`.
+
+### The game's own property warnings (not used by the mod yet)
+
+`FBrickPropertyEditInfo` has a color style byte right after its read-only byte: +0xBA in BRMK
+(read-only +0xB9); in the game read-only is +0xB1 (see "Before and after" below), so it's probably
++0xB2 (unchecked). The edit info constructors (BRMK 0x5DCD0, 0x116A80) set it to Default. A helper,
+BRMK 0x36A540 (not exported; `(EditInfo*, bool bWarning)`), with `bWarning` formats the display name
+(+0x40) as `"⚠ {0}"` (U+26A0, string at BRMK 0x7DF948) and sets the style to Highlight (3); with
+false it does nothing (it doesn't undo an earlier warning). Callers: the admin menu, server browser
+and UGC browser's `ReflectBrickProperties`, and an unnamed function (BRMK 0x33F740, six calls,
+probably the settings menu). No brick property uses it.
+
+`UPropertyContainerWidget::UpdateProperty(EditInfo, ChangedEvent)` (BRMK 0x3FAF80) sets the row's
+name text from the display name, then `UpdateIsReadOnly(EditInfo +0xB9)` and
+`UpdateColorStyle(EditInfo +0xBA)`. Both are Blueprint events (BRMK 0x58CB20 calls `ProcessEvent`
+with `FindFunctionChecked`), so they're reflected functions anyone can call.
+
+Possible "option 2" (the native look on the whole row, for later): after the game updates a
+property row, call the row's `UpdateColorStyle(Highlight)` through `ProcessEvent` and prefix its
+name text with "⚠ " (the name text block: BRMK field +0x460 of `UPropertyContainerWidget`, set
+through a virtual `SetText`; find its reflected name first). Work left: the game resets both on
+every `UpdateProperty`, so it needs a hook there (or on the numeric row's `UpdateValue`, then
+walking up from the `UNumericPropertyWidget` to its container: widget tree `Slot`/`Parent`, or the
+`UPropertyWidget` field pointing to it), and the original name must be kept to remove the prefix
+again. Writing the edit info's style byte before `UpdateProperty` would also work, but the edit
+info isn't reflected (offsets only).
+
 ## Numeric brick properties (game 1.11.7)
 
 Found by following `UpdateValue`'s virtual calls; details and pseudocode in

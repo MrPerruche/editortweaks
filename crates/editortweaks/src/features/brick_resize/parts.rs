@@ -15,7 +15,7 @@ pub const PART_SHARE: f32 = 0.3;
 
 /// A part of a box: per axis, the side it's on (-1 the smallest, 1 the largest), or 0 along the
 /// axes it spans. A face has one side, an edge two, a corner three.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct Part {
     pub sides: [i8; 3],
 }
@@ -25,6 +25,16 @@ impl Part {
         let mut sides = [0; 3];
         sides[axis] = if positive { 1 } else { -1 };
         Self { sides }
+    }
+
+    /// Every part of a box with `fixed` sides (see [`Self::dimensions_fixed`]): its 6 faces, 12
+    /// edges or 8 corners.
+    pub fn all(fixed: usize) -> impl Iterator<Item = Part> {
+        (0..27i8)
+            .map(|code| Part {
+                sides: [code % 3 - 1, code / 3 % 3 - 1, code / 9 - 1],
+            })
+            .filter(move |part| part.dimensions_fixed() == fixed)
     }
 
     /// The axes it has a side on, which dragging it moves along.

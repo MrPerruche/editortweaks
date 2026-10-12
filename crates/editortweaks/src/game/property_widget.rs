@@ -12,7 +12,24 @@ use brickrust::ue::coreuobject::{GObjects, UObjectBase};
 use brickrust::ue::tarray::TArray;
 use brickrust::ue::uclass::{UClass, UStruct};
 
+use crate::framework::sig::FunctionSig;
 use crate::game::reflection::{self, BoolFunction};
+
+/// `UNumericPropertyWidget::UpdateValue(const FBrickPropertyChangedEvent*)` (virtual; RVA 0xF03680
+/// in build 25831956, BRMK export 0x3FD440): fills the row's sliders from the first edited object
+/// whenever the panel shows or refreshes the property (not during a slider drag). In order: reads
+/// the value (a helper, game 0xEAE1B0, BRMK 0x3826C0, calling the property's getter), the value
+/// type, then the property's `GetValueRange` (vtable +0xA0, see `game::numeric_property`) with
+/// that object's container, then the Blueprint event `UpdateNumericProperty` and a helper (BRMK
+/// 0x3883F0) setting each slider's range and value. Found in the game as the only other caller of
+/// the value helper, which `OnSliderValueChanged` (through its exec thunk) calls first.
+pub const UPDATE_VALUE: FunctionSig = FunctionSig {
+    name: "UNumericPropertyWidget::UpdateValue",
+    // Storing the value type, then calling the property's GetValueRange with the container.
+    pattern: "88 45 ?? 4c 8d 45 ?? 48 8b 03 48 8d 55 ?? 48 8b cb ff 90 a0 00 00 00 39 bb ?? 00 00 00",
+};
+
+pub type UpdateValueFn = unsafe extern "C" fn(this: *mut c_void, event: *const c_void);
 
 /// The component a slider edits.
 #[derive(Clone, Copy, Debug)]

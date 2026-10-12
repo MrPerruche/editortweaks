@@ -25,6 +25,12 @@ Every action is a row of an input table: a `UDataTable` whose `RowStruct` is `FI
   `InputCategory` (`UInputCategory*`), `bConsumeInput`, `bCanBeRebound`, `bHideFromInputHelp`,
   `bCloseInputHelp`, `bIsClickable`, `bCallAxisWhenZero`.
 
+Which default keys are taken: `InputTable.uasset`'s name map lists every key name a default
+mapping uses, and each `Key` value references one by index (2026-10-11, choosing R for
+`EditorTweaks_NextOrientation`). R is used twice, by rows outside the editor's categories (near
+`Reload` with context `Input.Game.Pawn.Player`, and a `PressReleaseAction` with
+`Input.Game.PlayerController`, row name not decoded): no editor action has it by default.
+
 `UInputCategory` (a `UPrimaryDataAsset`, assets in `/Game/BrickRigs/Input/Categories`):
 `DisplayInfo`, `ParentCategory`, `bShowInInputHelp`. Top categories (e.g. `IC_BrickEditor`, the
 vehicle editor) have no parent; subcategories (`IC_BrickEditor_Move`, ...) point to one.

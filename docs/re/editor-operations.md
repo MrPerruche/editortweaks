@@ -81,14 +81,19 @@ code (signatures `MOVE_TRANSFORM`, `MOVE_GRID`, `MOVE_TURN`, `GIZMO_FRAME`, `REF
 
 The move mode (`UBrickEditorMoveMode`, game offsets): `+0x30` the editor, `+0x38`/`+0x3C` the
 gizmo axis and type (see `editor-input.md`), `+0x40` flags (bit 0x01: the gizmo is the world's;
-0x02 `BeginMode`'s bool argument; 0x08 input folded into `MoveLocation`/`MoveRotation` since the
-move began; 0x10 move perpendicular; 0x20 releasing the mouse folds the input instead of ending the
-move; 0x40/0x80 results close to `EffectiveMoveLocation`/`Rotation` become them, set by
-`BeginMode`), `+0x41` more flags (`Flags2` below; `BeginMode` sets 0x01 and 0x02), `+0x48` the
+0x02 `BeginMode`'s bool argument; 0x04 place the moved bricks again (set by `BeginMode`); 0x08 the
+same after recomputing brick snapping (set when mouse input moved the bricks, and by
+`ApplyAccumulatedInput`); `TickMode` refreshes only if 0x04 or 0x08 is set (game 0xD0D1C3),
+recomputes brick snapping only for 0x08 (0xD0D227; with snapping off it sets no adjustment) and
+clears both after (0xD0D70B); 0x10 move perpendicular; 0x20 releasing the mouse folds the input
+instead of ending the move; 0x40/0x80 results close to `EffectiveMoveLocation`/`Rotation` become
+them, set by `BeginMode`, cleared by `TickMode` once input moves the bricks, which then writes the
+move into those two: the panel's numbers), `+0x41` more flags (`Flags2` below; `BeginMode` sets 0x01 and 0x02), `+0x48` the
 reference brick (`FWeakObjectPtr`, the brick the move is about), `+0x50` its mirror mode counterpart,
 `+0x6C` the drag so far (cm), `+0x78` the turn so far (degrees about each gizmo axis), `+0x84`
 `MoveLocation`, `+0x90` `MoveRotation` (an `FRotator`), `+0xA0` the brick snapping adjustment
-(offset `+0`, pivot `+0xC`, quaternion `+0x20`; 0x30 bytes), `+0xD0`/`+0xDC`
+(offset `+0`, pivot `+0xC`, quaternion `+0x20`; `TickMode` copies these from
+`GetMoveSnappingOffset`'s result but not the 8 bytes at `+0x18`, so they may be another field), `+0xD0`/`+0xDC`
 `EffectiveMoveLocation`/`Rotation` (reflected; `__PPO__` offsets BRMK 0xE0/0xEC). User settings
 (`UBrickUserSettings::GetUserSettings()`, game 0xE6E250): `+0x338` snapping on, `+0x328` grid
 step, `+0x32C` angle step.
@@ -171,8 +176,37 @@ commit, and the commit started from that. A fold without a turn also turns `Move
 `f32` angles and back (180° became 179.99998°), so other bricks came out a hair off (19.999985 for
 20). `precise_moves` now also hooks `ApplyAccumulatedInput`: the fold is computed in `f64` too, the
 game gets the nearest `f32` values, and the `f64` one is used while `MoveLocation`/`MoveRotation`
-still hold those and Flags & 0x08 (a simulation of two released 90° turns: 179.99998° from the
-`f32` fold, exactly 180° now).
+still hold those (a simulation of two released 90° turns: 179.99998° from the `f32` fold, exactly
+180° now). Its first version also required Flags & 0x08, which `TickMode` clears on its next
+refresh, so the commit didn't use the `f64` fold (dropped 2026-10-11). Turning in `f64` leaves noise
+like 2.6e-15° where an angle should be 0, which `f32` keeps: values within 1e-9 of zero are stored
+as zero (`math::narrow_settled`).
+
+### Moving the bricks of a move from code (2026-10-11, `brick_resize` moving)
+
+While the move leaves the mouse free (see `editor-input.md`), the moved bricks are placed by
+writing the move itself: `MoveLocation`/`MoveRotation` (where the reference brick goes), zero drag
+and turn, no brick snapping adjustment (zero offset and pivot, identity quaternion), flag 0x08 set
+and 0x40/0x80 cleared (`MoveMode::replace`). `TickMode` then moves every moved brick there
+(`Move * Reference⁻¹ * Brick`), with mirror mode counterparts and the gizmo, the panel follows, and
+the move's end commits it as one undo step. Where the move shows a brick until then is that same
+product from its stored place, computed in `f64` (`precise_moves::effective` and `carried`); the
+selected bricks are the moved ones, and their counterparts show mirrored: the same motion seen in
+the mirror (the plane where the mirror axis's coordinate is 0).
+
+The first version set 0x04 instead (first in-game test, 2026-10-11: the bricks stayed put until the
+commit, then jumped). `TickMode` (game 0xD0C8F0) with 0x04 or 0x08 computes and sanitizes every
+object's place, updates the gizmo (editor vtable +0x690), the panel's numbers and each object
+(vtable +0x2E0), but moves the objects (their component at +0x78, then object vtable +0x300) only
+with 0x08 (the test at 0xD0D41B). 0x08 also recomputes brick snapping first (0xD0D227): with
+`bEditorSnappingEnabled` (settings +0x338) the adjustment is
+`ABrickEditor::GetMoveSnappingOffset` (editor vtable +0x688, the call at 0xD0D2C9, found by the
+signature `MoveMode::SNAPPING_OFFSET`; parameters built on the stack: the move mode at +0, the
+moved objects, the move, the snapping distance and angle settings at +0x60/+0x64), else none. So
+`brick_resize` hooks that slot's function of the live editor (lazily: the vehicle editor class
+isn't reflected in the shipping game) and returns no adjustment while the move is as
+`MoveMode::replace` put it (same place and rotation, no drag or turn): the gizmo's own drags still
+snap.
 
 `UFluMathStatics::QuatToNiceRotator(const FQuat&)` (reflected `UFunction`; native BRMK 0x2CA470,
 game 0xE387A0, the call in `execQuatToNiceRotator`, found through the `FNameNativePtrPair` naming
@@ -213,7 +247,8 @@ only requires game code (`sig::is_code`).
 
 A brick's box (`GetBrickEditorObjectLocalBounds`) is its static mesh's box times its scale, and a
 scalable brick's scale follows `BrickSize`: the box scales with the size along each axis, around
-the brick's origin.
+the brick's origin. Its model's triangles (for fast editing on models) come from the mesh's
+complex collision: see `brick-models.md`.
 
 ## The selection
 

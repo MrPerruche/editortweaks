@@ -145,6 +145,33 @@ def cmd_crashes(args: argparse.Namespace) -> None:
             print(f"  non-game modules: {', '.join(Path(m).name for m in extra)}")
 
 
+def cmd_hang(args: argparse.Namespace) -> None:
+    from etlib import hang
+
+    pid = hang.find_pid(paths.GAME_EXE_NAME)
+    if pid is None:
+        raise SystemExit("The game isn't running: run this while it's frozen.")
+    reports, mods = hang.sample(pid, args.samples, args.interval, args.frames, args.threads)
+    names = hang.Symbolizer(mods)
+    names.resolve_ours([a for r in reports for s in r.samples for a in [s.rip, *s.returns]])
+    for report in reports:
+        kind = "main (game) thread" if report.main else "busy thread"
+        print(f"{kind} {report.tid}: {report.cpu_share:.0%} of a core")
+        if not report.samples:
+            print("  (couldn't sample it)")
+            continue
+        for index, taken in enumerate(report.samples):
+            print(f"  sample {index + 1} at  {names.name(taken.rip)}")
+        print("  stack (first sample, innermost first):")
+        for address in report.samples[0].returns:
+            print(f"    {names.name(address)}")
+        print()
+    print(
+        "Busy (~100%) with samples in one function: an endless or very long loop there.\n"
+        "Idle (~0%) in ntdll waits: a deadlock; look for the first editortweaks frame."
+    )
+
+
 def cmd_sigcheck(args: argparse.Namespace) -> None:
     exe = Path(args.exe) if args.exe else paths.find_game().exe
     roots = [paths.PROJECT_ROOT / "crates", paths.PROJECT_ROOT / "third_party"]
@@ -283,6 +310,13 @@ def main() -> None:
     p.add_argument("-n", "--count", type=int, default=3)
     p.add_argument("--frames", type=int, default=8, help="call stack frames to show")
     p.set_defaults(func=cmd_crashes)
+
+    p = sub.add_parser("hang", help="while the game is frozen: where its threads are stuck")
+    p.add_argument("-s", "--samples", type=int, default=5, help="samples per thread")
+    p.add_argument("--interval", type=float, default=0.2, help="seconds between samples")
+    p.add_argument("--frames", type=int, default=24, help="stack frames to show")
+    p.add_argument("--threads", type=int, default=1, help="busiest other threads to sample too")
+    p.set_defaults(func=cmd_hang)
 
     p = sub.add_parser("sigcheck", help="check all byte signatures against the game exe")
     p.add_argument("--exe", help="exe to check (default: the installed game)")

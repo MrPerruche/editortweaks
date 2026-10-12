@@ -59,6 +59,23 @@ pub fn narrow(value: Vec3) -> [f32; 3] {
     value.map(|value| value as f32)
 }
 
+/// How near zero a computed place or angle (cm, degrees) is taken as zero by [`narrow_settled`]:
+/// far below anything placed on purpose, far above the `f64` noise of turning (about 1e-15).
+const NOISE: f64 = 1e-9;
+
+/// [`narrow`], with values within [`NOISE`] of zero stored as zero (and never -0). Elsewhere the
+/// `f64` noise is far below what `f32` tells apart, but near zero `f32` keeps it: a turn that
+/// leaves pitch at 0° may compute it as 2.6e-15°, which `f32` would store as is.
+pub fn narrow_settled(value: Vec3) -> [f32; 3] {
+    value.map(|value| {
+        if value.abs() < NOISE {
+            0.0
+        } else {
+            value as f32
+        }
+    })
+}
+
 /// A rotation, as a unit quaternion (`FQuat`).
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Quat {

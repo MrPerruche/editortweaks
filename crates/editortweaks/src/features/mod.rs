@@ -3,8 +3,10 @@
 
 use crate::framework::feature::Feature;
 
+mod actuator_arrows;
 mod brick_resize;
 mod camera_speed;
+mod editor_bounds;
 mod hello;
 /// The mod's rebindable keys, which other features read.
 mod keybinds;
@@ -16,6 +18,7 @@ mod precise_sliders;
 mod property_limits;
 mod slider_drag;
 mod slider_formulas;
+mod suspension_arrows;
 mod view_modes;
 
 /// All features, in load order.
@@ -27,8 +30,11 @@ pub static ALL: &[&dyn Feature] = &[
     &slider_formulas::SliderFormulas,
     &slider_drag::SliderDrag,
     &camera_speed::CameraSpeed,
+    &editor_bounds::EditorBounds,
     &move_slowdown::MoveSlowdown,
     &precise_moves::PreciseMoves,
     &view_modes::ViewModes,
     &brick_resize::BrickResize,
+    &actuator_arrows::ActuatorArrows,
+    &suspension_arrows::SuspensionArrows,
 ];

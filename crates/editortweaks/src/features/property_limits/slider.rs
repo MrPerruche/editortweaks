@@ -94,6 +94,12 @@ unsafe extern "C" fn detour(
     // SAFETY: the caller's arguments, unchanged.
     let result = unsafe { set_value(this, value, clamp_and_snap, broadcast, event_type) };
     DRAGGED.set(previous);
+    // The panel only refreshes sliders once a value is committed (`highlight`).
+    if dragged.is_some() {
+        // SAFETY: SetValueInternal is a UBrickSliderWidget member, so `this` is one; UI code only
+        // runs on the game thread.
+        unsafe { super::highlight::on_slider_moved(this) };
+    }
     result
 }
 

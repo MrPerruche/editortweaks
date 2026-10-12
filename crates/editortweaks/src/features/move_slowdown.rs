@@ -103,8 +103,11 @@ unsafe fn moves_by_gizmo(input: *const UObjectBase) -> bool {
     // SAFETY: per the contract; an input component's editor is live while it is.
     unsafe {
         !camera.moving(input)
-            && modes
-                .editor_of(input)
-                .is_some_and(|editor| modes.moving(editor) == Some(Moving::ByGizmo))
+            && modes.editor_of(input).is_some_and(|editor| {
+                matches!(
+                    modes.moving(editor),
+                    Some(Moving::ByGizmo | Moving::Precisely)
+                )
+            })
     }
 }

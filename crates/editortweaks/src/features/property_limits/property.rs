@@ -2,7 +2,8 @@
 //! `game::numeric_property`). While it runs, `GetValueRange` answers with the limits from the rules
 //! instead of the property's own range, so the rest of `ClampValue` (axis locks) still applies; then
 //! the rule's adjustment, if any, runs on the result. The panel's sliders still show the property's
-//! own range: the panel asks for it outside of `ClampValue`.
+//! own range: the panel asks for it outside of `ClampValue`, which is when `highlight` checks the
+//! shown value against the rules.
 //!
 //! A value from a slider drag also stops at its rule's `drag_min` here ([`stop_drag`]).
 
@@ -130,19 +131,25 @@ unsafe extern "C" fn get_value_range_detour(
     let original = *GET_VALUE_RANGE.get().expect("hook recorded before use");
     // SAFETY: forwards the caller's arguments unchanged.
     let result = unsafe { original(property, out, container) };
-    CLAMPING.with_borrow_mut(|clamping| {
+    let panel = CLAMPING.with_borrow_mut(|clamping| {
         // Outside of `ClampValue` (the panel asking for the sliders' range), or for another
         // property: leave the range alone.
         let Some(clamping) = clamping.as_mut() else {
-            return;
+            return true;
         };
         if clamping.property != property || clamping.container != container {
-            return;
+            return false;
         }
         // SAFETY: `out` is the caller's range buffer, just filled in by the original; `property`
         // and `container` are the live arguments of the `ClampValue` call in progress.
         unsafe { answer(clamping, &mut *out) };
+        false
     });
+    if panel {
+        // SAFETY: the arguments of this GetValueRange call, and the property's own range for them,
+        // just filled in by the original.
+        unsafe { super::highlight::on_panel_range(property, container, &*out) };
+    }
     result
 }
 
