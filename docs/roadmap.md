@@ -63,10 +63,16 @@ likely approach are first guesses, to be revised as the editor gets reverse engi
     the more copies relative to the vehicle's most, the others gray.
   `game/editor_view` adds view modes and paints bricks with any color, so other view modes (e.g.
   the reference model distance below) can reuse it.
-- **Collision view mode**: a view mode showing bricks' collision shapes ("hitboxes") as lines,
-  bricks see-through. Looked into 2026-10-12 (`docs/re/collision-shapes.md`): feasible by
-  reflection (`AggGeom` of the brick's body setup, scaled like its mesh) with the existing line
-  batcher and view mode code; not started.
+- **Collision view mode**: bricks' collision shapes ("hitboxes"). Done 2026-10-12 as the
+  "Collision" view mode (`features/view_modes/collision`, see `docs/re/collision-shapes.md`):
+  each brick's simple collision (boxes, spheres, capsules, convex hulls) as a solid mesh with the
+  brick's own material, color and pattern, following it while moved and outlined when selected;
+  the brick itself see-through (the game's hidden material), so a brick that is only see-through
+  has no collision. In game: static meshes built at run time (procedural ones lost the custom
+  primitive data), colors, patterns and outlines right. Wheels, spinners and flaps have materials
+  that deform the mesh, so their shapes show a plain version of the material (the brick's
+  parameters on the plain scalable brick's base material); 2026-10-13, untested in game yet.
+  Ideas: the complex collision too, a key to switch, only the selection.
 - **Drag to select**: box selection.
 - **Advanced resizing**:
   - Scale gizmo.

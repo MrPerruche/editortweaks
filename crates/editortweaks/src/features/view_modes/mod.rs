@@ -1,18 +1,20 @@
 //! Our view modes, cycled with Z or picked in the editor panel's view mode list (nothing selected),
-//! each coloring bricks by something the game doesn't show:
+//! each showing something the game doesn't:
 //!
 //! - "Mirror" ([`mirror`]): what each brick has at its mirror image, as mirror mode sees it;
-//! - "Duplicates" ([`duplicates`]): bricks sharing their place with copies of themselves.
+//! - "Duplicates" ([`duplicates`]): bricks sharing their place with copies of themselves;
+//! - "Collision" ([`collision`]): bricks' collision shapes, with their own materials.
 //!
 //! How (`game::editor_view`): each one is a new entry of the game's view mode enum, which the view
-//! mode cycle reads. In them, bricks get the material of the game's group view modes (hooking
-//! `GetEditorMaterialOverride`) and our colors in its custom primitive data (after the function
-//! writing the game's). A view mode works out every brick's colors at once ([`Coloring`]), kept
+//! mode cycle reads. In the coloring ones, bricks get the material of the game's group view modes
+//! (hooking `GetEditorMaterialOverride`) and our colors in its custom primitive data (after the
+//! function writing the game's). Collision keeps the bricks' materials and adds meshes. A view mode works out every brick's colors at once ([`Coloring`]), kept
 //! until the editor changes: after every change the editor re-pairs mirrored bricks
 //! (`UpdateMirroredObjects`), and then bricks whose colors changed are repainted. The game names
 //! view modes from a fixed list, so ours are added to it: the panel's list shows them, and their
 //! names after Z aren't "Invalid".
 
+mod collision;
 mod duplicates;
 mod mirror;
 
@@ -23,6 +25,7 @@ use brickrust::ue::coreuobject::UObjectBase;
 use core::ffi::c_void;
 
 use crate::framework::hook;
+use crate::game::brick_editor;
 use crate::game::editor_view::{
     self, Bricks, EditorCode, MaterialOverrideFn, PrimitiveDataFn, UpdateMirroredObjectsFn,
     ViewModeItems, ViewModeItemsFn,
@@ -43,10 +46,22 @@ const GRAY: [f32; 3] = [0.2, 0.2, 0.2];
 const PLAIN: Colors = [GRAY, GRAY];
 
 /// Our view modes, in the order Z cycles through them: each one's name and how to make it.
-const MODES: [(&str, NewColoring); 2] = [("Mirror", mirror::new), ("Duplicates", duplicates::new)];
+const MODES: [(&str, NewLook); 3] = [
+    ("Mirror", || mirror::new().map(Look::Colors)),
+    ("Duplicates", || duplicates::new().map(Look::Colors)),
+    ("Collision", || collision::find().map(|()| Look::Collision)),
+];
 
-/// Makes a view mode's [`Coloring`] (after engine init), or tells why it can't.
-type NewColoring = fn() -> Result<Box<dyn Coloring>, String>;
+/// Makes a view mode's [`Look`] (after engine init), or tells why it can't.
+type NewLook = fn() -> Result<Look, String>;
+
+/// How one of our view modes shows bricks.
+enum Look {
+    /// Painted with colors, through the group view modes' material.
+    Colors(Box<dyn Coloring>),
+    /// Their collision shapes, with their own materials ([`collision`]).
+    Collision,
+}
 
 /// How one of our view modes colors bricks.
 trait Coloring: Send + Sync {
@@ -124,7 +139,7 @@ struct View {
     name: &'static str,
     /// Its value in the game's enum.
     value: u8,
-    coloring: Box<dyn Coloring>,
+    look: Look,
     /// Its name for the game's lists, kept for the whole game (the lists get copies); without it,
     /// it isn't listed.
     label: Option<Label>,
@@ -179,6 +194,10 @@ impl Feature for ViewModes {
         if let Err(reason) = install_items_hook() {
             log!("the view modes won't be listed: {reason}");
         }
+        // Optional: without it, collision shapes don't show the selection outline.
+        if let Err(reason) = brick_editor::after_tick(collision::after_tick) {
+            log!("collision shapes won't be outlined: {reason}");
+        }
         Ok(())
     }
 
@@ -209,8 +228,8 @@ fn engine_init() -> Result<(), String> {
     let bricks = editor_view::bricks()?;
     let mut modes = Vec::new();
     for (name, new) in MODES {
-        let coloring = match new() {
-            Ok(coloring) => coloring,
+        let look = match new() {
+            Ok(look) => look,
             Err(reason) => {
                 log!("view mode '{name}' inactive: {reason}");
                 continue;
@@ -236,7 +255,7 @@ fn engine_init() -> Result<(), String> {
         modes.push(View {
             name,
             value,
-            coloring,
+            look,
             label,
             logged: Once::new(),
         });
@@ -272,8 +291,10 @@ unsafe extern "C" fn material_override(brick: *mut UObjectBase) -> *mut UObjectB
             return material;
         }
         match shown(brick) {
-            Some((code, views, _)) => views.bricks.color_material(code, brick),
-            None => material,
+            Some((code, views, view)) if matches!(view.look, Look::Colors(_)) => {
+                views.bricks.color_material(code, brick)
+            }
+            _ => material,
         }
     }
 }
@@ -288,8 +309,15 @@ unsafe extern "C" fn primitive_data(
     // SAFETY: the game's call, passed on; then `brick` is the live brick it updated.
     unsafe {
         original(brick, component, transform, relative);
-        if let Some((code, views, view)) = shown(brick) {
-            views.paint(code, view, brick);
+        match shown(brick) {
+            Some((code, views, view)) => match view.look {
+                Look::Colors(_) => {
+                    collision::remove(brick);
+                    views.paint(code, view, brick);
+                }
+                Look::Collision => collision::show(code, &views.bricks, brick),
+            },
+            None => collision::remove(brick),
         }
     }
 }
@@ -383,8 +411,11 @@ impl Views {
             bricks: &self.bricks,
             editor,
         };
+        let Look::Colors(coloring) = &view.look else {
+            return;
+        };
         // SAFETY: per the contract.
-        let painting = unsafe { view.coloring.paint(&editor) };
+        let painting = unsafe { coloring.paint(&editor) };
         view.logged
             .call_once(|| log!("{}: {}", view.name, painting.summary));
         if let Ok(mut shown) = SHOWN.lock() {
@@ -410,11 +441,22 @@ impl Views {
             }
             .brick_list();
             // Every brick shows the same view mode.
-            let Some(view) = bricks
+            let view = bricks
                 .first()
                 .and_then(|&first| code.view_mode(first))
-                .and_then(|value| self.view(value))
-            else {
+                .and_then(|value| self.view(value));
+            if let Some(View {
+                look: Look::Collision,
+                ..
+            }) = view
+            {
+                // Deleted bricks lose their shapes, changed ones get new ones.
+                collision::keep_only(&bricks);
+                collision::refresh(code, &self.bricks, &bricks);
+                return;
+            }
+            collision::keep_only(&[]);
+            let Some(view) = view else {
                 return;
             };
             self.show(code, view, editor);

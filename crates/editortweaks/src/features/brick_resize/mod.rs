@@ -88,7 +88,7 @@ use super::keybinds;
 use super::mouse_moves::{self, Direction, Handling, Movement};
 use super::precise_moves::{self, Place};
 use crate::framework::hook;
-use crate::game::brick_editor::{self, BrickEditor, TickFn};
+use crate::game::brick_editor::{self, BrickEditor};
 use crate::game::brick_model::BrickModels;
 use crate::game::editor_input::{self, ButtonAction, Click};
 use crate::game::editor_mode::{self, EditorModes};
@@ -117,7 +117,6 @@ use snap::Snapper;
 
 pub struct BrickResize;
 
-static ORIGINAL_TICK: OnceLock<TickFn> = OnceLock::new();
 static ORIGINAL_SELECT: OnceLock<NativeThunk> = OnceLock::new();
 static ORIGINAL_MOVE_CAMERA: OnceLock<NativeThunk> = OnceLock::new();
 /// Set once everything is found; until then (or if that fails) the hooks change nothing.
@@ -181,16 +180,7 @@ impl Feature for BrickResize {
     }
 
     fn on_load(&self) -> LoadResult {
-        let tick = brick_editor::TICK.resolve()?;
-        // SAFETY: `tick` is the start of ABrickEditor::Tick, and the detour has its signature.
-        unsafe {
-            hook::install_typed(
-                brick_editor::TICK.name,
-                tick,
-                tick_detour as TickFn,
-                &ORIGINAL_TICK,
-            )
-        }
+        brick_editor::after_tick(after_tick)
     }
 
     fn on_engine_init(&self) {
@@ -263,10 +253,7 @@ fn optional<T>(found: Result<T, String>, without: &str) -> Option<T> {
     }
 }
 
-unsafe extern "C" fn tick_detour(editor: *mut UObjectBase, delta: f32) {
-    let original = *ORIGINAL_TICK.get().expect("hook recorded before use");
-    // SAFETY: the original function with its own arguments.
-    unsafe { original(editor, delta) };
+fn after_tick(editor: *mut UObjectBase, _delta: f32) {
     let Some(game) = GAME.get() else {
         return;
     };

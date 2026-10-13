@@ -337,6 +337,8 @@ pub struct Bricks {
     brick: *const UStruct,
     /// Offset of `UBrickStaticInfo::ColorVisualizationMaterial`.
     color_material: usize,
+    /// Offset of `UBrickStaticInfo::HiddenMaterial`.
+    hidden_material: usize,
     /// Offset of `ABrickEditor::EditorInterfaceComponent`.
     interface: usize,
     /// Offset of `UBrickEditorInterfaceComponent::BrickEditorObjects` (a `TArray`).
@@ -368,6 +370,7 @@ pub fn bricks() -> Result<Bricks, String> {
             "ObjectProperty",
             8,
         )?,
+        hidden_material: reflection::field_offset(info, "HiddenMaterial", "ObjectProperty", 8)?,
         interface: reflection::field_offset(
             editor,
             "EditorInterfaceComponent",
@@ -453,15 +456,41 @@ impl Bricks {
         code: &EditorCode,
         brick: *const UObjectBase,
     ) -> *mut UObjectBase {
+        // SAFETY: per the contract.
+        unsafe { self.static_info_material(code, brick, self.color_material) }
+    }
+
+    /// The material hidden bricks show (`HiddenMaterial`: dithered, see-through), or null.
+    ///
+    /// # Safety
+    /// `brick` must be a live brick in the editor. Game thread only.
+    pub unsafe fn hidden_material(
+        &self,
+        code: &EditorCode,
+        brick: *const UObjectBase,
+    ) -> *mut UObjectBase {
+        // SAFETY: per the contract.
+        unsafe { self.static_info_material(code, brick, self.hidden_material) }
+    }
+
+    /// The material at `offset` in `brick`'s static info, or null.
+    ///
+    /// # Safety
+    /// `brick` must be a live brick in the editor, and `offset` that of a material field of
+    /// `UBrickStaticInfo`. Game thread only.
+    unsafe fn static_info_material(
+        &self,
+        code: &EditorCode,
+        brick: *const UObjectBase,
+        offset: usize,
+    ) -> *mut UObjectBase {
         // SAFETY: per the contract; the static info is a UBrickStaticInfo.
         unsafe {
             let info = code.static_info(brick);
             if info.is_null() {
                 return core::ptr::null_mut();
             }
-            info.add(self.color_material)
-                .cast::<*mut UObjectBase>()
-                .read()
+            info.add(offset).cast::<*mut UObjectBase>().read()
         }
     }
 

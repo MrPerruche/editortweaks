@@ -725,3 +725,83 @@ impl BoolFunction {
         }
     }
 }
+
+/// A reflected function with parameters, called through `ProcessEvent` (see [`call`]): find it,
+/// look up where each parameter goes ([`Function::parameter`]), then fill a [`Parameters`] buffer
+/// with [`put`] and call it.
+pub struct Function {
+    function: *const UFunction,
+    name: &'static str,
+}
+
+// SAFETY: a reflection record living as long as the game; only called on the game thread.
+unsafe impl Send for Function {}
+unsafe impl Sync for Function {}
+
+impl Function {
+    /// The function `name` of `class` or its parents, checked to fit in [`Parameters`].
+    pub fn find(class: *const UClass, name: &'static str) -> Result<Self, String> {
+        let function = find_function(class, name)?;
+        // SAFETY: a live function record.
+        if !unsafe { Parameters::fit(function) } {
+            return Err(format!("{name}: too many parameters"));
+        }
+        Ok(Self { function, name })
+    }
+
+    /// The offset of the parameter (or return value, `"ReturnValue"`) `parameter`, checked to be a
+    /// `kind` property of `size` bytes.
+    pub fn parameter(
+        &self,
+        parameter: &'static str,
+        kind: &'static str,
+        size: i32,
+    ) -> Result<usize, String> {
+        parameter_offset(self.function, self.name, parameter, kind, size)
+    }
+
+    /// Calls the function on `object` with `parameters`, which receives the return value and out
+    /// parameters.
+    ///
+    /// # Safety
+    /// `object` must be a live object whose class has the function, and `parameters` must hold
+    /// valid values for every parameter the function reads (zero is valid for most: null pointers,
+    /// empty arrays, `NAME_None`, false). Game thread only.
+    pub unsafe fn call(&self, object: *mut UObjectBase, parameters: &mut Parameters) {
+        // SAFETY: per the contract; the parameters fit (checked in `find`).
+        unsafe { call(object, self.function, parameters.as_mut_ptr()) }
+    }
+}
+
+/// Writes `value` at `offset` in `parameters` (a parameter's offset from [`Function::parameter`]).
+///
+/// # Safety
+/// `offset` must be the offset of a parameter of type `T` of the function `parameters` is for.
+pub unsafe fn put<T>(parameters: &mut Parameters, offset: usize, value: T) {
+    debug_assert!(offset + size_of::<T>() <= Parameters::SIZE);
+    // SAFETY: per the contract; the parameter lies within the buffer.
+    unsafe {
+        parameters
+            .as_mut_ptr()
+            .add(offset)
+            .cast::<T>()
+            .write_unaligned(value)
+    };
+}
+
+/// Reads the `T` at `offset` in `parameters`, e.g. the return value after a call.
+///
+/// # Safety
+/// `offset` must be the offset of a parameter of type `T`, holding a valid `T`.
+pub unsafe fn take<T>(parameters: &Parameters, offset: usize) -> T {
+    debug_assert!(offset + size_of::<T>() <= Parameters::SIZE);
+    // SAFETY: per the contract; the parameter lies within the buffer.
+    unsafe {
+        parameters
+            .0
+            .as_ptr()
+            .add(offset)
+            .cast::<T>()
+            .read_unaligned()
+    }
+}

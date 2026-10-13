@@ -216,8 +216,11 @@ bricks sharing a type, place and rotation with another.
 - Hiding bricks per view mode: the game's `ShouldBeHiddenByViewMode` (virtual, BRMK `UBrick` 0xEABF0;
   Input channels hides bricks without channels) could be hooked. Not done.
 - Not possible from the DLL: new materials or shaders (the shipping game can't compile them; only a
-  cooked pak made with BRMK could add some). Lines, text or arrows in the viewport need viewport
-  drawing, not explored. Only bricks are colored; one view mode at a time.
+  cooked pak made with BRMK could add some). Only bricks are colored; one view mode at a time.
+- Beyond colors: lines through the world's line batcher (`game/line_batcher.rs`), and meshes of
+  our own with any of the game's materials, as static meshes built at run time (the Collision view
+  mode, see `collision-shapes.md`; procedural meshes don't get the custom primitive data brick
+  materials read).
 - Repainting happens when the game updates a brick (edits, view mode changes) and after re-pairing
   (after every change, mirror mode on or off); anything else (selection, camera) needs its own
   trigger. Painting costs three reflected calls per brick; a view mode works out every brick's

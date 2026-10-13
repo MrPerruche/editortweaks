@@ -8,8 +8,11 @@
 //! inlined where used, so [`Operations`] does what the game's code does, with the field and vtable
 //! offsets read from one of the game's own operations.
 
+use std::sync::{Mutex, OnceLock, PoisonError};
+
 use brickrust::ue::coreuobject::UObjectBase;
 
+use crate::framework::hook;
 use crate::framework::sig::{FunctionSig, SigMatch};
 use crate::game::reflection;
 
@@ -24,6 +27,42 @@ pub const TICK: FunctionSig = FunctionSig {
 };
 
 pub type TickFn = unsafe extern "C" fn(editor: *mut UObjectBase, delta: f32);
+
+/// What runs after each editor tick (see [`after_tick`]): the live editor ticking and the frame's
+/// time. Called on the game thread.
+pub type AfterTick = fn(editor: *mut UObjectBase, delta: f32);
+
+static ORIGINAL_TICK: OnceLock<TickFn> = OnceLock::new();
+static AFTER_TICK: Mutex<Vec<AfterTick>> = Mutex::new(Vec::new());
+
+/// Runs `callback` after every `ABrickEditor::Tick`, in the order features asked. The loader allows
+/// one hook per function, so features share this one; the first call installs it.
+pub fn after_tick(callback: AfterTick) -> Result<(), String> {
+    if ORIGINAL_TICK.get().is_none() {
+        let tick = TICK.resolve()?;
+        // SAFETY: `tick` is the start of ABrickEditor::Tick, and the detour has its signature.
+        unsafe { hook::install_typed(TICK.name, tick, tick_detour as TickFn, &ORIGINAL_TICK)? };
+    }
+    AFTER_TICK
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .push(callback);
+    Ok(())
+}
+
+unsafe extern "C" fn tick_detour(editor: *mut UObjectBase, delta: f32) {
+    let original = *ORIGINAL_TICK.get().expect("hook recorded before use");
+    // SAFETY: the original function with its own arguments.
+    unsafe { original(editor, delta) };
+    // Copied out, so that a callback may ask for more without a deadlock.
+    let callbacks = AFTER_TICK
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .clone();
+    for callback in callbacks {
+        callback(editor, delta);
+    }
+}
 
 /// The start of an operation, inlined in a `UBrickEditorMode` action (game RVA 0xD0EAF0; it takes
 /// the editor from the mode, opens an operation, changes the selection and finishes it):
