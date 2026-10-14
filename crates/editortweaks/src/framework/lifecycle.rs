@@ -2,17 +2,25 @@
 
 use std::sync::OnceLock;
 
+use crate::framework::settings::{self, Section};
 use crate::prelude::*;
 
 /// Features whose `on_load` succeeded. Set once by [`start`].
 static ACTIVE: OnceLock<Vec<&'static dyn Feature>> = OnceLock::new();
 
-/// Entry point from `mod_init`: initializes brickrust, loads every feature and registers the
-/// engine hooks that drive the later stages.
-pub fn start(features: &'static [&'static dyn Feature]) {
+/// Entry point from `mod_init`: loads the settings of `sections` (see `framework::settings`),
+/// initializes brickrust, loads every feature and registers the engine hooks that drive the later
+/// stages.
+pub fn start(features: &'static [&'static dyn Feature], sections: &[&[Section]]) {
     if ACTIVE.get().is_some() {
         log!("start() called twice, ignoring");
         return;
+    }
+
+    match settings::load(sections) {
+        Ok(ignored) if ignored.is_empty() => {}
+        Ok(ignored) => log!("EditorTweaks.ini: ignored {}", ignored.join(", ")),
+        Err(reason) => log!("settings not loaded, the defaults apply: {reason}"),
     }
 
     // SAFETY: called once from `mod_init`, before the engine starts, which is when brickrust

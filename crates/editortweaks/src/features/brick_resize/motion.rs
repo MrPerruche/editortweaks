@@ -16,17 +16,48 @@
 use super::geometry::{self, Frame, Ray, Vec3};
 use super::model::Element;
 use super::scene::{Piece, Placed};
+use crate::framework::settings::{Setting, Toggle};
 use crate::math::Quat;
 
-/// When snapping turns the moved bricks to match the target: each case on (`true`) or off. Edit
-/// here; a settings menu may set them later.
-pub const MATCHING: Matching = Matching {
-    faces: true,
-    edges: true,
-    square: true,
-};
+/// When snapping turns the moved bricks to match the target now: each case a setting
+/// ([`SETTINGS`]).
+pub fn matching() -> Matching {
+    Matching {
+        faces: FACES.get(),
+        edges: EDGES.get(),
+        square: SQUARE.get(),
+    }
+}
 
-/// The cases snapping turns the moved bricks in (see [`MATCHING`]).
+/// The settings of when snapping turns the moved bricks, in the menu's order.
+pub static SETTINGS: [Setting; 3] = [
+    Setting::Toggle(&FACES),
+    Setting::Toggle(&EDGES),
+    Setting::Toggle(&SQUARE),
+];
+
+static FACES: Toggle = Toggle::new(
+    "MatchFaces",
+    "Faces onto faces",
+    "Moved bricks snapped by a face onto a face turn to lie flat on it: facing it, or facing the \
+     same way.",
+    true,
+);
+static EDGES: Toggle = Toggle::new(
+    "MatchEdges",
+    "Edges onto edges",
+    "Moved bricks snapped by an edge onto an edge turn to run along it, either way.",
+    true,
+);
+static SQUARE: Toggle = Toggle::new(
+    "MatchSquare",
+    "Square up",
+    "After either, moved bricks also turn about that face's normal or that edge to line up with \
+     the target brick's axes.",
+    true,
+);
+
+/// The cases snapping turns the moved bricks in (see [`matching`]).
 #[derive(Clone, Copy, Debug)]
 pub struct Matching {
     /// A face snapped onto a face turns to lie flat on it: facing it, or facing the same way.
@@ -327,7 +358,7 @@ fn shortest_turn(from: Vec3, onto: Vec3, axes: &[Vec3; 3]) -> Quat {
 
 /// The turns about `around` (length 1, degrees) lining one of `axes` up with one of `target`'s or
 /// its opposite, seen across `around`; none if no pair can be. May repeat.
-fn squaring_angles(around: Vec3, axes: &[Vec3; 3], target: &[Vec3; 3]) -> Vec<f64> {
+pub fn squaring_angles(around: Vec3, axes: &[Vec3; 3], target: &[Vec3; 3]) -> Vec<f64> {
     // An axis as seen across `around` (length 1), if it isn't almost along it.
     let flat = |axis: Vec3| {
         let flat = geometry::sub(axis, geometry::scale(around, geometry::dot(axis, around)));

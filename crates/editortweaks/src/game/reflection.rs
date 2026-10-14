@@ -47,6 +47,27 @@ pub unsafe fn name_is(name: &FName, text: &str) -> bool {
     }
 }
 
+/// The text of `name`, without its number (`_1`, ...).
+///
+/// # Safety
+/// `name` must be a valid name (of the live name pool).
+pub unsafe fn name_text(name: &FName) -> String {
+    // SAFETY: per the contract; an entry holds `len` characters, of one or two bytes.
+    unsafe {
+        let (chars, len, wide) = name.as_sptr2();
+        let len = usize::from(len);
+        if wide {
+            String::from_utf16_lossy(core::slice::from_raw_parts(chars.cast::<u16>(), len))
+        } else {
+            // Narrow names are Latin-1.
+            core::slice::from_raw_parts(chars, len)
+                .iter()
+                .map(|&byte| char::from(byte))
+                .collect()
+        }
+    }
+}
+
 /// The native class called `name`, without its `U`/`A` prefix (e.g. `"BrickSliderWidget"`).
 /// Walks every live object, so call it once and keep the result.
 pub fn find_class(name: &'static str) -> Option<*const UClass> {
@@ -510,6 +531,17 @@ const FUNC_NATIVE: u32 = 0x400;
 /// it intercepts every call made through reflection: Blueprints, dynamic delegates (e.g. bound
 /// widget events) and `ProcessEvent`.
 pub fn native_thunk(function: *const UFunction) -> Result<*const u8, String> {
+    let thunk = native_code(function)?;
+    if !sig::is_function_start(thunk) {
+        return Err(format!("its code pointer {thunk:p} isn't a game function"));
+    }
+    Ok(thunk)
+}
+
+/// The exec thunk of a reflected C++ function, checked to be game code but maybe a leaf function
+/// (no stack frame, so no unwind entry): small thunks only finish reading the parameters and jump
+/// to the C++ function. Check it with a [`sig::CodeShape`] before reading it.
+fn native_code(function: *const UFunction) -> Result<*const u8, String> {
     // SAFETY: `function` comes from `find_function`; both fields lie within a UFunction.
     let (flags, thunk) = unsafe {
         let base = function.cast::<u8>();
@@ -521,10 +553,93 @@ pub fn native_thunk(function: *const UFunction) -> Result<*const u8, String> {
     if flags & FUNC_NATIVE == 0 {
         return Err("not a C++ function".into());
     }
-    if !sig::is_function_start(thunk) {
-        return Err(format!("its code pointer {thunk:p} isn't a game function"));
+    if !sig::is_code(thunk) {
+        return Err(format!("its code pointer {thunk:p} isn't game code"));
     }
     Ok(thunk)
+}
+
+/// The exec thunk of a reflected C++ function without parameters: it finishes reading them (steps
+/// past the script's end marker), then jumps to the C++ function. E.g.
+/// `UMenuButtonWidget::execOnClicked` (game 0xFE6430, to 0xEE7120).
+const PARAMETERLESS_THUNK: sig::CodeShape = sig::CodeShape {
+    name: "exec thunk without parameters",
+    shape: "48 8b 42 20 45 33 c0 48 85 c0 41 0f 95 c0 4c 03 c0 4c 89 42 20 e9 ?? ?? ?? ??",
+};
+/// Where the `jmp` (E9, then its distance) starts in [`PARAMETERLESS_THUNK`].
+const PARAMETERLESS_JUMP: usize = 0x15;
+
+/// The same for a `BlueprintNativeEvent` (C++ that Blueprints may override): the thunk jumps
+/// through the object's virtual table to `<name>_Implementation`, whose slot's offset is the last
+/// 4 bytes. E.g. `UMenuSettingsPageWidget::execAddProperties` (game 0xFCD790, slot +0x488).
+const PARAMETERLESS_VIRTUAL_THUNK: sig::CodeShape = sig::CodeShape {
+    name: "exec thunk without parameters of a virtual function",
+    shape: "48 8b 42 20 45 33 c0 48 85 c0 41 0f 95 c0 4c 03 c0 4c 89 42 20 48 8b 01 48 ff a0 ?? ?? ?? ??",
+};
+/// Where the slot's offset is in [`PARAMETERLESS_VIRTUAL_THUNK`].
+const PARAMETERLESS_VIRTUAL_SLOT: usize = 0x1B;
+
+/// The C++ function behind `function`, a reflected function without parameters (see
+/// [`PARAMETERLESS_THUNK`]). Hooking it intercepts the reflected calls and the C++ ones.
+pub fn parameterless_native(function: *const UFunction) -> Result<*const u8, String> {
+    let thunk = native_code(function)?;
+    if !PARAMETERLESS_THUNK.matches(thunk) {
+        return Err(format!("its thunk isn't an {}", PARAMETERLESS_THUNK.name));
+    }
+    // SAFETY: the shape checked covers the jump's 5 bytes.
+    let (opcode, distance) = unsafe {
+        (
+            thunk.add(PARAMETERLESS_JUMP).read(),
+            thunk
+                .add(PARAMETERLESS_JUMP + 1)
+                .cast::<i32>()
+                .read_unaligned(),
+        )
+    };
+    if opcode != 0xE9 {
+        return Err(format!("its thunk has no jump at +{PARAMETERLESS_JUMP:#X}"));
+    }
+    // The distance counts from the jump's end.
+    let target = thunk
+        .wrapping_add(PARAMETERLESS_JUMP + 5)
+        .wrapping_offset(distance as isize);
+    if !sig::is_function_start(target) {
+        return Err(format!("its thunk jumps to {target:p}, not a function"));
+    }
+    Ok(target)
+}
+
+/// The C++ implementation of `function`, a `BlueprintNativeEvent` without parameters of `class` (see
+/// [`PARAMETERLESS_VIRTUAL_THUNK`]), as `class`'s own objects have it: the slot of its default
+/// object's virtual table. Blueprint classes keep their C++ parent's table.
+pub fn parameterless_virtual(
+    class: *const UClass,
+    function: *const UFunction,
+) -> Result<*const u8, String> {
+    let thunk = native_code(function)?;
+    if !PARAMETERLESS_VIRTUAL_THUNK.matches(thunk) {
+        return Err(format!(
+            "its thunk isn't an {}",
+            PARAMETERLESS_VIRTUAL_THUNK.name
+        ));
+    }
+    // SAFETY: the shape checked covers the slot's offset; a default object's first field is its
+    // table, which has that slot (the thunk calls it on every object of the class).
+    unsafe {
+        let offset = thunk
+            .add(PARAMETERLESS_VIRTUAL_SLOT)
+            .cast::<u32>()
+            .read_unaligned() as usize;
+        let defaults = default_object(class).ok_or("its class has no default object")?;
+        let table = (*defaults).vtable.cast::<*const u8>();
+        let implementation = table.add(offset / size_of::<*const u8>()).read();
+        if !sig::is_function_start(implementation) {
+            return Err(format!(
+                "its implementation at {implementation:p} isn't a function"
+            ));
+        }
+        Ok(implementation)
+    }
 }
 
 /// The offset of the parameter `name` of `function` (called `function_name` in errors), checked to

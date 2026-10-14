@@ -42,11 +42,25 @@ likely approach are first guesses, to be revised as the editor gets reverse engi
   constants). Shift replaced Alt (2026-10-10, Alt is the resize tool's key); it leaves the camera
   and G/dragged moves alone (there it's the game's "move perpendicular").
 - **Rebindable keys**: the mod's keys in the game's own input settings. Done 2026-10-10 as
-  `features/keybinds`: the editor's category gets an "Editor tweaks" section (fast editing, on
-  models, fast editing snapping, slow moves, slow gizmo moves, keep dragging sliders), saved with the
-  game's keys. Not
-  rebindable: Shift/Ctrl during an Alt-drag (the game's own slider keys) and the resize tool's mouse
+  `features/keybinds`: an "Editor tweaks" category of their own (2026-10-14; before, a section of
+  the editor's), listed after the editor's, by section: fast editing (fast editing, use models,
+  snap, next orientation), fast editing: lines (line point, slide along line, clear line), slow
+  movement (slow, super slow), sliders (value scrubbing). Saved with the game's keys (`Input.ini` keeps
+  only what differs from the defaults, so a new default key reaches players who didn't rebind it). Not rebindable: Shift/Ctrl during an Alt-drag (the game's own slider keys) and the resize tool's mouse
   buttons (the game's `Select` / `MoveCamera`, rebindable there).
+- **Settings menu**: the mod's settings in the game's options. Started 2026-10-14 as
+  `features/settings_menu` and `framework/settings`: an "Editor tweaks" button after the options'
+  own (Gameplay, User interface, ...) opens a sub-menu like theirs (Back returns to the options),
+  whose page is a settings page like the game's (the gameplay settings page asked for our category
+  instead), with check boxes and lists by section:
+  fast editing snapping (each kind of point), turning to match (faces, edges, square up), lines
+  (how long a line lasts), sliders (drag past slider ends). Saved as they change to
+  `%LOCALAPPDATA%\BrickRigs\SavedRemastered\Config\WindowsNoEditor\EditorTweaks.ini`, read at
+  start-up. A feature's setting is a `Toggle` or `Choice` static next to its code, listed in
+  `features::SETTINGS`. See `docs/re/settings-menu.md`. Reworked the same day to make the
+  sub-menu the way the game makes its own; works in game (button kept after Back, settings saved).
+  Later: numbers
+  (sliders), switching whole features off, the menu from the editor's own settings.
 - **Precise moves**: no more 89.99999° and places a hair off after moving or turning groups of
   bricks. Started 2026-10-10 as `features/precise_moves`: every move is computed again in `f64`
   from the game's own inputs (stored places, the move's drag and turn as the game snaps them), only
@@ -102,6 +116,25 @@ likely approach are first guesses, to be revised as the editor gets reverse engi
     level with it, an edge either way along, each squared up every way (8 for boxes); the choice is
     kept while the snap stays on the same pieces. Ideas: match while moving freely too, show the
     next orientation faintly, a vertex onto a face lying flat.
+  - Moving about a line (2026-10-13, `brick_resize/line_tool.rs` and `hinge.rs`; players' ideas
+    merged into one by the user): in the move with the mouse free, Alt + a click of the line key
+    (`keybinds::LINE_POINT`, the right mouse button by default) places a point where snapping finds
+    one (any brick, moved ones too); two make a purple line, shown while moving with the mouse
+    free, kept until cleared (a click over no brick, or the clear key `keybinds::CLEAR_LINE`, none
+    by default) or replaced (the "Line lasts" setting: or until the move ends, or for one drag).
+    With Alt held the right button is the line key's (the camera started under it and captured the
+    mouse: first in-game test, 2026-10-13, only P worked); it moves the camera again once Alt is let
+    go. With a line, Alt + drag turns the moved bricks about it, the grabbed point going round it
+    as near the mouse as it can (by the game's angle step), and Alt + a drag of the line key (the
+    right button) slides them along it (by the grid step; also a drag with
+    `keybinds::SLIDE_ALONG_LINE` held, no key by default: it was Shift, but Alt + Shift switches
+    Windows' keyboard layout, second test 2026-10-14). Ctrl turns them to where the grabbed face or
+    edge matches the target best (facing it or level with it, the one nearest the turn so far
+    first, R the next; a face across the line squares up instead; a corner goes round to the
+    target's side), or slides the grabbed point level with it. The game's gizmo isn't moved onto
+    the line: its turns always pivot on the reference brick (see `docs/re/editor-operations.md`).
+    Tested in game 2026-10-14 (points and turning fine; lines lasting until cleared felt long).
+    Ideas: typed angles, several lines, a line along a picked edge in one click.
   - Smarter snapping (2026-10-11, `brick_resize/snap.rs`): like a CAD program's object snaps, the
     visible point of another brick nearest the mouse: corners/vertices, halfway along edges
     (thirds and quarters optional), faces' centers, where two bricks' edges cross, where an edge
@@ -109,8 +142,7 @@ likely approach are first guesses, to be revised as the editor gets reverse engi
     two bricks go into each other (lines where their faces cross, found once per pair of bricks
     and kept while the drag lasts): halfway along them, or anywhere along them; else along an
     edge, else onto a face. Each kind has its own mark, and a dashed line shows what the
-    dragged part lines up with. Each kind is a boolean in `snap::SNAPPING`, for a settings menu
-    later. Ideas: match another brick's size, round sizes, show the points available nearby.
+    dragged part lines up with. Each kind is a setting (the settings menu, 2026-10-14). Ideas: match another brick's size, round sizes, show the points available nearby.
   - The tool computes in `f64` in the vehicle's space from stored values (a scalable brick's box
     from its size), rounding only the results to `f32`: its first version worked in the world in
     `f32` and gave sizes like 110.000545 cm for 110.

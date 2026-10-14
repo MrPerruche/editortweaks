@@ -37,11 +37,21 @@
 //!   edge's middle, a face's center...);
 //! - hold Ctrl while dragging: the grabbed point snaps like a resize does, to bricks not moved;
 //!   onto a face from a face, or onto an edge from an edge, the bricks also turn to match it, then
-//!   square up with the target brick (see [`motion::MATCHING`]): the smallest such turn, and each
+//!   square up with the target brick (see [`motion::matching`]): the smallest such turn, and each
 //!   press of R ([`keybinds::NEXT_ORIENTATION`]) the next one (facing the target or level with it,
 //!   along an edge either way, squared up each way), kept while the snap stays on the same piece.
-//!   Unsnapped again, they keep that turn and slide on from where the snap put them. With mirror mode on, snapping onto a moved
-//!   brick's counterpart (it moves along, mirrored) meets it halfway across the mirror plane;
+//!   Unsnapped again, they keep that turn and slide on from where the snap put them. With mirror
+//!   mode on, snapping onto a moved brick's counterpart (it moves along, mirrored) meets it halfway
+//!   across the mirror plane;
+//! - with Alt held, a click of the line key ([`keybinds::LINE_POINT`], the right mouse button)
+//!   places a point where snapping finds one, on any brick; two make a line, which shows while
+//!   moving with the mouse free (see [`line_tool`]; the right button moves the camera again once
+//!   Alt is let go). While there's a line, Alt + drag turns the moved bricks about it instead, the
+//!   grabbed point going round it as near the mouse as it can, and Alt + a drag of the line key
+//!   slides them along it (so does a drag with [`keybinds::SLIDE_ALONG_LINE`] held, no key by
+//!   default: Alt + Shift switches Windows' keyboard layout); Ctrl turns them to where the grabbed
+//!   face or edge matches the target best (R: the next way), or slides the grabbed point level with
+//!   it (see [`hinge`]);
 //! - releasing the button leaves the move going: a click ends it as usual (one undo step), the
 //!   gizmo still works meanwhile. The game's own brick snapping (to connectors) stays off for
 //!   these moves (`MoveMode::keep_snapping_off`), the gizmo's drags still have it.
@@ -58,7 +68,7 @@
 //! (`game::line_batcher`). The editor's left click (`Action_Select`, its reflected handler hooked)
 //! starts and ends a resize instead of selecting while the resize key is held over a scalable
 //! brick; the right button's (`Action_MoveCamera`) counts right clicks instead of moving the camera
-//! meanwhile.
+//! meanwhile, and is the line key's (when bound to it) while a line point can be placed.
 //! While a button is held the engine reports the mouse's movement to the editor, which would turn
 //! the camera with it: the resize takes it instead ([`super::mouse_moves`]), and follows it when
 //! the engine holds the cursor still ([`Drag::point`]). Each change writes `BrickSize` and tells the
@@ -70,6 +80,8 @@
 
 mod draw;
 mod geometry;
+mod hinge;
+mod line_tool;
 mod model;
 mod motion;
 mod parts;
@@ -88,6 +100,7 @@ use super::keybinds;
 use super::mouse_moves::{self, Direction, Handling, Movement};
 use super::precise_moves::{self, Place};
 use crate::framework::hook;
+use crate::framework::settings::Section;
 use crate::game::brick_editor::{self, BrickEditor};
 use crate::game::brick_model::BrickModels;
 use crate::game::editor_input::{self, ButtonAction, Click};
@@ -109,6 +122,8 @@ use crate::prelude::*;
 
 use draw::{Drawing, PixelSize};
 use geometry::{Bounds, Frame, Ray, Vec3};
+use hinge::Hinge;
+use line_tool::LineTool;
 use model::{BrickModel, Element, Models};
 use motion::{Aim, Grab, Motion, Orientation};
 use resize::{Grip, Resize};
@@ -116,6 +131,22 @@ use scene::{Piece, Placed, Scene, View};
 use snap::Snapper;
 
 pub struct BrickResize;
+
+/// Fast editing's settings, by section of the menu (see `features::SETTINGS`).
+pub static SETTINGS: [Section; 3] = [
+    Section {
+        title: "Fast editing: snapping",
+        settings: &snap::SETTINGS,
+    },
+    Section {
+        title: "Fast editing: turning to match",
+        settings: &motion::SETTINGS,
+    },
+    Section {
+        title: "Fast editing: lines",
+        settings: &line_tool::SETTINGS,
+    },
+];
 
 static ORIGINAL_SELECT: OnceLock<NativeThunk> = OnceLock::new();
 static ORIGINAL_MOVE_CAMERA: OnceLock<NativeThunk> = OnceLock::new();
@@ -130,6 +161,8 @@ static LOG_RESIZED: Once = Once::new();
 static LOG_MOVED: Once = Once::new();
 static LOG_SNAPPING_ON: Once = Once::new();
 static LOG_TURNED: Once = Once::new();
+static LOG_HINGE: Once = Once::new();
+static LOG_SLID: Once = Once::new();
 static LOG_CURSOR: Once = Once::new();
 static LOG_NO_PLACES: Once = Once::new();
 static LOG_NO_INTERFACE: Once = Once::new();
@@ -142,6 +175,9 @@ static LOG_SLOW_SNAP: Once = Once::new();
 
 /// How long finding what to snap to may take before it's logged (once), in milliseconds.
 const SLOW_SNAP_MS: f64 = 4.0;
+
+/// How many segments the circle a grabbed point goes round a line on is drawn with.
+const CIRCLE_SEGMENTS: usize = 64;
 
 /// How far the mouse may move after the snap key goes up before a drag stops snapping (screen
 /// pixels): the hand shakes a little when releasing the button.
@@ -345,19 +381,28 @@ fn take_movement(movement: &Movement) -> Handling {
         // Only the game thread uses the state, and not around input handlers.
         Err(TryLockError::WouldBlock) => return Handling::Pass,
     };
-    let Some(drag) = &mut state.drag else {
-        return Handling::Pass;
-    };
     let pixels = movement.value / mouse_moves::AXIS_PER_PIXEL;
-    match movement.direction {
-        Direction::Right => drag.pointer.moved[0] += pixels,
+    let moved = match movement.direction {
+        Direction::Right => [pixels, 0.0],
         // Up is positive, and the screen's y goes down.
-        Direction::Up => drag.pointer.moved[1] -= pixels,
-    }
+        Direction::Up => [0.0, -pixels],
+    };
+    // A press of the line key: moved too far, it's no click.
+    state.line_tool.mouse_moved(moved);
+    let Some(drag) = &mut state.drag else {
+        return if state.line_tool.took_button() {
+            Handling::Take
+        } else {
+            Handling::Pass
+        };
+    };
+    drag.pointer.moved[0] += moved[0];
+    drag.pointer.moved[1] += moved[1];
     Handling::Take
 }
 
 /// A brick's piece under the mouse while the resize key is held.
+#[derive(Clone, Copy)]
 struct Hover {
     /// The brick (see [`Scene::get`]).
     index: usize,
@@ -383,7 +428,17 @@ struct Drag {
     snapper: Snapper,
     /// Whether it snaps.
     snap_key: SnapKey,
+    /// What it goes on while held.
+    held_by: HeldBy,
     action: Action,
+}
+
+/// What holds a drag: the left mouse button (the game's `Select`), or the line key (sliding moved
+/// bricks along the line, see [`line_tool`]).
+#[derive(Clone, Copy, PartialEq)]
+enum HeldBy {
+    Select,
+    LineKey,
 }
 
 /// Whether a drag snaps: while the snap key is held, and after it goes up until the mouse moves
@@ -408,6 +463,10 @@ impl SnapKey {
     }
 }
 
+#[expect(
+    clippy::large_enum_variant,
+    reason = "there's one drag at a time: its size doesn't matter"
+)]
 enum Action {
     Resize(Resizing),
     Move(Moving),
@@ -442,8 +501,13 @@ struct Moving {
     grab: Grab,
     /// Where the move put its reference brick when grabbed.
     start: Place,
-    /// The game's grid step for moves (0 while its snapping is off).
+    /// The game's grid and angle steps for moves (0 while its snapping is off).
     grid: f64,
+    angle: f64,
+    /// While a line is placed: turning the bricks about it, or sliding them along it.
+    hinge: Option<Hinge>,
+    /// Whether dragged by the line key: then they slide along the line.
+    by_line_key: bool,
     /// The motion given last.
     motion: Motion,
     /// The motion the last snap gave (none before one): unsnapped, the bricks go on from there.
@@ -530,6 +594,11 @@ struct State {
     on_models: bool,
     /// Bricks' models made so far, kept across scenes.
     models: Option<Models>,
+    /// The line moved bricks turn about or slide along, and placing it.
+    line_tool: LineTool,
+    /// The moved brick hovered when the line key went down with a line placed: a drag of the key
+    /// from there slides the bricks along the line.
+    slide_from: Option<Hover>,
 }
 
 // SAFETY: object pointers are only used on the game thread (the mutex just satisfies statics).
@@ -570,6 +639,14 @@ impl Pointer {
 }
 
 impl Drag {
+    /// Whether what holds it is still down.
+    fn is_held(&self) -> bool {
+        match self.held_by {
+            HeldBy::Select => keyboard::is_mouse_button_down(),
+            HeldBy::LineKey => keybinds::LINE_POINT.is_held(),
+        }
+    }
+
     /// The grabbed point now (in the vehicle), as deep as the pointer shows.
     fn grabbed_point(&self) -> Vec3 {
         match &self.action {
@@ -589,6 +666,8 @@ impl State {
             drawn: false,
             on_models: false,
             models: None,
+            line_tool: LineTool::new(),
+            slide_from: None,
         }
     }
 
@@ -598,7 +677,12 @@ impl State {
     /// `editor` must be the live editor ticking. Game thread only.
     unsafe fn tick(&mut self, game: &Game, editor: *mut UObjectBase) {
         let held = keybinds::RESIZE_BRICKS.is_held();
-        if !held && self.drag.is_none() && self.scene.is_none() && !self.drawn {
+        if !held
+            && self.drag.is_none()
+            && self.scene.is_none()
+            && !self.drawn
+            && self.line_tool.is_idle()
+        {
             return;
         }
         self.on_models = keybinds::MODEL_EDITING.is_held();
@@ -616,7 +700,9 @@ impl State {
                 let wanted = if held { wanted(game, editor) } else { None };
                 if wanted != self.gathered {
                     self.hover = None;
+                    self.slide_from = None;
                     self.scene = None;
+                    self.line_tool.forget_bricks();
                 }
                 if let Some(wanted) = &wanted
                     && self.scene.is_none()
@@ -632,21 +718,31 @@ impl State {
                 let models = self.models.get_or_insert_with(Models::default);
                 add_models(reader, models, scene);
             }
+            self.line_tool
+                .in_move(game.modes.move_mode(editor).is_some());
+            // The line shows while moving with the mouse free.
+            let show_line = game.modes.moving(editor) == Some(editor_mode::Moving::Precisely);
             let controller = game.editor.player_controller(editor);
-            let view = match &self.scene {
-                Some(scene) if !controller.is_null() => {
+            // Where the vehicle is: from its bricks, else from when the line was placed.
+            let vehicle = match &self.scene {
+                Some(scene) => Some(scene.vehicle),
+                None => self.line_tool.vehicle(),
+            };
+            let view = match vehicle {
+                Some(vehicle) if !controller.is_null() => {
                     let cursor = game.viewport.mouse(controller);
                     let mouse = match &mut self.drag {
                         Some(drag) => Some(drag.pointer.point(cursor)),
                         None => cursor,
                     };
-                    mouse.and_then(|mouse| view(game, controller, mouse, &scene.vehicle))
+                    mouse.and_then(|mouse| view(game, controller, mouse, &vehicle))
                 }
                 _ => None,
             };
-            if self.drag.is_some() {
-                if !keyboard::is_mouse_button_down() {
-                    // The release went elsewhere (another window): finish here.
+            if let Some(drag) = &self.drag {
+                if !drag.is_held() {
+                    // The release went elsewhere (another window), or it's the line key's: finish
+                    // here.
                     self.finish(game);
                 } else if let Some(view) = &view {
                     self.follow(game, editor, view);
@@ -657,7 +753,50 @@ impl State {
                 // The mouse is off the view.
                 self.hover = None;
             }
-            self.draw(game, view.as_ref());
+            self.place_line(game, view.as_ref(), held);
+            self.draw(game, view.as_ref(), show_line);
+        }
+    }
+
+    /// The line key (see [`line_tool`]): while a point can be placed (the resize key `held` in a
+    /// move with the mouse free, nothing dragged), what a click would place shows, and a click
+    /// places it; a drag from a moved brick with a line placed slides the bricks along it. The
+    /// clear key clears it.
+    ///
+    /// # Safety
+    /// Game thread only.
+    unsafe fn place_line(&mut self, game: &Game, view: Option<&View>, held: bool) {
+        self.line_tool.clear_key(keybinds::CLEAR_LINE.is_held());
+        let can_be_placed =
+            held && self.drag.is_none() && matches!(self.gathered, Some(Gathered::Moving { .. }));
+        // The key first: a press places what showed before it.
+        let vehicle = self.scene.as_ref().map(|scene| scene.vehicle);
+        let pressed = self.line_tool.key(
+            keybinds::LINE_POINT.is_held(),
+            can_be_placed,
+            view.map(|view| view.mouse),
+            vehicle,
+        );
+        if pressed {
+            let line = self.line_tool.line().is_some();
+            self.slide_from = self.hover.filter(|hover| line && hover.grabbable);
+        }
+        if self.line_tool.is_dragging()
+            && let Some(hover) = self.slide_from.take()
+            && self.line_tool.line().is_some()
+        {
+            // The press is the drag's now: its release places nothing.
+            self.line_tool.cancel_press();
+            // SAFETY: per the contract.
+            if unsafe { self.press_move(game, hover, HeldBy::LineKey) } {
+                LOG_SLID.call_once(|| log!("sliding bricks along a line (a drag of the line key)"));
+            }
+        }
+        match (&self.scene, view) {
+            (Some(scene), Some(view)) if can_be_placed => {
+                self.line_tool.preview(scene, view, self.on_models)
+            }
+            _ => self.line_tool.stop_preview(),
         }
     }
 
@@ -703,17 +842,27 @@ impl State {
     /// # Safety
     /// Game thread only.
     unsafe fn press(&mut self, game: &Game) -> bool {
+        if self.drag.is_some() {
+            // A drag of the line key is going on: the click would end the move under it.
+            return true;
+        }
         if !keybinds::RESIZE_BRICKS.is_held() {
             return false;
         }
         // SAFETY: per the contract.
-        unsafe {
-            match self.gathered {
-                Some(Gathered::Editing) => self.press_resize(game),
-                Some(Gathered::Moving { .. }) => self.press_move(game),
-                None => false,
+        let pressed = unsafe {
+            match (&self.gathered, self.hover) {
+                (Some(Gathered::Editing), _) => self.press_resize(game),
+                (Some(Gathered::Moving { .. }), Some(hover)) => {
+                    self.press_move(game, hover, HeldBy::Select)
+                }
+                _ => false,
             }
+        };
+        if pressed {
+            self.line_tool.cancel_press();
         }
+        pressed
     }
 
     /// Starts resizing the hovered brick, if it can be; whether it did.
@@ -764,6 +913,7 @@ impl State {
                 pointer: Pointer::new(hover.view.mouse),
                 snapper: Snapper::default(),
                 snap_key: SnapKey::default(),
+                held_by: HeldBy::Select,
                 action: Action::Resize(Resizing {
                     brick,
                     counterpart,
@@ -785,13 +935,13 @@ impl State {
         true
     }
 
-    /// Starts moving the bricks of the move by the hovered one; whether it did.
+    /// Starts moving the bricks of the move by the `hover`ed one, a drag `held_by` the left button
+    /// or the line key; whether it did.
     ///
     /// # Safety
     /// Game thread only.
-    unsafe fn press_move(&mut self, game: &Game) -> bool {
-        let (Some(scene), Some(hover), Some(Gathered::Moving { mode, now })) =
-            (&self.scene, &self.hover, &self.gathered)
+    unsafe fn press_move(&mut self, game: &Game, hover: Hover, held_by: HeldBy) -> bool {
+        let (Some(scene), Some(Gathered::Moving { mode, now })) = (&self.scene, &self.gathered)
         else {
             return false;
         };
@@ -815,7 +965,11 @@ impl State {
                 )
             });
         }
-        let (piece, point) = grabbed(scene, hover, self.on_models);
+        let (piece, point) = grabbed(scene, &hover, self.on_models);
+        let hinge = self.line_tool.line().map(|line| Hinge::new(line, point));
+        if hinge.is_some() {
+            LOG_HINGE.call_once(|| log!("moving bricks about a line"));
+        }
         LOG_MOVED.call_once(|| {
             log!(
                 "moving bricks by {} of one (the move at {:?}, {:?})",
@@ -839,6 +993,9 @@ impl State {
             },
             start: precise_moves::effective(*mode, now),
             grid: f64::from(now.grid),
+            angle: f64::from(now.angle),
+            hinge,
+            by_line_key: held_by == HeldBy::LineKey,
             motion: Motion::NONE,
             kept: Motion::NONE,
             turn: TurnChoice::default(),
@@ -851,6 +1008,7 @@ impl State {
             pointer: Pointer::new(hover.view.mouse),
             snapper: Snapper::default(),
             snap_key: SnapKey::default(),
+            held_by,
             action: Action::Move(moving),
         });
         true
@@ -858,27 +1016,41 @@ impl State {
 
     /// While dragging, takes the right button (the camera stays still): each press sets aside one
     /// more of the bricks the mouse goes through for snapping. Whether it took it.
+    ///
+    /// Else, with the line key bound to it (down with it) while a point can be placed, its press
+    /// and release are the line key's (see [`line_tool`]): the camera would capture the mouse.
     fn right_click(&mut self, click: Click) -> bool {
-        let Some(drag) = &mut self.drag else {
-            return false;
-        };
-        if click == Click::Pressed {
-            drag.snapper.deeper();
+        let pressed = click == Click::Pressed;
+        if let Some(drag) = &mut self.drag {
+            if pressed {
+                drag.snapper.deeper();
+            } else {
+                self.line_tool.right_button(false, false);
+            }
+            return true;
         }
-        true
+        let line_key = pressed
+            && keybinds::RESIZE_BRICKS.is_held()
+            && matches!(self.gathered, Some(Gathered::Moving { .. }))
+            && keybinds::LINE_POINT.is_held();
+        self.line_tool.right_button(pressed, line_key)
     }
 
-    /// Ends dragging when the button is released; whether one was.
+    /// Ends dragging when the button is released; whether one was (or a drag of the line key, which
+    /// took its press: see [`Self::press`]).
     ///
     /// # Safety
     /// Game thread only.
     unsafe fn release(&mut self, game: &Game) -> bool {
-        if self.drag.is_none() {
-            return false;
+        match &self.drag {
+            None => false,
+            Some(drag) if drag.held_by == HeldBy::LineKey => true,
+            Some(_) => {
+                // SAFETY: per the contract.
+                unsafe { self.finish(game) };
+                true
+            }
         }
-        // SAFETY: per the contract.
-        unsafe { self.finish(game) };
-        true
     }
 
     /// Follows the mouse: resizes the brick, or moves the bricks.
@@ -929,6 +1101,11 @@ impl State {
         if !changed {
             // A click without a drag.
             return;
+        }
+        if let Action::Move(moving) = &drag.action
+            && moving.hinge.is_some()
+        {
+            self.line_tool.drag_done();
         }
         LOG_CURSOR.call_once(|| {
             log!(
@@ -988,10 +1165,10 @@ impl State {
     ///
     /// # Safety
     /// Game thread only.
-    unsafe fn draw(&mut self, game: &Game, view: Option<&View>) {
-        let lines = match (view, &self.scene) {
-            (Some(view), Some(scene)) => self.lines(scene, view),
-            _ => Vec::new(),
+    unsafe fn draw(&mut self, game: &Game, view: Option<&View>, show_line: bool) {
+        let lines = match view {
+            Some(view) => self.lines(view, show_line),
+            None => Vec::new(),
         };
         if lines.is_empty() && !self.drawn {
             return;
@@ -1009,8 +1186,21 @@ impl State {
         self.drawn = !lines.is_empty();
     }
 
-    fn lines(&self, scene: &Scene, view: &View) -> Vec<line_batcher::Line> {
-        let mut drawing = Drawing::new(view.pixels, scene.vehicle);
+    /// What shows with the mouse at `view`: the line (if `show_line`), and what's pointed at or
+    /// dragged.
+    fn lines(&self, view: &View, show_line: bool) -> Vec<line_batcher::Line> {
+        let vehicle = match (&self.scene, self.line_tool.vehicle()) {
+            (Some(scene), _) => scene.vehicle,
+            (None, Some(vehicle)) => vehicle,
+            (None, None) => return Vec::new(),
+        };
+        let mut drawing = Drawing::new(view.pixels, vehicle);
+        if show_line {
+            self.line_tool.draw(&mut drawing);
+        }
+        let Some(scene) = &self.scene else {
+            return drawing.into_lines();
+        };
         if let Some(drag) = &self.drag {
             match &drag.action {
                 Action::Resize(resizing) => draw_resizing(&mut drawing, resizing),
@@ -1115,7 +1305,7 @@ unsafe fn follow_resize(
             .collect();
         let is_resized = |placed: &Placed| resized.iter().any(|&object| placed.object.is(object));
         let started = Instant::now();
-        let snapped = snapper.snap(&snap::SNAPPING, scene, view, models, is_resized);
+        let snapped = snapper.snap(&snap::snapping(), scene, view, models, is_resized);
         log_snap(snapped.map(|snapped| snapped.kind), started);
         match snapped {
             Some(snapped) => Some(resizing.resize.snap(&snapped.target)),
@@ -1162,12 +1352,16 @@ unsafe fn follow_move(
     if !still {
         return false;
     }
-    let free = moving.grab.follow(&view.ray, moving.grid, &moving.kept);
     let pressed = moving.turn.pressed(keybinds::NEXT_ORIENTATION.is_held());
-    let motion = if let Some(snapper) = snapper {
+    let motion = if moving.hinge.is_some() {
+        follow_hinge(scene, moving, snapper, view, models, pressed)
+    } else if let Some(snapper) = snapper {
+        let free = moving.grab.follow(&view.ray, moving.grid, &moving.kept);
         let started = Instant::now();
         // The moved bricks are left out.
-        let snapped = snapper.snap(&snap::SNAPPING, scene, view, models, |placed| placed.moving);
+        let snapped = snapper.snap(&snap::snapping(), scene, view, models, |placed| {
+            placed.moving
+        });
         log_snap(snapped.map(|snapped| snapped.kind), started);
         match snapped {
             Some(snapped) => {
@@ -1184,7 +1378,7 @@ unsafe fn follow_move(
             None => free,
         }
     } else {
-        free
+        moving.grab.follow(&view.ray, moving.grid, &moving.kept)
     };
     if let Some(motion) = motion
         && motion != moving.motion
@@ -1200,8 +1394,57 @@ unsafe fn follow_move(
     true
 }
 
+/// The motion of a move about the line (see [`hinge`]): turned, the grabbed point going round the
+/// line as near the mouse as it can, or slid along it (see [`Moving::slides`]), by the game's
+/// steps. Snapped with a `snapper`: turned to where what's grabbed matches
+/// the target best (the next way each time the orientation key is `pressed`), or slid level with
+/// it. `None` while the mouse gives no steady answer.
+fn follow_hinge(
+    scene: &Scene,
+    moving: &mut Moving,
+    snapper: Option<&mut Snapper>,
+    view: &View,
+    models: bool,
+    pressed: bool,
+) -> Option<Motion> {
+    let slides = moving.slides();
+    let hinge = moving.hinge.as_mut()?;
+    let snapped = snapper.and_then(|snapper| {
+        let started = Instant::now();
+        // The moved bricks and their counterparts are left out: they move.
+        let snapped = snapper.snap(&snap::snapping(), scene, view, models, |placed| {
+            placed.moving || placed.mirroring
+        });
+        log_snap(snapped.map(|snapped| snapped.kind), started);
+        snapped
+    });
+    if slides {
+        hinge.slid = match snapped {
+            Some(snapped) => hinge.slide_to(snapped.target.point),
+            None => hinge::stepped(hinge.slide_for(&view.ray)?, moving.grid),
+        };
+        return Some(hinge.motion());
+    }
+    // Where the mouse turns the bricks: matching turns nearest it come first.
+    let free = hinge.angle_for(&view.ray, view.pixels.per_distance);
+    let matching = snapped.map(|snapped| {
+        let aim = aim(scene, snapped);
+        let near = free.unwrap_or(hinge.turned);
+        let angles = hinge.matching_angles(&moving.grab, &aim, &motion::matching(), near);
+        (angles, &snapped.on)
+    });
+    hinge.turned = match matching {
+        Some((angles, on)) if !angles.is_empty() => {
+            let choice = moving.turn.choose(on, pressed);
+            angles[choice % angles.len()]
+        }
+        _ => hinge::stepped(free?, moving.angle),
+    };
+    Some(hinge.motion())
+}
+
 /// The motion snapping a move to `snapped`: onto it, turned the `choice`th way matching it where it
-/// lines up (see [`motion::MATCHING`]); on a counterpart of the moved bricks, meeting it halfway
+/// lines up (see [`motion::matching`]); on a counterpart of the moved bricks, meeting it halfway
 /// across the mirror plane, the rest following the mouse (`free`, if it gives a point).
 fn snap_move(
     scene: &Scene,
@@ -1220,7 +1463,7 @@ fn snap_move(
         }
         _ => Some(moving.grab.snap(
             &aim(scene, snapped),
-            &motion::MATCHING,
+            &motion::matching(),
             &moving.kept,
             choice,
         )),
@@ -1237,6 +1480,16 @@ unsafe fn mirror_axis(game: &Game) -> Option<usize> {
     Some(usize::from(axis - 1))
 }
 
+impl Moving {
+    /// Whether the bricks slide along the line rather than turn about it: dragged by the line key,
+    /// with the slide key held, or grabbed by a point on the line (it can't go round it).
+    fn slides(&self) -> bool {
+        self.hinge.as_ref().is_some_and(|hinge| {
+            self.by_line_key || keybinds::SLIDE_ALONG_LINE.is_held() || hinge.on_line()
+        })
+    }
+}
+
 /// What's grabbed of the hovered brick, and where: with the snap key held, the brick's own snap
 /// point nearest the mouse (a corner, an edge's middle, a face's center...) and its piece there;
 /// else the piece under the mouse, at its point there (see [`motion::grabbed_point`]).
@@ -1245,7 +1498,7 @@ fn grabbed(scene: &Scene, hover: &Hover, models: bool) -> (Piece, Vec3) {
     if keybinds::SNAP_RESIZE.is_held() {
         let mut own = Snapper::default();
         let others = |other: &Placed| !core::ptr::eq(other, placed);
-        if let Some(snapped) = own.snap(&snap::SNAPPING, scene, &hover.view, models, others)
+        if let Some(snapped) = own.snap(&snap::snapping(), scene, &hover.view, models, others)
             && let Some(&(_, piece)) = snapped.on.iter().find(|(index, _)| *index == hover.index)
         {
             return (piece, snapped.target.point);
@@ -1290,8 +1543,20 @@ fn draw_resizing(drawing: &mut Drawing, resizing: &Resizing) {
     }
 }
 
-/// The grabbed brick of a move where it's going: its box, and the piece grabbed.
+/// The grabbed brick of a move where it's going: its box, and the piece grabbed; moving about a
+/// line, the circle the grabbed point goes round it on.
 fn draw_moving(drawing: &mut Drawing, moving: &Moving) {
+    if let Some(hinge) = &moving.hinge
+        && !moving.slides()
+    {
+        let step = 360.0 / CIRCLE_SEGMENTS as f64;
+        let points: Vec<Vec3> = (0..=CIRCLE_SEGMENTS)
+            .map(|index| hinge.around(index as f64 * step))
+            .collect();
+        for pair in points.windows(2) {
+            drawing.segment(pair[0], pair[1], draw::CIRCLE);
+        }
+    }
     let frame = moving.motion.frame(&moving.frame);
     drawing.outline(&frame, &moving.bounds, draw::BOX);
     match moving.piece {

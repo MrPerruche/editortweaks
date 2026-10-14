@@ -18,6 +18,7 @@ use brickrust::ue::uclass::{UFunction, UStruct};
 
 use crate::framework::sig::{FunctionSig, SigMatch, StringRefSig};
 use crate::game::kismet;
+use crate::game::property_reflection::{ITEM_NAME, ITEM_SIZE, RawArray};
 use crate::game::reflection::{self, ENUM_NAMES, EnumEntry, Getter, Parameters};
 use crate::game::text::Text;
 use crate::game::weak_object;
@@ -118,21 +119,6 @@ const ITEM_COPY: FunctionSig = FunctionSig {
 };
 
 type ItemCopyFn = unsafe extern "C" fn(target: *mut u8, source: *const u8) -> *mut u8;
-
-/// Size of an `FEnumPropertyItem` in the game (0xB0 in BRMK): the value (`int32`), its display
-/// info (name at [`ITEM_NAME`], icon), three more texts and flags. Checked through the items'
-/// values (see [`ViewModeItems::append`]).
-const ITEM_SIZE: usize = 0xA8;
-/// Offset of an item's name (`FText`).
-const ITEM_NAME: usize = 8;
-
-/// A `TArray` with elements of a size known only at run time.
-#[repr(C)]
-struct RawArray {
-    data: *mut u8,
-    num: i32,
-    max: i32,
-}
 
 /// Adds view modes to the game's view mode lists ([`VIEW_MODE_ITEMS`]).
 pub struct ViewModeItems {

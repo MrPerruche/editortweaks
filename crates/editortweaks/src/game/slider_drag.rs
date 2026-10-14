@@ -145,10 +145,20 @@ impl MouseDrag {
     /// dragged value as it is, and clamps it itself.
     ///
     /// # Safety
-    /// Only while no slider is being dragged (e.g. at engine init), on the game thread.
+    /// Only while nothing runs the clamp: on the game thread, outside of `NativeOnMouseMove`.
     pub unsafe fn lift_clamp(&self) -> Result<(), String> {
         // SAFETY: `clamp` is the matched clamp, whole instructions with no jump into them (see
         // `CLAMP`); per the contract, nothing runs them meanwhile.
         unsafe { patch::write_code(self.clamp, &CLAMP, &NO_CLAMP) }
+    }
+
+    /// Puts the clamp back after [`Self::lift_clamp`].
+    ///
+    /// # Safety
+    /// As for [`Self::lift_clamp`].
+    pub unsafe fn restore_clamp(&self) -> Result<(), String> {
+        // SAFETY: `clamp` holds the code `lift_clamp` wrote, whole instructions with no jump into
+        // them (see `CLAMP`); per the contract, nothing runs them meanwhile.
+        unsafe { patch::write_code(self.clamp, &NO_CLAMP, &CLAMP) }
     }
 }

@@ -8,7 +8,7 @@
 //! assets without a `ParentCategory`) that rows use. The player's input (`UBrickPlayerInput`, see
 //! `game::player_input`) binds each row's `DefaultMappings` under the row's name unless the player
 //! rebound it (saved through `UInputSettings` in `Input.ini`), and the input settings list every row
-//! of the chosen top category, its subcategories included.
+//! of the chosen top category, a section per subcategory (in their `SortPriority` order).
 //!
 //! Our actions get a table of their own ([`InputTables::new_table`]): each row is made by the row
 //! struct's constructor (`InitializeStruct`), filled through reflection and handed to the table
@@ -154,6 +154,8 @@ struct CategoryLayout {
     label: usize,
     /// `ParentCategory` (`UInputCategory*`).
     parent: usize,
+    /// `SortPriority` (`int32`): where a subcategory's section goes among its parent's.
+    order: usize,
     show_in_input_help: BoolField,
 }
 
@@ -233,6 +235,7 @@ impl InputTables {
                     "ObjectProperty",
                     8,
                 )?,
+                order: reflection::field_offset(category_class, "SortPriority", "IntProperty", 4)?,
                 show_in_input_help: reflection::bool_field(
                     category_class.cast(),
                     "bShowInInputHelp",
@@ -291,7 +294,8 @@ impl InputTables {
     }
 
     /// A new input category called `name` inside `outer`, shown as `label`, inside the category
-    /// `parent` (null: a top category), kept for the whole game.
+    /// `parent` (null: a top category) at place `order` among its subcategories, kept for the whole
+    /// game.
     ///
     /// # Safety
     /// `outer` must be a live object without anything called `name` inside, `parent` null or a live
@@ -302,6 +306,7 @@ impl InputTables {
         name: FName,
         label: &Text,
         parent: *mut UObjectBase,
+        order: i32,
     ) -> Result<*mut UObjectBase, String> {
         // SAFETY: per the contract; the fields' offsets come from reflection, and the label is a
         // live text from the constructor.
@@ -315,6 +320,7 @@ impl InputTables {
             base.add(self.category.parent)
                 .cast::<*mut UObjectBase>()
                 .write(parent);
+            base.add(self.category.order).cast::<i32>().write(order);
             self.category.show_in_input_help.set(base, false);
             Ok(category)
         }
@@ -402,18 +408,27 @@ impl InputTables {
     }
 }
 
-/// Adds `object` to `list` unless it's there already. Lists the game emptied (its tables at
-/// shutdown) stay empty. Whether it was added.
+/// Adds `object` to `list` unless it's there already: right after `after` if that's listed, else
+/// last. Lists the game emptied (its tables at shutdown) stay empty. Whether it was added.
 ///
 /// # Safety
 /// `list` must be a live array of the game's (see [`InputTables::tables`]). Game thread only.
-pub unsafe fn add_once(list: &mut TArray<*mut UObjectBase>, object: *mut UObjectBase) -> bool {
-    // SAFETY: per the contract; `push` grows the array with the game's allocator, like `TArray`.
+pub unsafe fn add_once(
+    list: &mut TArray<*mut UObjectBase>,
+    object: *mut UObjectBase,
+    after: Option<*mut UObjectBase>,
+) -> bool {
+    // SAFETY: per the contract; `push` grows the array with the game's allocator, like `TArray`,
+    // and the slice covers its elements.
     unsafe {
         if list.num <= 0 || list.iter().any(|listed| listed == object) {
             return false;
         }
         list.push(object);
+        let objects = core::slice::from_raw_parts_mut(list.data, list.num as usize);
+        if let Some(at) = after.and_then(|after| objects.iter().position(|&other| other == after)) {
+            objects[at + 1..].rotate_right(1);
+        }
     }
     true
 }

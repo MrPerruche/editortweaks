@@ -218,6 +218,25 @@ normalized to (-180, 180]. All `f32` (an `rsqrtss` with two Newton steps for the
 Ported to `f64` as `math::Quat::to_rotator`. Its other callers: `MirrorBrickEditorObject` (0xBFCB0)
 and 0x2665F0.
 
+### The gizmo's place (looked into 2026-10-13, for moving bricks about a line)
+
+BRMK 1.11.6. `UBrickEditorMoveMode::GetGizmoTransform` (virtual, returns `TOptional<FTransform>`,
+0xAF350) is `Adjust(GetMoveTransformWithAccumulatedInput())` (the adjustment at BRMK +0xB0), its
+rotation `FQuat::Identity` if the gizmo is the world's (flags, BRMK +0x48, bit 0x01), scale 1: the
+gizmo sits where the move puts the reference brick, along its axes. `ABrickEditor::SetGizmoTransform
+(const FTransform&)` (0xE7FD0) only sets the relative location and rotation of `GizmoMeshComponent`
+(BRMK +0x528, reflected `__PPO__`). `ABrickEditor::GetGizmoAxisAtScreenPosition` (0xAEFA0)
+deprojects the screen position (`APlayerController::DeprojectScreenPositionToWorld`) and traces
+against that component, so the handles are wherever the mesh is.
+
+Moving the gizmo elsewhere wouldn't move what it turns about, though: the move's turn
+(`GetMoveTransformWithAccumulatedInput`, above) turns only the rotation, about the axes of
+`GetGizmoTransformInternal(false)`, never the location, so the bricks always turn about the
+reference brick's origin. A gizmo on a line would need that turn's pivot moved (hooking
+`GetMoveTransformWithAccumulatedInput`, and `precise_moves`' `f64` copy of it). `brick_resize`
+moves bricks about a line itself instead (`brick_resize/hinge.rs`), giving the move its place like
+its other moves (above).
+
 ## Resizing a scalable brick
 
 Like the panel: write `BrickSize`, then `PostModifyBrickProperty` with an event naming it.

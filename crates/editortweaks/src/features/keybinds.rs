@@ -1,14 +1,15 @@
-//! The mod's keys, rebindable in the game's own input settings (the editor's category, section
-//! "Editor tweaks"): each [`Keybind`] is an input action of the game, so the settings list it,
+//! The mod's keys, rebindable in the game's own input settings (category "Editor tweaks", by
+//! [`Section`]): each [`Keybind`] is an input action of the game, so the settings list it,
 //! rebind it (also to a key with modifier keys, like Ctrl + R) and reset it with the others, and
 //! the game saves its keys with its own (`Input.ini`). Keys the mod can't read (gamepad buttons,
 //! the mouse wheel) never count as held.
 //!
 //! How: after the game loads its input tables (`UBrickAssetManager::LoadAssetLibraries`, hooked),
-//! a table of ours with one row per keybind joins them, in a category of ours inside the editor's
-//! (`game::input_table`). The player's input then binds them like the game's actions, and
-//! [`Keybind::is_held`] reads its bindings (`game::player_input`) and the keyboard. If any of that
-//! isn't found (e.g. after a game update), the keybinds keep their default keys.
+//! a table of ours with one row per keybind joins them, in a top category of ours (listed right
+//! after the editor's) with a subcategory per section (`game::input_table`). The player's input
+//! then binds them like the game's actions, and [`Keybind::is_held`] reads its bindings
+//! (`game::player_input`) and the keyboard. If any of that isn't found (e.g. after a game update),
+//! the keybinds keep their default keys.
 
 use std::sync::{Mutex, Once, OnceLock, PoisonError};
 
@@ -36,7 +37,7 @@ pub static RESIZE_BRICKS: Keybind = Keybind::new(
 /// drags and snaps to are the faces, edges and vertices of the models (`brick_resize`).
 pub static MODEL_EDITING: Keybind = Keybind::new(
     "EditorTweaks_ModelEditing",
-    "Fast editing on models",
+    "Use models",
     "Hold while fast editing to use the faces, edges and vertices of bricks' models instead of their boxes.",
     &["ThumbMouseButton"],
 );
@@ -44,7 +45,7 @@ pub static MODEL_EDITING: Keybind = Keybind::new(
 /// Snaps the dragged part to other bricks while held during a resize or move (`brick_resize`).
 pub static SNAP_RESIZE: Keybind = Keybind::new(
     "EditorTweaks_SnapResize",
-    "Fast editing snapping",
+    "Snap",
     "Hold while fast editing to snap to other bricks: corners, middles, intersections, edges and faces. Moved bricks also turn to match faces and edges.",
     &["LeftControl", "RightControl"],
 );
@@ -53,15 +54,45 @@ pub static SNAP_RESIZE: Keybind = Keybind::new(
 /// matches (`brick_resize`).
 pub static NEXT_ORIENTATION: Keybind = Keybind::new(
     "EditorTweaks_NextOrientation",
-    "Fast editing next orientation",
+    "Next orientation",
     "Press while moving bricks with fast editing snapping to turn them the next way that matches the face or edge they snap to.",
     &["R"],
+);
+
+/// Clicked while fast editing moved bricks (the resize key held), places a point of the line they
+/// turn about or slide along: two make it, one over no brick clears it. Dragged from one of them
+/// with a line placed, slides them along it. On the right mouse button, the camera moves with it
+/// once the resize key is let go (`brick_resize`).
+pub static LINE_POINT: Keybind = Keybind::new(
+    "EditorTweaks_LinePoint",
+    "Line point",
+    "Click while fast editing moved bricks to place a point of a line: two points make it. Dragging their box then turns them around the line, and dragging it with this key slides them along the line. Click over no brick to clear it. With the right mouse button, let go of the fast editing key to move the camera.",
+    &["RightMouseButton"],
+);
+
+/// While held, dragging moved bricks with a line placed slides them along it instead of turning
+/// them about it, like a drag of [`LINE_POINT`] (`brick_resize`). No key by default: Shift was,
+/// but Alt + Shift switches Windows' keyboard layout.
+pub static SLIDE_ALONG_LINE: Keybind = Keybind::new(
+    "EditorTweaks_SlideAlongLine",
+    "Slide along line",
+    "Hold while fast editing moved bricks with a line placed to slide them along the line instead of turning them around it (like dragging with the line point key).",
+    &[],
+);
+
+/// Pressed, clears the line placed for moving bricks about, and a first point (`brick_resize`).
+/// No key by default.
+pub static CLEAR_LINE: Keybind = Keybind::new(
+    "EditorTweaks_ClearLine",
+    "Clear line",
+    "Press to clear the line placed for fast editing moved bricks.",
+    &[],
 );
 
 /// Slows down mouse moves of bricks and of the camera while held (`move_slowdown`).
 pub static SLOW_MOVES: Keybind = Keybind::new(
     "EditorTweaks_SlowMoves",
-    "Slow movement",
+    "Slow",
     "Hold to move and rotate bricks and turn the camera slower with the mouse",
     &["LeftControl", "RightControl"],
 );
@@ -69,7 +100,7 @@ pub static SLOW_MOVES: Keybind = Keybind::new(
 /// Slows down moves by a gizmo handle a lot while held (`move_slowdown`).
 pub static SLOW_GIZMO_MOVES: Keybind = Keybind::new(
     "EditorTweaks_SlowGizmoMoves",
-    "Super slow movement",
+    "Super slow",
     "Hold to move and rotate bricks by a gizmo handle much slower. Tip: combine slow & super slow for ultra slow!",
     &["LeftShift", "RightShift"],
 );
@@ -82,21 +113,54 @@ pub static KEEP_DRAGGING_SLIDERS: Keybind = Keybind::new(
     &["LeftAlt", "RightAlt"],
 );
 
-/// Every keybind, in the order the settings list them.
-static ALL: [&Keybind; 7] = [
-    &RESIZE_BRICKS,
-    &MODEL_EDITING,
-    &SNAP_RESIZE,
-    &NEXT_ORIENTATION,
-    &SLOW_MOVES,
-    &SLOW_GIZMO_MOVES,
-    &KEEP_DRAGGING_SLIDERS,
+/// Every keybind, by section, in the order the settings list them.
+static SECTIONS: [Section; 4] = [
+    Section {
+        name: "IC_EditorTweaks_FastEditing",
+        title: "Fast editing",
+        keybinds: &[
+            &RESIZE_BRICKS,
+            &MODEL_EDITING,
+            &SNAP_RESIZE,
+            &NEXT_ORIENTATION,
+        ],
+    },
+    Section {
+        name: "IC_EditorTweaks_Lines",
+        title: "Fast editing: lines",
+        keybinds: &[&LINE_POINT, &SLIDE_ALONG_LINE, &CLEAR_LINE],
+    },
+    Section {
+        name: "IC_EditorTweaks_SlowMovement",
+        title: "Slow movement",
+        keybinds: &[&SLOW_MOVES, &SLOW_GIZMO_MOVES],
+    },
+    Section {
+        name: "IC_EditorTweaks_Sliders",
+        title: "Sliders",
+        keybinds: &[&KEEP_DRAGGING_SLIDERS],
+    },
 ];
 
-/// The game's top category our section goes in (the editor's bindings).
+/// Keybinds shown together in the input settings, under `title`: a subcategory of ours.
+struct Section {
+    /// Its object's name.
+    name: &'static str,
+    title: &'static str,
+    keybinds: &'static [&'static Keybind],
+}
+
+/// Every keybind.
+fn all() -> impl Iterator<Item = &'static Keybind> {
+    SECTIONS
+        .iter()
+        .flat_map(|section| section.keybinds.iter().copied())
+}
+
+/// The game's category ours is listed after (the editor's bindings).
 const EDITOR_CATEGORY: &str = "IC_BrickEditor";
-/// Our section's name in the settings, and its object's.
-const CATEGORY_LABEL: &str = "Editor tweaks";
+/// Our category's name in the settings, and its object's.
+const CATEGORY_LABEL: &str = "Editor tweaks (mod)";
 const CATEGORY_NAME: &str = "IC_EditorTweaks";
 const TABLE_NAME: &str = "EditorTweaksInputTable";
 
@@ -185,14 +249,14 @@ static PLAYERS: OnceLock<PlayerInputs> = OnceLock::new();
 static OURS: Mutex<Ours> = Mutex::new(Ours::NotYet);
 static LOG_UNREADABLE_KEY: Once = Once::new();
 
-/// Our table and category, made once (the game keeps loaded tables).
+/// Our table and categories, made once (the game keeps loaded tables).
 #[derive(Clone, Copy)]
 enum Ours {
     NotYet,
     Made {
         table: *mut UObjectBase,
-        /// Ours, a top category (to list) if the editor's wasn't found.
-        top_category: Option<*mut UObjectBase>,
+        /// Our top category, which the game's list of them needs (subcategories aren't listed).
+        category: *mut UObjectBase,
     },
     /// Making them failed halfway: not tried again, the objects' names are taken.
     Failed,
@@ -227,7 +291,7 @@ impl Feature for Keybinds {
             }
             Err(reason) => log!("rebound keys can't be read, the default keys apply: {reason}"),
         }
-        let listed = ALL.iter().all(|keybind| keybind.action.get().is_some());
+        let listed = all().all(|keybind| keybind.action.get().is_some());
         log!(
             "active{}",
             if listed {
@@ -251,8 +315,7 @@ unsafe extern "C" fn load_asset_libraries(manager: *mut UObjectBase, mode: u8) {
     }
 }
 
-/// Adds our table (and category, if a top one) to the lists the game just loaded, making them
-/// the first time.
+/// Adds our table and category to the lists the game just loaded, making them the first time.
 ///
 /// # Safety
 /// `manager` must be the live asset manager, its lists just loaded. Game thread only.
@@ -281,15 +344,11 @@ unsafe fn add_ours(manager: *mut UObjectBase) -> Result<(), String> {
                 }
             };
         }
-        if let Ours::Made {
-            table,
-            top_category,
-        } = *ours
-        {
-            input_table::add_once(tables.tables(manager), table);
-            if let Some(category) = top_category {
-                input_table::add_once(tables.categories(manager), category);
-            }
+        if let Ours::Made { table, category } = *ours {
+            input_table::add_once(tables.tables(manager), table, None);
+            let categories = tables.categories(manager);
+            let editor = input_table::find_named(categories, EDITOR_CATEGORY);
+            input_table::add_once(categories, category, editor);
         }
     }
     Ok(())
@@ -302,63 +361,77 @@ enum MakeError {
     Final(String),
 }
 
-/// Our table, its rows and their category.
+/// Our table, our categories and the rows.
 ///
 /// # Safety
 /// As for [`add_ours`].
 unsafe fn make(tables: &InputTables, manager: *mut UObjectBase) -> Result<Ours, MakeError> {
     // Everything that can fail without leaving anything behind first.
     let prepared = prepare().map_err(MakeError::Retry)?;
-    // SAFETY: per the contract; the names are new (made once), the category's parent is null or a
-    // live category from the game's list.
+    // SAFETY: per the contract; the names are new (made once), each subcategory's parent is our
+    // live top category.
     unsafe {
-        let parent = input_table::find_named(tables.categories(manager), EDITOR_CATEGORY)
-            .unwrap_or(core::ptr::null_mut());
         let category = tables
             .new_category(
                 manager,
-                prepared.category_name,
-                &prepared.category_label,
-                parent,
+                prepared.category.name,
+                &prepared.category.label,
+                core::ptr::null_mut(),
+                0,
             )
             .map_err(MakeError::Retry)?;
         let table = tables
             .new_table(manager, prepared.table_name)
             .map_err(MakeError::Final)?;
-        for (order, (keybind, action)) in ALL.iter().zip(&prepared.actions).enumerate() {
-            let row = Action {
-                name: action.name,
-                label: &action.label,
-                description: &action.description,
-                keys: &action.keys,
-                order: order as i32,
-            };
-            tables
-                .add_row(table, &row, category)
-                .map_err(|reason| MakeError::Final(format!("{}: {reason}", keybind.name)))?;
-            let _ = keybind.action.set(action.name);
+        for (place, (section, prepared)) in SECTIONS.iter().zip(&prepared.sections).enumerate() {
+            let subcategory = tables
+                .new_category(
+                    manager,
+                    prepared.category.name,
+                    &prepared.category.label,
+                    category,
+                    place as i32,
+                )
+                .map_err(|reason| MakeError::Final(format!("{}: {reason}", section.name)))?;
+            for (order, (keybind, action)) in
+                section.keybinds.iter().zip(&prepared.actions).enumerate()
+            {
+                let row = Action {
+                    name: action.name,
+                    label: &action.label,
+                    description: &action.description,
+                    keys: &action.keys,
+                    order: order as i32,
+                };
+                tables
+                    .add_row(table, &row, subcategory)
+                    .map_err(|reason| MakeError::Final(format!("{}: {reason}", keybind.name)))?;
+                let _ = keybind.action.set(action.name);
+            }
         }
         log!(
-            "{} keybinds added to the input settings ({})",
-            ALL.len(),
-            if parent.is_null() {
-                "own category: the editor's wasn't found"
-            } else {
-                "in the editor's category"
-            }
+            "{} keybinds added to the input settings (category {CATEGORY_LABEL}, {} sections)",
+            all().count(),
+            SECTIONS.len()
         );
-        Ok(Ours::Made {
-            table,
-            top_category: parent.is_null().then_some(category),
-        })
+        Ok(Ours::Made { table, category })
     }
 }
 
 /// The names and texts our objects and rows need.
 struct Prepared {
     table_name: FName,
-    category_name: FName,
-    category_label: Text,
+    category: PreparedCategory,
+    sections: Vec<PreparedSection>,
+}
+
+struct PreparedCategory {
+    name: FName,
+    label: Text,
+}
+
+struct PreparedSection {
+    category: PreparedCategory,
     actions: Vec<PreparedAction>,
 }
 
@@ -370,25 +443,42 @@ struct PreparedAction {
 }
 
 fn prepare() -> Result<Prepared, String> {
-    let actions = ALL
+    let sections = SECTIONS
         .iter()
-        .map(|keybind| {
-            Ok(PreparedAction {
-                name: kismet::string_to_name(keybind.name)?,
-                label: kismet::string_to_text(keybind.label)?,
-                description: kismet::string_to_text(keybind.description)?,
-                keys: keybind
-                    .keys
+        .map(|section| {
+            Ok(PreparedSection {
+                category: prepare_category(section.name, section.title)?,
+                actions: section
+                    .keybinds
                     .iter()
-                    .map(|key| kismet::string_to_name(key))
+                    .map(|keybind| prepare_action(keybind))
                     .collect::<Result<_, String>>()?,
             })
         })
         .collect::<Result<_, String>>()?;
     Ok(Prepared {
         table_name: kismet::string_to_name(TABLE_NAME)?,
-        category_name: kismet::string_to_name(CATEGORY_NAME)?,
-        category_label: kismet::string_to_text(CATEGORY_LABEL)?,
-        actions,
+        category: prepare_category(CATEGORY_NAME, CATEGORY_LABEL)?,
+        sections,
+    })
+}
+
+fn prepare_category(name: &str, label: &str) -> Result<PreparedCategory, String> {
+    Ok(PreparedCategory {
+        name: kismet::string_to_name(name)?,
+        label: kismet::string_to_text(label)?,
+    })
+}
+
+fn prepare_action(keybind: &Keybind) -> Result<PreparedAction, String> {
+    Ok(PreparedAction {
+        name: kismet::string_to_name(keybind.name)?,
+        label: kismet::string_to_text(keybind.label)?,
+        description: kismet::string_to_text(keybind.description)?,
+        keys: keybind
+            .keys
+            .iter()
+            .map(|key| kismet::string_to_name(key))
+            .collect::<Result<_, String>>()?,
     })
 }

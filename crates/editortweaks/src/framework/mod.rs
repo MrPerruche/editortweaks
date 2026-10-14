@@ -6,4 +6,5 @@ pub mod hook;
 pub mod lifecycle;
 pub mod log;
 pub mod patch;
+pub mod settings;
 pub mod sig;

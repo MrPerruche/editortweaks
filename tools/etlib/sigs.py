@@ -10,6 +10,9 @@ Signatures are read straight from the Rust sources, so there's a single source o
 - our `CodeShape { name: "...", shape: "..." }` declarations (mode "Shape"): a leaf function's
   whole code, which the mod finds through a vtable at run time; at least one function (at a
   function boundary) must have it. Several identical ones are fine.
+- our `VtableSig { name: "...", type_name: "...", length: N }` declarations (mode "Vtable"): the
+  virtual function tables of exactly N functions whose entries 0, 2 and 3 load that ASCII type
+  name, like `framework::sig::VtableSig`. Several (identical copies) are fine.
 """
 
 from __future__ import annotations
@@ -37,6 +40,11 @@ _STRING_REF_SIG = re.compile(
 )
 _CODE_SHAPE = re.compile(
     r'CodeShape\s*\{\s*name:\s*"(?P<name>[^"]+)",.*?shape:\s*"(?P<pattern>[^"]+)"',
+    re.S,
+)
+_VTABLE_SIG = re.compile(
+    r'VtableSig\s*\{\s*name:\s*"(?P<name>[^"]+)",\s*type_name:\s*"(?P<type>[^"]+)",'
+    r"\s*length:\s*(?P<length>\d+)",
     re.S,
 )
 # `lea r64, [rip + disp32]`: REX.W (48 or 4C), 8D, ModRM with mod 00 and r/m 101.
@@ -70,7 +78,7 @@ class Result:
             return "MISSING"
         if not self.looks_like_function:
             return "NOT-FUNC"
-        if len(self.targets) == 1 or self.signature.mode == "Shape":
+        if len(self.targets) == 1 or self.signature.mode in ("Shape", "Vtable"):
             return "OK"
         return "SAME" if len(set(self.targets)) == 1 else "AMBIGUOUS"
 
@@ -97,6 +105,11 @@ def find_signatures(roots: list[Path]) -> list[Signature]:
                 signatures.append(Signature(m["name"], 0, "StringRef", m["text"], source(m)))
             for m in _CODE_SHAPE.finditer(text):
                 signatures.append(Signature(m["name"], 0, "Shape", m["pattern"], source(m)))
+            for m in _VTABLE_SIG.finditer(text):
+                # The pattern holds the type name, the offset the table's length.
+                signatures.append(
+                    Signature(m["name"], int(m["length"]), "Vtable", m["type"], source(m))
+                )
     return signatures
 
 
@@ -108,6 +121,43 @@ def string_references(image: PeImage, text: str) -> list[int]:
         for m in re.finditer(re.escape(needle), image.image)
         if m.start() % 2 == 0 and not image.section_of(m.start()).startswith(".text")
     }
+    return _functions_loading(image, strings)
+
+
+def vtables(image: PeImage, type_name: str, length: int) -> list[int]:
+    """Tables of `length` code pointers whose entries 0, 2 and 3 load the ASCII `type_name`."""
+    needle = type_name.encode() + b"\x00"
+    strings = {
+        m.start()
+        for m in re.finditer(re.escape(needle), image.image)
+        if image.image[m.start() - 1] == 0
+        and not image.section_of(m.start()).startswith(".text")
+    }
+    loading = {image.image_base + f for f in _functions_loading(image, strings) if f >= 0}
+
+    def is_code(value: int) -> bool:
+        rva = value - image.image_base
+        return 0 < rva < len(image.image) and image.section_of(rva).startswith(".text")
+
+    tables = []
+    for first in loading:
+        for m in re.finditer(re.escape(struct.pack("<Q", first)), image.image):
+            at = m.start()
+            if at % 8 or image.section_of(at).startswith(".text"):
+                continue
+            table = struct.unpack_from(f"<{length + 1}Q", image.image, at)
+            if (
+                table[2] in loading
+                and table[3] in loading
+                and all(is_code(entry) for entry in table[:length])
+                and not is_code(table[length])
+            ):
+                tables.append(at)
+    return sorted(tables)
+
+
+def _functions_loading(image: PeImage, strings: set[int]) -> list[int]:
+    """Start of the function containing each `lea` of one of `strings` (RVAs; -1 if none)."""
     functions = []
     for section in (s for s in image.sections if s.executable):
         code = image.image[section.rva : section.rva + section.size]
@@ -122,6 +172,8 @@ def string_references(image: PeImage, text: str) -> list[int]:
 def resolve(image: PeImage, signature: Signature) -> list[int]:
     if signature.mode == "StringRef":
         return string_references(image, signature.pattern)
+    if signature.mode == "Vtable":
+        return vtables(image, signature.pattern, signature.offset)
     if signature.mode == "Shape":
         targets = []
         for section in (s for s in image.sections if s.executable):

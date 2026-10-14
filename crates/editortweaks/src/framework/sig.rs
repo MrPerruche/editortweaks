@@ -4,8 +4,9 @@
 //! then looked up in the exe's unwind table (`.pdata`), which lists every non-leaf function.
 //! So code added before the pattern in a game update doesn't break it, unlike "match + offset".
 //! Patterns must match exactly once; `et.py sigcheck` checks them against a new game build.
-//! A [`StringRefSig`] finds a function by a string constant it uses instead, and a [`CodeShape`]
-//! checks a leaf function found another way (they aren't in `.pdata`).
+//! A [`StringRefSig`] finds a function by a string constant it uses instead, a [`CodeShape`]
+//! checks a leaf function found another way (they aren't in `.pdata`), and a [`VtableSig`] finds a
+//! C++ class's virtual function table by the type name it reports.
 
 use std::sync::OnceLock;
 
@@ -89,33 +90,9 @@ impl StringRefSig {
         if strings.is_empty() {
             return Err(format!("{}: string \"{}\" not found", self.name, self.text));
         }
-        // `lea r64, [rip + disp32]`: REX.W (48 or 4C), 8D, ModRM with mod 00 and r/m 101.
-        let mut functions: Vec<u32> = Vec::new();
-        for code in image.code_sections() {
-            for at in 0..code.len().saturating_sub(7) {
-                if !matches!(code[at], 0x48 | 0x4C)
-                    || code[at + 1] != 0x8D
-                    || code[at + 2] & 0xC7 != 0x05
-                {
-                    continue;
-                }
-                let displacement =
-                    i32::from_le_bytes([code[at + 3], code[at + 4], code[at + 5], code[at + 6]]);
-                let rva = image.rva_of(code[at..].as_ptr());
-                let target = (rva + 7).wrapping_add_signed(displacement);
-                if strings.contains(&target) {
-                    let function = image.function_containing(rva).ok_or_else(|| {
-                        format!(
-                            "{}: reference at RVA 0x{rva:X} outside functions",
-                            self.name
-                        )
-                    })?;
-                    if !functions.contains(&function) {
-                        functions.push(function);
-                    }
-                }
-            }
-        }
+        let functions = image
+            .functions_loading(&strings)
+            .map_err(|reason| format!("{}: {reason}", self.name))?;
         match functions[..] {
             // SAFETY: an RVA from the image's own exception directory.
             [function] => Ok(unsafe { image.base.add(function as usize) }),
@@ -130,6 +107,76 @@ impl StringRefSig {
                 functions.len()
             )),
         }
+    }
+}
+
+/// The virtual function table of the game's C++ class `type_name`, found by that name: classes
+/// that know their type name (e.g. brick properties, `"FBoolBrickProperty"`) return it from their
+/// first virtual functions, which load it as an ASCII string. A match is a table of exactly `length`
+/// functions whose entries 0, 2 and 3 all load the name (a subclass overrides them with its own
+/// name, so it doesn't match unless it adds nothing). The compiler may keep identical copies of a
+/// class's table, so there can be several matches. Keep the `name: "...", type_name: "...",
+/// length: N` shape: `et.py sigcheck` parses these declarations.
+pub struct VtableSig {
+    pub name: &'static str,
+    pub type_name: &'static str,
+    pub length: usize,
+}
+
+impl VtableSig {
+    /// Every table matching, in the order they lie in the exe.
+    pub fn resolve(&self) -> Result<Vec<*const *const u8>, String> {
+        let image = GameImage::get();
+        let needle: Vec<Option<u8>> = self.type_name.bytes().chain([0]).map(Some).collect();
+        let strings: Vec<u32> = image
+            .data_sections()
+            .flat_map(|data| find_all(data, &needle))
+            // SAFETY: a match inside a data section, so the byte before it is mapped too.
+            .filter(|&found| unsafe { *found.sub(1) } == 0)
+            .map(|found| image.rva_of(found))
+            .collect();
+        if strings.is_empty() {
+            return Err(format!("{}: type name not found", self.name));
+        }
+        let functions = image
+            .functions_loading(&strings)
+            .map_err(|reason| format!("{}: {reason}", self.name))?;
+        let base = image.base as usize;
+        let loads_name = |entry: usize| {
+            entry
+                .checked_sub(base)
+                .and_then(|rva| u32::try_from(rva).ok())
+                .is_some_and(|rva| functions.contains(&rva))
+        };
+        let mut tables = Vec::new();
+        for data in image.data_sections() {
+            let entries = data.len() / 8;
+            // SAFETY: sections start page-aligned, so every 8-byte slot is aligned and in bounds.
+            let slots =
+                unsafe { std::slice::from_raw_parts(data.as_ptr().cast::<usize>(), entries) };
+            for (index, &first) in slots.iter().enumerate() {
+                let Some(table) = slots.get(index..=index + self.length) else {
+                    break;
+                };
+                if loads_name(first)
+                    && loads_name(table[2])
+                    && loads_name(table[3])
+                    && table[..self.length]
+                        .iter()
+                        .all(|&entry| is_code(entry as *const u8))
+                    && !is_code(table[self.length] as *const u8)
+                {
+                    tables.push(table.as_ptr().cast::<*const u8>());
+                }
+            }
+        }
+        if tables.is_empty() {
+            return Err(format!(
+                "{}: no table of {} functions found",
+                self.name, self.length
+            ));
+        }
+        Ok(tables)
     }
 }
 
@@ -346,6 +393,35 @@ impl GameImage {
             let offset = rva.checked_sub(start)?;
             code.get(offset..offset.checked_add(length)?)
         })
+    }
+
+    /// Start RVAs of the functions loading the address of one of `strings` (RVAs), each once.
+    fn functions_loading(&self, strings: &[u32]) -> Result<Vec<u32>, String> {
+        // `lea r64, [rip + disp32]`: REX.W (48 or 4C), 8D, ModRM with mod 00 and r/m 101.
+        let mut functions: Vec<u32> = Vec::new();
+        for code in self.code_sections() {
+            for at in 0..code.len().saturating_sub(7) {
+                if !matches!(code[at], 0x48 | 0x4C)
+                    || code[at + 1] != 0x8D
+                    || code[at + 2] & 0xC7 != 0x05
+                {
+                    continue;
+                }
+                let displacement =
+                    i32::from_le_bytes([code[at + 3], code[at + 4], code[at + 5], code[at + 6]]);
+                let rva = self.rva_of(code[at..].as_ptr());
+                let target = (rva + 7).wrapping_add_signed(displacement);
+                if strings.contains(&target) {
+                    let function = self
+                        .function_containing(rva)
+                        .ok_or_else(|| format!("reference at RVA 0x{rva:X} outside functions"))?;
+                    if !functions.contains(&function) {
+                        functions.push(function);
+                    }
+                }
+            }
+        }
+        Ok(functions)
     }
 
     /// The RVA of an address inside the image.

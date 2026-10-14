@@ -34,5 +34,5 @@ pub extern "C" fn mod_info() -> ModInfo {
 /// Called once by the loader, before the engine initializes.
 #[unsafe(no_mangle)]
 pub extern "C" fn mod_init() {
-    framework::lifecycle::start(features::ALL);
+    framework::lifecycle::start(features::ALL, features::SETTINGS);
 }

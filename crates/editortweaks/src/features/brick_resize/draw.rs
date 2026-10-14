@@ -92,6 +92,29 @@ pub const POINTER: Pen = Pen {
     halo: true,
 };
 
+/// A line moved bricks turn about or slide along (see `hinge`), its points, and what a click would
+/// place.
+pub const LINE: Pen = Pen {
+    color: [0.6, 0.1, 1.0],
+    pixels: 2.5,
+    on_top: true,
+    halo: true,
+};
+/// The line past its points: the thinnest, hidden by bricks in front of it.
+pub const LINE_PAST: Pen = Pen {
+    color: [0.6, 0.1, 1.0],
+    pixels: 0.0,
+    on_top: false,
+    halo: false,
+};
+/// The circle a grabbed point goes round the line on.
+pub const CIRCLE: Pen = Pen {
+    color: [0.6, 0.1, 1.0],
+    pixels: 1.5,
+    on_top: true,
+    halo: true,
+};
+
 /// How long a corner's marks along its edges are (pixels), and the pointer's cross.
 const CORNER_MARK_PIXELS: f32 = 22.0;
 const POINTER_PIXELS: f32 = 16.0;

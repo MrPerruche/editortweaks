@@ -99,6 +99,20 @@ with the action index if `bDisplayActionIndex`), described by `PrimaryActionDesc
 `HoldAction` and axis rows. Labels in `Content/Localization/StringTables/Input.csv` use short
 sentence case: "Move perpendicular", "Add to selection".
 
+Which rows, and their sections (BRMK, read 2026-10-14):
+
+- The dropdown's options are `GetInputCategories`, in the array's order.
+- A row belongs to the chosen category if its `InputCategory` leads to it:
+  `UInputCategory::ResolveInputCategory(Object, bTopMost)` (BRMK 0x2D9B20) follows
+  `ParentCategory` up to the top, however deep.
+- The rows are sorted (predicate BRMK 0x3F1420): rows of different categories by
+  `UInputCategory::SortInputCategory` (BRMK 0x2DF820), else by the row's `SortPriority`, then
+  more. `SortInputCategory(A, B)` puts a parent before its direct children, then compares the
+  categories' `SortPriority` (reflected `int32`, BRMK +0xA4; the assets set it on a few
+  subcategories, e.g. 10 on `IC_BrickEditor_File`), then their object names (case-insensitive).
+- Each row's own category's `DisplayInfo.Name` is a property category of the panel, made at its
+  first row: a section with that title. So subcategories are sections, in that order.
+
 ## Adding rows at run time
 
 `UDataTable` in the shipping game (vtable 0x3ECFF60, found through the class's
@@ -119,13 +133,17 @@ The mod builds its rows the same way without the copy: game allocator, `Initiali
 struct's C++ constructor, e.g. `FTableRowBase`'s vtable and empty texts), fields written through
 reflection (texts assigned with a reference each, `DefaultMappings` elements constructed the same
 way with only `Key.KeyName` set; `FKey` looks its details up when needed), then `AddRowInternal`.
-Both slots are read from `AddRow` (`input_table::ADD_ROW`). The table and its category are made
-with `StaticConstructObject_Internal` (outer: the asset manager; `RF_Transient |
+Both slots are read from `AddRow` (`input_table::ADD_ROW`). The table and its categories are
+made with `StaticConstructObject_Internal` (outer: the asset manager; `RF_Transient |
 RF_MarkAsRootSet`).
 
-The mod's rows: `PressReleaseAction`, no context tags, `bCanBeRebound`, `bHideFromInputHelp`, its
-category `IC_EditorTweaks` ("Editor tweaks") inside `IC_BrickEditor` (or a top category of its own,
-listed in `InputCategories`, if that isn't found).
+The mod's rows: `PressReleaseAction`, no context tags, `bCanBeRebound`, `bHideFromInputHelp`. Their
+categories: a top one, `IC_EditorTweaks` ("Editor tweaks"), which the mod adds to
+`InputCategories` after each load, right after `IC_BrickEditor` (last if that isn't there); and
+inside it one subcategory per section (`IC_EditorTweaks_FastEditing`, ...), its `SortPriority`
+giving the sections' order. Until 2026-10-14 they were a single subcategory of `IC_BrickEditor`.
+The selected category (`UBrickUserSettings::InputCategory`) isn't saved in the config files, so
+categories made at run time leave nothing behind.
 
 ## Reading held keys
 

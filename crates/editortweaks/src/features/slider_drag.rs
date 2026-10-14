@@ -6,14 +6,14 @@
 //!   takes as long as 100 to 1000), see [`ALT_DRAG_SPEED`]. Shift and Control slow it down, as they
 //!   do normal drags (the game's own keys for that, which stay). Releasing Alt carries on as a
 //!   normal drag from there.
-//! - With [`LIFT_SLIDER_LIMITS`], no drag stops at the slider's ends (plain, Shift, Ctrl or Alt):
-//!   values only stop at the property's own limits (`property_limits` and its rules, some of which
+//! - With [`LIFT_SLIDER_LIMITS`] (a setting), no drag stops at the slider's ends (plain, Shift,
+//!   Ctrl or Alt): values only stop at the property's own limits (`property_limits` and its rules, some of which
 //!   stop drags before typed values: `drag_min`). In absolute mode (the value under the cursor),
 //!   dragging past an end carries on proportionally. Arrow keys still stop at the ends.
 //!
 //! How: the slider's mouse move handler (`game::slider_drag`) is hooked. Its clamp to the slider's
-//! range is removed from its code; `property_limits` then keeps the out-of-range value when it's
-//! set. During an Alt-drag the game sees a Shift-drag that didn't move, which keeps the value,
+//! range is removed from its code (or put back, as the setting says when a drag moves);
+//! `property_limits` then keeps the out-of-range value when it's set. During an Alt-drag the game sees a Shift-drag that didn't move, which keeps the value,
 //! while a timer (`platform::timer`, about once per frame) moves it. When a property stops a
 //! dragged value at its limit, the drag carries on from there ([`stored`]): moving back takes
 //! effect right away instead of first undoing the movement past the limit. The row's other sliders
@@ -22,11 +22,13 @@
 use core::ffi::c_void;
 use std::cell::{Cell, RefCell};
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
 use super::keybinds;
 use super::property_limits;
 use crate::framework::hook;
+use crate::framework::settings::{Section, Setting, Toggle};
 use crate::game::numeric_property::NumericValue;
 use crate::game::property_widget::{self, PropertyWidgets};
 use crate::game::slate::{self, Geometry, PointerEvent};
@@ -37,9 +39,20 @@ use crate::platform::keyboard;
 use crate::platform::timer::ThreadTimer;
 use crate::prelude::*;
 
+/// Slider drags' settings, by section of the menu (see `features::SETTINGS`).
+pub static SETTINGS: [Section; 1] = [Section {
+    title: "Sliders",
+    settings: &[Setting::Toggle(&LIFT_SLIDER_LIMITS)],
+}];
+
 /// Lift the slider's own limits from every kind of drag, so only the property's limits apply.
-/// Meant to become a setting.
-pub const LIFT_SLIDER_LIMITS: bool = true;
+static LIFT_SLIDER_LIMITS: Toggle = Toggle::new(
+    "LiftSliderLimits",
+    "Drag past slider ends",
+    "Slider drags (plain, Shift, Ctrl or Alt) carry on past the slider's ends: values only stop at \
+     the property's own limits. Arrow keys still stop at the ends.",
+    true,
+);
 
 /// Alt-drag speed with the mouse one slider width away from where Alt was pressed (four times that
 /// at two widths): the value changes by this much of its own size per second, e.g. 1.0 moves 100
@@ -75,8 +88,14 @@ struct Sliders {
     range: RangeFields,
     /// Finds the property row of a dragged slider, whose other sliders may need updating.
     rows: Option<PropertyWidgets>,
-    /// Whether drags carry on past the slider's ends.
-    lifted: bool,
+    /// Whether drags may carry on past the slider's ends: sliders keep values outside of their
+    /// range (`property_limits`). Otherwise `SetValueInternal` would clamp them anyway, and drags
+    /// would carry on past the end unseen.
+    can_lift: bool,
+    /// Whether they do now: the clamp is lifted from the game's code (see [`sync_limits`]).
+    lifted: AtomicBool,
+    /// Whether lifting or restoring the clamp failed: it's left as it is.
+    stuck: AtomicBool,
 }
 
 thread_local! {
@@ -142,7 +161,7 @@ impl Feature for SliderDrag {
 
     fn on_engine_init(&self) {
         match engine_init() {
-            Ok(true) => log!("active (drags stop at the property's limits only)"),
+            Ok(true) => log!("active (drags may go past the slider's ends: a setting)"),
             Ok(false) => log!("active (drags stop at the slider's ends)"),
             Err(reason) => log!("inactive: {reason}"),
         }
@@ -164,30 +183,53 @@ fn engine_init() -> Result<bool, String> {
                 log!("locked axes show values past a limit until released: {reason}")
             })
             .ok(),
-        lifted: lift_limits(drag),
+        can_lift: can_lift(),
+        lifted: AtomicBool::new(false),
+        stuck: AtomicBool::new(false),
     };
-    let lifted = sliders.lifted;
+    let can_lift = sliders.can_lift;
     let _ = SLIDERS.set(sliders);
-    Ok(lifted)
+    Ok(can_lift)
 }
 
-/// Removes the drag's clamp to the slider's range, if [`LIFT_SLIDER_LIMITS`] and sliders keep values
-/// outside of their range (`property_limits`): otherwise `SetValueInternal` would clamp them
-/// anyway, and drags would carry on past the end unseen.
-fn lift_limits(drag: &MouseDrag) -> bool {
-    if !LIFT_SLIDER_LIMITS {
-        return false;
-    }
-    if !property_limits::keeps_slider_values() {
+/// Whether the drag's clamp to the slider's range may be lifted: sliders keep values outside of
+/// their range (`property_limits`).
+fn can_lift() -> bool {
+    let keeps = property_limits::keeps_slider_values();
+    if !keeps {
         log!("drags stop at the slider's ends: sliders clamp their values");
-        return false;
     }
-    // SAFETY: at engine init, on the game thread, before any slider can be dragged.
-    match unsafe { drag.lift_clamp() } {
-        Ok(()) => true,
+    keeps
+}
+
+/// Lifts the drag's clamp to the slider's range, or puts it back, as [`LIFT_SLIDER_LIMITS`] says
+/// now. Whether drags carry on past the slider's ends.
+///
+/// # Safety
+/// Game thread only, outside of `NativeOnMouseMove` (whose code holds the clamp).
+unsafe fn sync_limits(sliders: &Sliders) -> bool {
+    let lifted = sliders.lifted.load(Ordering::Relaxed);
+    let wanted = sliders.can_lift && LIFT_SLIDER_LIMITS.get();
+    if wanted == lifted || sliders.stuck.load(Ordering::Relaxed) {
+        return lifted;
+    }
+    // SAFETY: per the contract, nothing runs the clamp meanwhile.
+    let done = unsafe {
+        if wanted {
+            sliders.drag.lift_clamp()
+        } else {
+            sliders.drag.restore_clamp()
+        }
+    };
+    match done {
+        Ok(()) => {
+            sliders.lifted.store(wanted, Ordering::Relaxed);
+            wanted
+        }
         Err(reason) => {
-            log!("drags stop at the slider's ends: {reason}");
-            false
+            log!("drag limits left as they are: {reason}");
+            sliders.stuck.store(true, Ordering::Relaxed);
+            lifted
         }
     }
 }
@@ -209,6 +251,8 @@ unsafe extern "C" fn on_mouse_move(
     if !unsafe { sliders.drag.is_dragging(slider) } {
         return call();
     }
+    // SAFETY: on the game thread, before NativeOnMouseMove runs.
+    unsafe { sync_limits(sliders) };
     // SAFETY: the caller's event and geometry, valid during the call.
     let (moved, width) = unsafe { ((*event).cursor_delta[0], (*geometry).absolute_width()) };
     if !keybinds::KEEP_DRAGGING_SLIDERS.is_held() {
@@ -417,7 +461,7 @@ unsafe fn alt_drag_step(sliders: &Sliders, slider: *mut c_void, distance: f32, s
         1.0
     };
     let mut target = alt_drag_target(current, span, distance * distance.abs() * seconds);
-    if !sliders.lifted {
+    if !sliders.lifted.load(Ordering::Relaxed) {
         target = target.max(min).min(max);
     }
     if !target.is_finite() || target == current {

@@ -180,7 +180,10 @@ def cmd_sigcheck(args: argparse.Namespace) -> None:
     print(f"{len(signatures)} signatures vs {exe}\n")
     results = sigs.check(image, signatures)
     for r in results:
-        targets = ", ".join(f"0x{t:X}" for t in dict.fromkeys(r.targets)) or "-"
+        unique = list(dict.fromkeys(r.targets))
+        targets = ", ".join(f"0x{t:X}" for t in unique[:4]) or "-"
+        if len(unique) > 4:
+            targets += f" (+{len(unique) - 4} more)"  # shapes common to many functions
         print(f"[{r.status:9}] {r.signature.name:34} {targets:24} {r.signature.source}")
     print(
         "\nMISSING: not found (a missing Offset32 signature crashes the game at startup)."
@@ -256,6 +259,17 @@ def cmd_exports(args: argparse.Namespace) -> None:
     for name, rva in shown:
         print(f"0x{rva:08X}  {name}")
     print(f"\n{len(shown)} of {len(exports)} exports; imports: {', '.join(image.imported_dlls())}")
+
+
+def cmd_blueprint(args: argparse.Namespace) -> None:
+    from etlib import blueprint
+
+    decompiler = blueprint.Decompiler(blueprint.export_json(Path(args.asset)))
+    functions = decompiler.functions()
+    if args.function:
+        functions = [f for f in functions if f["ObjectName"] in args.function]
+    for function in functions:
+        print("\n".join(decompiler.lines(function)))
 
 
 def cmd_disasm(args: argparse.Namespace) -> None:
@@ -349,6 +363,11 @@ def main() -> None:
     p.add_argument("-n", "--count", type=int, default=20, help="instructions")
     p.add_argument("--file", help="PE file (default: the game exe)")
     p.set_defaults(func=cmd_disasm)
+
+    p = sub.add_parser("blueprint", help="a Blueprint asset's code (e.g. from BRMK), with offsets")
+    p.add_argument("asset", help=".uasset file, e.g. BRMK's .../UI/Menu/Widgets/WBP_Menu.uasset")
+    p.add_argument("function", nargs="*", help="only these functions or events")
+    p.set_defaults(func=cmd_blueprint)
 
     args = parser.parse_args()
     args.func(args)
