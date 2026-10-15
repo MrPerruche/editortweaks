@@ -409,6 +409,15 @@ pub unsafe fn class_of(object: *const c_void) -> *const UStruct {
     }
 }
 
+/// Whether the live object `object` is of `class` or a subclass of it.
+///
+/// # Safety
+/// `object` must be a live object.
+pub unsafe fn is_a(object: *const UObjectBase, class: *const UStruct) -> bool {
+    // SAFETY: per the contract.
+    unsafe { with_parents(class_of(object.cast())) }.any(|parent| parent == class)
+}
+
 /// The default object of `class` (its CDO), if it has one of its own.
 ///
 /// # Safety
@@ -885,6 +894,44 @@ impl Function {
     pub unsafe fn call(&self, object: *mut UObjectBase, parameters: &mut Parameters) {
         // SAFETY: per the contract; the parameters fit (checked in `find`).
         unsafe { call(object, self.function, parameters.as_mut_ptr()) }
+    }
+}
+
+/// A reflected function taking one parameter, e.g. `SetVisibility(ESlateVisibility)`.
+pub struct SingleCall {
+    function: Function,
+    value: usize,
+}
+
+impl SingleCall {
+    /// The function `name` of `class`, its one parameter `parameter` checked to be a `kind`
+    /// property of `size` bytes.
+    pub fn find(
+        class: *const UClass,
+        name: &'static str,
+        parameter: &'static str,
+        kind: &'static str,
+        size: i32,
+    ) -> Result<Self, String> {
+        let function = Function::find(class, name)?;
+        Ok(Self {
+            value: function.parameter(parameter, kind, size)?,
+            function,
+        })
+    }
+
+    /// Calls it on `object` with `value`.
+    ///
+    /// # Safety
+    /// `object` must be a live object whose class has the function, and `T` the parameter's type.
+    /// Game thread only.
+    pub unsafe fn call<T>(&self, object: *mut UObjectBase, value: T) {
+        let mut parameters = Parameters::new();
+        // SAFETY: per the contract.
+        unsafe {
+            put(&mut parameters, self.value, value);
+            self.function.call(object, &mut parameters);
+        }
     }
 }
 

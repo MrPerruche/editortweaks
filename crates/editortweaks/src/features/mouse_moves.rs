@@ -5,7 +5,8 @@
 //! editor's reflected handlers `Axis_MouseMoveRight` and `Axis_MouseMoveUp`
 //! (`game::editor_input::MouseMoveAxes`): in a move mode it moves the bricks, otherwise it turns the
 //! camera. Their exec thunks are hooked here on the first [`listen`]; every listener sees each
-//! movement and can scale it or take it (then the game's handler doesn't run).
+//! movement and can scale it or take it (then the game's handler doesn't run). A listener taking
+//! the movement for a drag follows the mouse with a [`Pointer`].
 
 use core::ffi::c_void;
 use std::sync::{Mutex, OnceLock, PoisonError};
@@ -33,6 +34,84 @@ pub struct Movement {
     pub value: f32,
     /// The editor input component handling it (its outer is the editor).
     pub input: *const UObjectBase,
+}
+
+impl Movement {
+    /// How far it moves on the screen, in pixels: right, down.
+    pub fn pixels(&self) -> [f32; 2] {
+        let pixels = self.value / AXIS_PER_PIXEL;
+        match self.direction {
+            Direction::Right => [pixels, 0.0],
+            // Up is positive, and the screen's y goes down.
+            Direction::Up => [0.0, -pixels],
+        }
+    }
+}
+
+/// Where a drag points (screen pixels), see [`Self::point`].
+pub struct Pointer {
+    at: [f32; 2],
+    /// Where the cursor was when the button went down.
+    pressed_at: [f32; 2],
+    /// Whether the cursor has moved since (else the engine holds it still).
+    cursor_moves: bool,
+    /// The mouse's movement not yet added (pixels), see [`Self::moved`].
+    moved: [f32; 2],
+}
+
+impl Pointer {
+    pub fn new(mouse: [f32; 2]) -> Self {
+        Self {
+            at: mouse,
+            pressed_at: mouse,
+            cursor_moves: false,
+            moved: [0.0; 2],
+        }
+    }
+
+    /// Adds the mouse's movement (pixels, see [`Movement::pixels`]), for the next [`Self::point`].
+    pub fn moved(&mut self, pixels: [f32; 2]) {
+        self.moved[0] += pixels[0];
+        self.moved[1] += pixels[1];
+    }
+
+    /// Where the drag points now (screen pixels), given where the cursor is (if known). While a
+    /// button is held over the 3D view, the engine may hide the cursor and hold it where it was
+    /// pressed: then the mouse's movement moves the pointer from there. Once the cursor moves, the
+    /// pointer is the cursor.
+    pub fn point(&mut self, cursor: Option<[f32; 2]>) -> [f32; 2] {
+        let moved = core::mem::take(&mut self.moved);
+        if let Some(cursor) = cursor
+            && (cursor[0] - self.pressed_at[0]).abs() + (cursor[1] - self.pressed_at[1]).abs() > 0.5
+        {
+            self.cursor_moves = true;
+        }
+        self.at = match cursor {
+            Some(cursor) if self.cursor_moves => cursor,
+            _ => [self.at[0] + moved[0], self.at[1] + moved[1]],
+        };
+        self.at
+    }
+
+    /// Where the drag started.
+    pub fn start(&self) -> [f32; 2] {
+        self.pressed_at
+    }
+
+    /// Where the drag pointed at the last [`Self::point`].
+    pub fn at(&self) -> [f32; 2] {
+        self.at
+    }
+
+    /// Whether the cursor has moved since the drag started (else the engine holds it still).
+    pub fn cursor_moves(&self) -> bool {
+        self.cursor_moves
+    }
+
+    /// Whether the mouse moved while the engine held the cursor still: then the pointer shows.
+    pub fn held_still(&self) -> bool {
+        !self.cursor_moves && self.at != self.pressed_at
+    }
 }
 
 /// What a listener does with a movement.

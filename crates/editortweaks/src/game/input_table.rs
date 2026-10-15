@@ -24,6 +24,7 @@ use brickrust::ue::tarray::TArray;
 use brickrust::ue::uclass::{UClass, UStruct};
 
 use crate::framework::sig::{self, FunctionSig};
+use crate::game::player_input::Chord;
 use crate::game::reflection::{self, BoolField};
 use crate::game::text::Text;
 
@@ -85,8 +86,8 @@ pub struct Action<'a> {
     pub label: &'a Text,
     /// Its description, shown with it.
     pub description: &'a Text,
-    /// The keys (`FKey` names) bound to it by default, each alone (no modifier keys).
-    pub keys: &'a [FName],
+    /// The keys bound to it by default, with the modifier keys each needs.
+    pub keys: &'a [Chord],
     /// Its place among the category's actions (`SortPriority`).
     pub order: i32,
 }
@@ -139,12 +140,16 @@ struct RowLayout {
     mapping: MappingLayout,
 }
 
-/// An `FDefaultInputMapping`: modifier keys (`bShift`, ..., left unset), `Key`, `Scale`.
+/// An `FDefaultInputMapping`: modifier keys (`bShift`, ...), `Key`, `Scale` (left at 1).
 struct MappingLayout {
     ustruct: *const UStruct,
     size: usize,
     /// `Key.KeyName` (`FName`).
     key_name: usize,
+    shift: BoolField,
+    ctrl: BoolField,
+    alt: BoolField,
+    cmd: BoolField,
 }
 
 /// Offsets in a `UInputCategory`.
@@ -184,6 +189,7 @@ impl InputTables {
         }
         let (key, key_struct) = nested(mapping, "Key")?;
         let key_name = reflection::struct_field_offset(key_struct, "KeyName", "NameProperty", 8)?;
+        let modifier = |name| reflection::bool_field(mapping, name);
         let press_release =
             reflection::enum_value("EInputRowType", "EInputRowType::PressReleaseAction")?;
 
@@ -224,6 +230,10 @@ impl InputTables {
                     // SAFETY: a live struct.
                     size: unsafe { reflection::struct_size(mapping) },
                     key_name: key + key_name,
+                    shift: modifier("bShift")?,
+                    ctrl: modifier("bCtrl")?,
+                    alt: modifier("bAlt")?,
+                    cmd: modifier("bCmd")?,
                 },
             },
             category: CategoryLayout {
@@ -365,11 +375,16 @@ impl InputTables {
             if !action.keys.is_empty() {
                 let mapping = &row.mapping;
                 let elements = self.new_structs(mapping.ustruct, action.keys.len())?;
-                for (index, key) in action.keys.iter().enumerate() {
-                    elements
-                        .add(index * mapping.size + mapping.key_name)
+                for (index, chord) in action.keys.iter().enumerate() {
+                    let element = elements.add(index * mapping.size);
+                    element
+                        .add(mapping.key_name)
                         .cast::<FName>()
-                        .write_unaligned(*key);
+                        .write_unaligned(chord.key);
+                    mapping.shift.set(element, chord.shift);
+                    mapping.ctrl.set(element, chord.ctrl);
+                    mapping.alt.set(element, chord.alt);
+                    mapping.cmd.set(element, chord.cmd);
                 }
                 let count = action.keys.len() as i32;
                 base.add(row.mappings).cast::<RawArray>().write(RawArray {

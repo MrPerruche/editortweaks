@@ -19,7 +19,7 @@ use brickrust::ue::coreuobject::UObjectBase;
 use super::draw::PixelSize;
 use super::geometry::{self, Bounds, Ray, Vec3};
 use super::parts::{CORNER_PIXELS, EDGE_PIXELS, PART_SHARE};
-use crate::game::brick_model::Triangles;
+use crate::game::brick_model::{self, Triangles};
 use crate::game::weak_object::WeakObject;
 
 /// How far a point may be from a plane to be in it, as a share of the mesh's size (the length of
@@ -27,9 +27,6 @@ use crate::game::weak_object::WeakObject;
 const PLANE_TOLERANCE: f64 = 1e-5;
 /// How far from a straight line (as the sine of the angle) two segments may turn to make one edge.
 const LINE_TOLERANCE: f64 = 1e-5;
-/// How far a brick's box may be from its model's box scaled (per coordinate, as a share of the
-/// box's size) for the model to be taken as the brick's shape.
-const FIT_TOLERANCE: f64 = 1e-4;
 
 /// A part of a model: one of its vertices (a point's index), edges or faces.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
@@ -420,32 +417,11 @@ impl BrickModel {
     /// axes the brick is `mirrored` along. `None` unless the box is the model's box scaled around
     /// the origin (e.g. a brick adding other meshes to its box).
     pub fn fit(model: Arc<Model>, mirrored: [bool; 3], exact: &Bounds) -> Option<Self> {
-        let mut scale = [1.0; 3];
-        for axis in 0..3 {
-            let size = model.bounds.extent(axis);
-            let wanted = exact.extent(axis);
-            let tolerance = FIT_TOLERANCE * wanted.abs().max(1.0);
-            if size <= 1e-6 {
-                // Flat along this axis: only a flat box fits.
-                if wanted > tolerance {
-                    return None;
-                }
-                continue;
-            }
-            if wanted <= 1e-9 {
-                // Flattened to nothing: points can't be found back on it.
-                return None;
-            }
-            let sign = if mirrored[axis] { -1.0 } else { 1.0 };
-            scale[axis] = sign * wanted / size;
-            let [low, high] =
-                [model.bounds.min[axis], model.bounds.max[axis]].map(|side| side * scale[axis]);
-            if (low.min(high) - exact.min[axis]).abs() > tolerance
-                || (low.max(high) - exact.max[axis]).abs() > tolerance
-            {
-                return None;
-            }
-        }
+        let scale = brick_model::scale_to_fit(
+            [model.bounds.min, model.bounds.max],
+            mirrored,
+            [exact.min, exact.max],
+        )?;
         Some(Self { model, scale })
     }
 

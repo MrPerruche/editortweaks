@@ -1,8 +1,10 @@
 //! The mod's keys, rebindable in the game's own input settings (category "Editor tweaks", by
 //! [`Section`]): each [`Keybind`] is an input action of the game, so the settings list it,
 //! rebind it (also to a key with modifier keys, like Ctrl + R) and reset it with the others, and
-//! the game saves its keys with its own (`Input.ini`). Keys the mod can't read (gamepad buttons,
-//! the mouse wheel) never count as held.
+//! the game saves its keys with its own (`Input.ini`). Default keys may need modifier keys too
+//! (`Ctrl+RightMouseButton`). Keys the mod can't read (gamepad buttons, the mouse wheel) never count
+//! as held. With the mouse buttons swapped in the editor (`click_swap`), a key bound to one is held
+//! with the other.
 //!
 //! How: after the game loads its input tables (`UBrickAssetManager::LoadAssetLibraries`, hooked),
 //! a table of ours with one row per keybind joins them, in a top category of ours (listed right
@@ -16,6 +18,7 @@ use std::sync::{Mutex, Once, OnceLock, PoisonError};
 use brickrust::ue::coreuobject::UObjectBase;
 use brickrust::ue::fname::FName;
 
+use super::click_swap;
 use crate::framework::hook;
 use crate::game::input_table::{self, Action, InputTables, LoadAssetLibrariesFn};
 use crate::game::kismet;
@@ -23,6 +26,25 @@ use crate::game::player_input::{self, Chord, PlayerInputs};
 use crate::game::text::Text;
 use crate::platform::keyboard;
 use crate::prelude::*;
+
+/// Held while dragging over the 3D view in the editor's default mode, draws a box: the bricks in it
+/// get selected when it's let go (`drag_select`). On the left or right mouse button, the game's own
+/// action on it (selecting, moving the camera) doesn't run while it's held.
+pub static DRAG_SELECT: Keybind = Keybind::new(
+    "EditorTweaks_DragSelect",
+    "Drag select",
+    "Hold and drag in the editor to draw a box: the bricks in it get selected when you let go. Which bricks count is a setting (Editor tweaks options, Selection).",
+    &["Ctrl+RightMouseButton"],
+);
+
+/// Held when a [`DRAG_SELECT`] box is let go, adds its bricks to the selection instead of replacing
+/// it (`drag_select`).
+pub static ADD_TO_DRAG_SELECTION: Keybind = Keybind::new(
+    "EditorTweaks_DragSelectAdd",
+    "Add to drag selection",
+    "Hold when letting go of a drag select box to add its bricks to the selection instead of replacing it.",
+    &["LeftShift", "RightShift"],
+);
 
 /// Shows the box of the brick under the mouse while held; clicking then resizes it, or moves it
 /// while moving bricks with the gizmo showing (`brick_resize`).
@@ -105,6 +127,24 @@ pub static SLOW_GIZMO_MOVES: Keybind = Keybind::new(
     &["LeftShift", "RightShift"],
 );
 
+/// Switches the editor's view between perspective and orthographic, sized by the zoom
+/// (`ortho_view`).
+pub static ORTHO_VIEW: Keybind = Keybind::new(
+    "EditorTweaks_OrthoView",
+    "Orthographic view",
+    "Press in the editor to switch between the normal view and an orthographic one (no perspective, like a field of view of 0). The zoom sets how wide it is.",
+    &["NumPadFive"],
+);
+
+/// Held while the editor's camera is moved (its right or middle mouse button held), the mouse pans
+/// the view rather than turning it, in either view (`ortho_view`).
+pub static PAN_VIEW: Keybind = Keybind::new(
+    "EditorTweaks_PanView",
+    "Pan view",
+    "Hold while moving the camera in the editor (right mouse button) to pan the view: the mouse moves the camera sideways and up or down instead of turning it.",
+    &["Shift+RightMouseButton"],
+);
+
 /// Keeps a dragged slider's value changing while held (`slider_drag`).
 pub static KEEP_DRAGGING_SLIDERS: Keybind = Keybind::new(
     "EditorTweaks_KeepDraggingSliders",
@@ -114,7 +154,12 @@ pub static KEEP_DRAGGING_SLIDERS: Keybind = Keybind::new(
 );
 
 /// Every keybind, by section, in the order the settings list them.
-static SECTIONS: [Section; 4] = [
+static SECTIONS: [Section; 6] = [
+    Section {
+        name: "IC_EditorTweaks_Selection",
+        title: "Selection",
+        keybinds: &[&DRAG_SELECT, &ADD_TO_DRAG_SELECTION],
+    },
     Section {
         name: "IC_EditorTweaks_FastEditing",
         title: "Fast editing",
@@ -134,6 +179,11 @@ static SECTIONS: [Section; 4] = [
         name: "IC_EditorTweaks_SlowMovement",
         title: "Slow movement",
         keybinds: &[&SLOW_MOVES, &SLOW_GIZMO_MOVES],
+    },
+    Section {
+        name: "IC_EditorTweaks_View",
+        title: "View",
+        keybinds: &[&ORTHO_VIEW, &PAN_VIEW],
     },
     Section {
         name: "IC_EditorTweaks_Sliders",
@@ -172,7 +222,7 @@ pub struct Keybind {
     /// What the input settings call it, and its description there.
     label: &'static str,
     description: &'static str,
-    /// Its default keys (`FKey` names), each alone.
+    /// Its default keys: `FKey` names, after the modifier keys each needs (see [`DefaultKey`]).
     keys: &'static [&'static str],
     /// The action's name, once in the game's input tables.
     action: OnceLock<FName>,
@@ -203,7 +253,8 @@ impl Keybind {
             None => self
                 .keys
                 .iter()
-                .any(|key| keyboard::is_key_down(key) == Some(true)),
+                .map(|key| DefaultKey::parse(key))
+                .any(|key| modifiers_held(&key.modifiers) && key_held(key.key)),
         }
     }
 
@@ -223,20 +274,82 @@ impl Keybind {
 
 /// Whether `chord`'s key and the modifier keys it needs are held.
 fn is_chord_held(chord: &Chord) -> bool {
-    let modifiers = (!chord.shift || keyboard::is_shift_down())
-        && (!chord.ctrl || keyboard::is_control_down())
-        && (!chord.alt || keyboard::is_alt_down())
-        && (!chord.cmd || keyboard::is_command_down());
-    if !modifiers {
-        return false;
-    }
-    let key = chord.key.to_string();
-    keyboard::is_key_down(&key).unwrap_or_else(|| {
+    let modifiers = Modifiers {
+        shift: chord.shift,
+        ctrl: chord.ctrl,
+        alt: chord.alt,
+        cmd: chord.cmd,
+    };
+    modifiers_held(&modifiers) && key_held(&chord.key.to_string())
+}
+
+/// Whether the modifier keys `needed` are held (others may be too).
+fn modifiers_held(needed: &Modifiers) -> bool {
+    (!needed.shift || keyboard::is_shift_down())
+        && (!needed.ctrl || keyboard::is_control_down())
+        && (!needed.alt || keyboard::is_alt_down())
+        && (!needed.cmd || keyboard::is_command_down())
+}
+
+/// Whether the key Unreal calls `name` is held: with the mouse buttons swapped, a mouse button is the
+/// other one.
+fn key_held(name: &str) -> bool {
+    let key = click_swap::pressed_for(name);
+    keyboard::is_key_down(key).unwrap_or_else(|| {
         LOG_UNREADABLE_KEY.call_once(|| {
             log!("can't tell whether {key} is held: not a key of the keyboard or mouse")
         });
         false
     })
+}
+
+/// Modifier keys a key needs.
+#[derive(Default)]
+struct Modifiers {
+    shift: bool,
+    ctrl: bool,
+    alt: bool,
+    /// The Windows key.
+    cmd: bool,
+}
+
+/// A default key as [`Keybind::new`] takes it: an `FKey` name after the modifier keys it needs,
+/// e.g. `Ctrl+RightMouseButton` (`Shift+`, `Ctrl+`, `Alt+`, `Cmd+`).
+struct DefaultKey<'a> {
+    key: &'a str,
+    modifiers: Modifiers,
+}
+
+impl<'a> DefaultKey<'a> {
+    fn parse(text: &'a str) -> Self {
+        let mut parsed = Self {
+            key: text,
+            modifiers: Modifiers::default(),
+        };
+        while let Some((modifier, rest)) = parsed.key.split_once('+') {
+            let flag = match modifier {
+                "Shift" => &mut parsed.modifiers.shift,
+                "Ctrl" => &mut parsed.modifiers.ctrl,
+                "Alt" => &mut parsed.modifiers.alt,
+                "Cmd" => &mut parsed.modifiers.cmd,
+                _ => break,
+            };
+            *flag = true;
+            parsed.key = rest;
+        }
+        parsed
+    }
+
+    /// As the input tables take it (after engine init: names are made).
+    fn chord(&self) -> Result<Chord, String> {
+        Ok(Chord {
+            key: kismet::string_to_name(self.key)?,
+            shift: self.modifiers.shift,
+            ctrl: self.modifiers.ctrl,
+            alt: self.modifiers.alt,
+            cmd: self.modifiers.cmd,
+        })
+    }
 }
 
 pub struct Keybinds;
@@ -439,7 +552,7 @@ struct PreparedAction {
     name: FName,
     label: Text,
     description: Text,
-    keys: Vec<FName>,
+    keys: Vec<Chord>,
 }
 
 fn prepare() -> Result<Prepared, String> {
@@ -478,7 +591,7 @@ fn prepare_action(keybind: &Keybind) -> Result<PreparedAction, String> {
         keys: keybind
             .keys
             .iter()
-            .map(|key| kismet::string_to_name(key))
+            .map(|key| DefaultKey::parse(key).chord())
             .collect::<Result<_, String>>()?,
     })
 }

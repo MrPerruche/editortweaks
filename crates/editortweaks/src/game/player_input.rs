@@ -7,15 +7,188 @@
 //! rebound it to (`game::input_table`). Its offset is read from
 //! `UBrickPlayerInput::IsInputActionKeyPressed` ([`ACTION_KEY`]), which looks a key up in them;
 //! the elements' layout comes from reflection (`FInputActionKeyMapping` is a reflected struct).
+//!
+//! Keys reach it through `UPlayerInput::InputKey` ([`INPUT_KEY`]), and [`ViewTargets`] tells what a
+//! player looks through (the editor, while editing).
+
+use core::ffi::c_void;
 
 use brickrust::ue::coreuobject::UObjectBase;
 use brickrust::ue::fname::FName;
 use brickrust::ue::tarray::TArray;
 use brickrust::ue::uclass::{UClass, UStruct};
 
-use crate::framework::sig::{self, CodeShape};
+use crate::framework::sig::{self, CodeShape, FunctionSig};
 use crate::game::reflection::{self, BoolField};
 use crate::game::world;
+
+/// `virtual bool UPlayerInput::InputKey(FKey Key, EInputEvent Event, float AmountDepressed, bool
+/// bGamepad)` (engine; BRMK engine module 0x1758A30, game RVA 0x29C9DB0, slot +0x278 of
+/// `UBrickPlayerInput`'s vtable, which keeps it): every key and mouse button the player's
+/// controller gets (`APlayerController::InputKey`, from the game's viewport, not what menus take),
+/// before the bindings see it. UE 4.27:
+///
+/// ```text
+/// FKeyState& KeyState = KeyStateMap.FindOrAdd(Key);
+/// switch (Event) {
+/// case IE_Pressed: case IE_Repeat:  KeyState.RawValueAccumulator.X = AmountDepressed; ...
+/// case IE_Released:                 KeyState.RawValueAccumulator.X = 0; ...
+/// case IE_DoubleClick:              ...
+/// }
+/// ```
+///
+/// The bindings then read the key states each frame (`ProcessInputStack`), so a key renamed here
+/// acts as the other key everywhere.
+pub const INPUT_KEY: FunctionSig = FunctionSig {
+    name: "UPlayerInput::InputKey",
+    // The switch on the event (pressed, released, repeat, double click), then the double click's
+    // value written to the key state (`RawValueAccumulator.X`, +0xC0).
+    pattern: "83 ea 01 0f 84 ?? ?? ?? ?? 83 ea 01 0f 84 ?? ?? ?? ?? 83 fa 01 0f 85 ?? ?? ?? ?? f3 0f 11 ?? c0 00 00 00",
+};
+
+/// The key comes as a pointer to the caller's copy (an `FKey` by value), which the function
+/// destroys when it's done (Microsoft's x64 convention).
+pub type InputKeyFn = unsafe extern "C" fn(
+    input: *mut UObjectBase,
+    key: *mut Key,
+    event: i32,
+    amount: f32,
+    gamepad: bool,
+) -> bool;
+
+/// `EInputEvent`: what happened to the key.
+pub const PRESSED: i32 = 0;
+pub const RELEASED: i32 = 1;
+pub const DOUBLE_CLICK: i32 = 3;
+
+/// An `FKey` (UE 4.27, 0x18 bytes): its name, and its details (`TSharedPtr<FKeyDetails>`: the
+/// details, then their reference controller), which the engine looks up from the name while null.
+#[repr(C)]
+pub struct Key {
+    pub name: FName,
+    details: *mut c_void,
+    controller: *mut ReferenceController,
+}
+
+/// `SharedPointerInternals::FReferenceControllerBase`: its vtable, then the counts. `FKey`'s
+/// pointer isn't thread safe (UE 4.27's default on Windows): plain counts.
+#[repr(C)]
+struct ReferenceController {
+    vtable: *const c_void,
+    shared: i32,
+    weak: i32,
+}
+
+impl Key {
+    /// Makes this key the one called `name`: its details are let go (the engine finds the new
+    /// key's from its name when it needs them).
+    ///
+    /// # Safety
+    /// `self` must be a live `FKey` of the game's. Game thread only (the counts aren't atomic).
+    pub unsafe fn rename(&mut self, name: FName) {
+        self.name = name;
+        // SAFETY: per the contract; the controller is null or the details' live controller. The
+        // engine's list of keys keeps its own reference to every key's details, so this one is
+        // never the last: if it seems to be, it's kept (the details stay alive, unused).
+        unsafe {
+            if let Some(controller) = self.controller.as_mut()
+                && controller.shared > 1
+            {
+                controller.shared -= 1;
+            }
+        }
+        self.details = core::ptr::null_mut();
+        self.controller = core::ptr::null_mut();
+    }
+}
+
+/// What players look through: `APlayerController::PlayerCameraManager`'s `ViewTarget.Target` (all
+/// reflected). The editor makes itself its player's (`ABrickEditor::BecomeViewTarget`).
+pub struct ViewTargets {
+    /// `PlayerController`.
+    controller: *const UStruct,
+    /// Offset of `APlayerController::PlayerCameraManager`.
+    camera_manager: usize,
+    /// Offset of `ViewTarget.Target` in a camera manager.
+    target: usize,
+    /// `BrickEditor`.
+    editor: *const UStruct,
+}
+
+// SAFETY: reflection records and offsets living as long as the game; only used on the game thread.
+unsafe impl Send for ViewTargets {}
+unsafe impl Sync for ViewTargets {}
+
+pub fn view_targets() -> Result<ViewTargets, String> {
+    let class = |name| reflection::find_class(name).ok_or(format!("class {name} not found"));
+    let controller = class("PlayerController")?;
+    let manager = class("PlayerCameraManager")?;
+    // SAFETY: a live class; property records live as long as their class.
+    let target = unsafe {
+        let view_target = reflection::find_property(manager.cast(), "ViewTarget");
+        if view_target.is_null() {
+            return Err("PlayerCameraManager: field 'ViewTarget' not found".into());
+        }
+        let view = reflection::struct_type(view_target);
+        if view.is_null() {
+            return Err("PlayerCameraManager: 'ViewTarget' isn't a struct".into());
+        }
+        (*view_target).offset_internal as usize
+            + reflection::struct_field_offset(view, "Target", "ObjectProperty", 8)?
+    };
+    Ok(ViewTargets {
+        controller: controller.cast(),
+        camera_manager: reflection::field_offset(
+            controller,
+            "PlayerCameraManager",
+            "ObjectProperty",
+            8,
+        )?,
+        target,
+        editor: class("BrickEditor")?.cast(),
+    })
+}
+
+impl ViewTargets {
+    /// Whether the player whose input is `input` (a `UPlayerInput`, inside its player controller)
+    /// looks through an editor: is editing.
+    ///
+    /// # Safety
+    /// `input` must be a live player input. Game thread only.
+    pub unsafe fn in_editor(&self, input: *const UObjectBase) -> bool {
+        // SAFETY: per the contract; an object's outer is live or null, and each pointer read is a
+        // reflected field of an object checked to have it (or null).
+        unsafe {
+            let controller = (*input).outer_private;
+            if controller.is_null() || !is_a(controller, self.controller) {
+                return false;
+            }
+            let read = |object: *const UObjectBase, offset: usize| {
+                object
+                    .cast::<u8>()
+                    .add(offset)
+                    .cast::<*const UObjectBase>()
+                    .read()
+            };
+            let manager = read(controller, self.camera_manager);
+            if manager.is_null() {
+                return false;
+            }
+            let target = read(manager, self.target);
+            !target.is_null() && is_a(target, self.editor)
+        }
+    }
+}
+
+/// Whether `object` is of `class` or a subclass.
+///
+/// # Safety
+/// `object` must be a live object.
+unsafe fn is_a(object: *const UObjectBase, class: *const UStruct) -> bool {
+    // SAFETY: per the contract.
+    unsafe { reflection::with_parents(reflection::class_of(object.cast())) }
+        .any(|parent| parent == class)
+}
 
 /// `bool UBrickPlayerInput::IsInputActionKeyPressed(FName ActionName, const FKey& Key) const` (BRMK
 /// 0x331B20, game RVA 0xE75440): whether `Key` is bound to the action, ignoring modifier keys.

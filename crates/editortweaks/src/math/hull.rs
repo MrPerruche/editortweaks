@@ -1,5 +1,5 @@
 //! Convex hulls of points: the faces of a collision hull, whose points are all the game keeps
-//! (PhysX makes the faces when cooking).
+//! (PhysX makes the faces when cooking). For the collision view's meshes and drag select's spinners.
 //!
 //! Incremental: start from four points spanning a tetrahedron, then add each point outside the
 //! hull so far, replacing the faces it sees with faces from it to their outline (the horizon).

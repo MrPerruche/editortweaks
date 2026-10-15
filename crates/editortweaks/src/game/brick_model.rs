@@ -15,6 +15,7 @@ use brickrust::ue::uclass::UStruct;
 
 use crate::framework::sig::Module;
 use crate::game::reflection::{self, Getter};
+use crate::math::Vec3;
 
 /// The PhysX module with the triangle meshes' code (`Gu::TriangleMesh`).
 const PHYSX_COMMON: &str = "PhysX3Common_x64.dll";
@@ -144,10 +145,21 @@ impl BrickModels {
     /// # Safety
     /// `brick` must be a live editor object. Game thread only.
     pub unsafe fn mesh_of(&self, brick: *mut UObjectBase) -> Option<*mut UObjectBase> {
-        // SAFETY: per the contract; the root component is a live object if not null, and the
-        // offset comes from reflection (checked to be a static mesh component's).
+        // SAFETY: per the contract; the root component is a live object if not null.
+        unsafe { self.mesh_of_component(self.root.call(brick)) }
+    }
+
+    /// The static mesh `component` (a brick's root component, or null) shows, if any.
+    ///
+    /// # Safety
+    /// `component` must be null or a live object. Game thread only.
+    pub unsafe fn mesh_of_component(
+        &self,
+        component: *mut UObjectBase,
+    ) -> Option<*mut UObjectBase> {
+        // SAFETY: per the contract; the offset comes from reflection (checked to be a static mesh
+        // component's).
         unsafe {
-            let component = self.root.call(brick);
             if component.is_null()
                 || !reflection::with_parents(reflection::class_of(component.cast()))
                     .any(|class| class == self.mesh_component)
@@ -265,6 +277,44 @@ impl BrickModels {
         }
         Ok(())
     }
+}
+
+/// How far a brick's box may be from its mesh's box scaled (per coordinate, as a share of the box's
+/// size) for the mesh to be taken as the brick's shape.
+const FIT_TOLERANCE: f64 = 1e-4;
+
+/// How a brick scales a mesh whose triangles span `mesh` (smallest and largest corner, in its own
+/// space) to show its box `exact` (the same, in the brick), turned inside out along the axes it's
+/// `mirrored` along: the scale along each axis, around the origin, as the game scales a brick's
+/// mesh (see `docs/re/collision-shapes.md`). `None` unless the box is the mesh's box scaled
+/// around the origin (e.g. a brick adding other meshes to its box) or is flattened to nothing.
+pub fn scale_to_fit(mesh: [Vec3; 2], mirrored: [bool; 3], exact: [Vec3; 2]) -> Option<Vec3> {
+    let mut scale = [1.0; 3];
+    for axis in 0..3 {
+        let size = mesh[1][axis] - mesh[0][axis];
+        let wanted = exact[1][axis] - exact[0][axis];
+        let tolerance = FIT_TOLERANCE * wanted.abs().max(1.0);
+        if size <= 1e-6 {
+            // Flat along this axis: only a flat box fits.
+            if wanted > tolerance {
+                return None;
+            }
+            continue;
+        }
+        if wanted <= 1e-9 {
+            // Flattened to nothing: points can't be found back on it.
+            return None;
+        }
+        let sign = if mirrored[axis] { -1.0 } else { 1.0 };
+        scale[axis] = sign * wanted / size;
+        let [low, high] = [mesh[0][axis], mesh[1][axis]].map(|side| side * scale[axis]);
+        if (low.min(high) - exact[0][axis]).abs() > tolerance
+            || (low.max(high) - exact[1][axis]).abs() > tolerance
+        {
+            return None;
+        }
+    }
+    Some(scale)
 }
 
 /// The `T` at `offset` bytes into `base`.

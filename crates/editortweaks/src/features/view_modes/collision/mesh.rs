@@ -11,9 +11,7 @@ use core::cmp::Ordering;
 use crate::game::collision::{BoxShape, CapsuleShape, Shapes, SphereShape};
 use crate::game::editor_object::Vector;
 use crate::game::mesh_builder::Triangles;
-use crate::math::{self, Quat, Vec3};
-
-use super::hull;
+use crate::math::{self, Quat, Vec3, hull};
 
 /// Rings and steps around of spheres and capsules' caps: smooth enough at brick sizes.
 const RINGS: u32 = 8;

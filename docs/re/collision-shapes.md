@@ -10,8 +10,9 @@ Collision view mode (`features/view_modes/collision`) through `game/collision.rs
 The brick meshes use `CTF_UseSimpleAndComplex` (see `brick-models.md`): PhysX simulates contacts
 with the simple shapes (`UBodySetup::AggGeom`: boxes, spheres, capsules, convex hulls), and
 precise traces (`bTraceComplex`) hit the complex triangle mesh, made from the render mesh's
-collision LOD. The view mode shows the simple shapes. Which traces in the game are complex
-(editor picking, weapons) isn't checked.
+collision LOD. The view mode shows the simple shapes. The editor's picking is complex (see
+`selection.md`); which other traces in the game are complex
+(weapons, say) isn't checked.
 
 ## Bricks use the engine's body instance, scaled by the game
 

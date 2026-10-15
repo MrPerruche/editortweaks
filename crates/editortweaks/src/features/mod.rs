@@ -3,18 +3,23 @@
 //! [`SETTINGS`].
 
 use crate::framework::feature::Feature;
-use crate::framework::settings::Section;
+use crate::framework::settings::{Section, Setting};
 
 mod actuator_arrows;
 mod brick_resize;
 mod camera_speed;
+mod click_swap;
+mod drag_select;
 mod editor_bounds;
+/// Shared hooks of the editor's mouse button actions (not a feature).
+mod editor_buttons;
 mod hello;
 /// The mod's rebindable keys, which other features read.
 mod keybinds;
 /// Shared hooks of the editor's mouse movement (not a feature).
 mod mouse_moves;
 mod move_slowdown;
+mod ortho_view;
 mod precise_moves;
 mod precise_sliders;
 mod property_limits;
@@ -33,15 +38,27 @@ pub static ALL: &[&dyn Feature] = &[
     &slider_formulas::SliderFormulas,
     &slider_drag::SliderDrag,
     &camera_speed::CameraSpeed,
+    &ortho_view::OrthoView,
     &editor_bounds::EditorBounds,
     &move_slowdown::MoveSlowdown,
     &precise_moves::PreciseMoves,
     &view_modes::ViewModes,
     &brick_resize::BrickResize,
+    &drag_select::DragSelect,
+    &click_swap::ClickSwap,
     &actuator_arrows::ActuatorArrows,
     &suspension_arrows::SuspensionArrows,
     &settings_menu::SettingsMenu,
 ];
 
 /// Every feature's settings, by section of the menu, in the menu's order (see `settings_menu`).
-pub static SETTINGS: &[&[Section]] = &[&brick_resize::SETTINGS, &slider_drag::SETTINGS];
+pub static SETTINGS: &[&[Section]] = &[&SELECTION, &brick_resize::SETTINGS, &slider_drag::SETTINGS];
+
+/// The settings of selecting bricks: which buttons, and what a box picks.
+static SELECTION: [Section; 1] = [Section {
+    title: "Selection",
+    settings: &[
+        Setting::Toggle(&click_swap::SWAP_CLICKS),
+        Setting::Choice(&drag_select::PICKS),
+    ],
+}];

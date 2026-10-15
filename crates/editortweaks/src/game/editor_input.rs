@@ -72,6 +72,8 @@ pub struct CameraFlags {
     offset: usize,
 }
 
+/// Set in [`CameraFlags`] while the camera is pivoted.
+const CAMERA_PIVOTING: u8 = 2;
 /// Set in [`CameraFlags`] while the camera is moved or pivoted.
 const CAMERA_MOVING: u8 = 4;
 
@@ -90,8 +92,25 @@ impl CameraFlags {
     /// # Safety
     /// `input` must be a live editor input component.
     pub unsafe fn moving(&self, input: *const UObjectBase) -> bool {
+        // SAFETY: per the contract.
+        unsafe { self.flags(input) & CAMERA_MOVING != 0 }
+    }
+
+    /// Whether `input`'s camera is pivoted (`PivotCamera` held): turning it turns it around the
+    /// selection (`ABrickEditor::UpdateViewRotation`), rather than in place.
+    ///
+    /// # Safety
+    /// As for [`Self::moving`].
+    pub unsafe fn pivoting(&self, input: *const UObjectBase) -> bool {
+        // SAFETY: per the contract.
+        unsafe { self.flags(input) & CAMERA_PIVOTING != 0 }
+    }
+
+    /// # Safety
+    /// As for [`Self::moving`].
+    unsafe fn flags(&self, input: *const UObjectBase) -> u8 {
         // SAFETY: per the contract; the offset comes from the game's own check.
-        unsafe { input.cast::<u8>().add(self.offset).read() & CAMERA_MOVING != 0 }
+        unsafe { input.cast::<u8>().add(self.offset).read() }
     }
 }
 
@@ -299,6 +318,79 @@ impl ButtonAction {
     /// `result` must be the return value pointer the thunk was called with.
     pub unsafe fn handled(&self, result: *mut c_void) {
         // SAFETY: per the contract; `button_action` checked the return value.
+        unsafe { set_handled(result) }
+    }
+}
+
+/// `FBrActionResult Action_ZoomInStep(const FBrActionParams&)` and `Action_ZoomOutStep`
+/// (`UBaseInputComponent`, BRMK 0x225520 / 0x2255D0): a zoom step (the mouse wheel in the editor).
+/// For a real input (`Params.Mode`), they step the view target's zoom ratio by +1 or -1 (BRMK
+/// 0x372190, `Step` of its zoom params), and return handled if it has zoom params.
+pub struct ZoomSteps {
+    /// `EditorInputComponent`.
+    class: *const UClass,
+    pub zoom_in: Axis,
+    pub zoom_out: Axis,
+}
+
+// SAFETY: reflection records and game code live as long as the game; only used on the game thread.
+unsafe impl Send for ZoomSteps {}
+unsafe impl Sync for ZoomSteps {}
+
+pub fn zoom_steps() -> Result<ZoomSteps, String> {
+    let class = reflection::find_class("EditorInputComponent")
+        .ok_or("class EditorInputComponent not found")?;
+    let steps = ZoomSteps {
+        class,
+        zoom_in: axis(class, "Action_ZoomInStep")?,
+        zoom_out: axis(class, "Action_ZoomOutStep")?,
+    };
+    returns_action_result(class, "Action_ZoomInStep")?;
+    returns_action_result(class, "Action_ZoomOutStep")?;
+    // SAFETY: `axis` checked that the parameter is an FBrActionParams, a reflected struct.
+    let mode = unsafe {
+        let params = reflection::struct_type(steps.zoom_in.params);
+        reflection::struct_field_offset(params, "Mode", "EnumProperty", 1)
+            .or_else(|_| reflection::struct_field_offset(params, "Mode", "ByteProperty", 1))?
+    };
+    if mode != 0 {
+        return Err("FBrActionParams changed its layout".into());
+    }
+    Ok(steps)
+}
+
+impl ZoomSteps {
+    /// Whether `object` is an editor input component.
+    ///
+    /// # Safety
+    /// `object` must be a live object.
+    pub unsafe fn is_editor_input(&self, object: *const c_void) -> bool {
+        // SAFETY: per the contract.
+        unsafe { reflection::with_parents(reflection::class_of(object)) }
+            .any(|class| class == self.class.cast())
+    }
+
+    /// Whether a call of `step`'s thunk is a real zoom step called through `ProcessEvent` (as the
+    /// input system's calls are), not a test of whether it would be handled.
+    ///
+    /// # Safety
+    /// `stack` must be the frame `step`'s thunk was called with.
+    pub unsafe fn is_real(&self, step: &Axis, stack: *const c_void) -> bool {
+        // SAFETY: per the contract; `Mode` is the first byte of the FBrActionParams.
+        unsafe {
+            match reflection::native_call_parameter(stack, step.params) {
+                Some(params) => params.read() == REAL,
+                None => false,
+            }
+        }
+    }
+
+    /// Marks a call of a zoom step thunk as handled without running the game's handler.
+    ///
+    /// # Safety
+    /// `result` must be the return value pointer the thunk was called with.
+    pub unsafe fn handled(&self, result: *mut c_void) {
+        // SAFETY: per the contract; `zoom_steps` checked the return values.
         unsafe { set_handled(result) }
     }
 }

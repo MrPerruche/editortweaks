@@ -77,7 +77,11 @@ a function only once). `Action_MoveCamera` / `Action_PivotCamera` (BRMK 0x222710
 0 / 1 of +0x210 and call `UpdateCameraMode` (0x261F80), which sets bit 2 (4) when either is set.
 In the game the overrides call `HandleStealMouseMove` (0xDE3CC0), whose flag test gives the offset
 (signature `editor_input::STEAL_MOUSE_MOVE`, `CameraFlags`). The resize tool takes the right button
-(`Action_MoveCamera`, hooked) while it drags, so the camera mode doesn't start then.
+(`Action_MoveCamera`, hooked) while it drags, so the camera mode doesn't start then, and so does drag
+select while its key is held; both go through `features/editor_buttons`, which hooks the `Select`
+and `MoveCamera` thunks once for every feature (see `selection.md`).
+`ortho_view` takes the mouse's movement while the camera mode is on and its pan key is held
+(Shift + right button), and pans the camera by it (`editor-camera.md`).
 
 The editor creates its input component in `ABrickEditor::EnableInput` (BRMK 0x9C9A0) with itself as
 the outer (`StaticConstructObject_Internal`, stored in `AActor::InputComponent`), so a handler's

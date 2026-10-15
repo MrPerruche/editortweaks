@@ -1,6 +1,7 @@
 //! The camera of what the player views (`IViewTargetInterface`, implemented by `ABrickEditor`, the
-//! free camera's `ABrickSpectatorPawn`, vehicles, ...), here its speed. Found through BRMK 1.11.6's
-//! exports, then in game 1.11.7 (build 25831956); see `docs/re/editor-input.md`.
+//! free camera's `ABrickSpectatorPawn`, vehicles, ...), here its speed and its zoom. Found through
+//! BRMK 1.11.6's exports, then in game 1.11.7 (build 25831956); see `docs/re/editor-input.md` and
+//! `docs/re/editor-camera.md`.
 
 use core::ffi::c_void;
 
@@ -35,6 +36,14 @@ pub type CameraSpeedFn = unsafe extern "C" fn(interface: *mut c_void) -> f32;
 /// Slot of `_getUObject` in `IViewTargetInterface`'s vtable (BRMK and game, checked on the editor's
 /// vtables; `GetCameraSpeedParams` is slot 16, `GetCameraSpeedRatio` slot 18).
 const GET_UOBJECT_SLOT: usize = 2;
+
+/// Slot of `GetZoomCache` in `IViewTargetInterface`'s vtable (BRMK and game: `UpdateZoom` calls it
+/// at +0xA8, `GetZoomParams` at +0xA0): the view target's `FViewTargetZoomCache`, or null.
+const GET_ZOOM_CACHE_SLOT: usize = 21;
+
+/// Offset of the current zoom ratio in `FViewTargetZoomCache` (not reflected: +0x0 the held zoom
+/// input, +0x4 the ratio the zoom steps set, +0x8 the current one, gliding there).
+const ZOOM_CACHE_RATIO: usize = 8;
 
 pub struct CameraSpeed {
     /// [`CAMERA_SPEED`]'s start.
@@ -94,6 +103,25 @@ impl CameraSpeed {
             let get: unsafe extern "C" fn(*mut c_void) -> f32 = virtual_at(interface, self.ratio);
             get(interface)
         }
+    }
+}
+
+/// The view target's zoom ratio: 0 (unzoomed) to 1 (zoomed in the most), if it zooms.
+///
+/// # Safety
+/// `interface` must point to a live object's `IViewTargetInterface`. Game thread only.
+pub unsafe fn zoom_ratio(interface: *mut c_void) -> Option<f32> {
+    // SAFETY: per the contract; the slot is `GetZoomCache`, which returns null or the view
+    // target's own zoom cache.
+    unsafe {
+        let get: unsafe extern "C" fn(*mut c_void) -> *const u8 =
+            virtual_at(interface, GET_ZOOM_CACHE_SLOT * size_of::<usize>());
+        let cache = get(interface);
+        if cache.is_null() {
+            return None;
+        }
+        let ratio = cache.add(ZOOM_CACHE_RATIO).cast::<f32>().read_unaligned();
+        (0.0..=1.0).contains(&ratio).then_some(ratio)
     }
 }
 

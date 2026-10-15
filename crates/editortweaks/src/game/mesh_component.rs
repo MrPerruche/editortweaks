@@ -14,7 +14,9 @@ use brickrust::ue::tarray::TArray;
 use brickrust::ue::uclass::UClass;
 
 use crate::game::editor_object::{Transform, Vector};
-use crate::game::reflection::{self, BoolField, Function, Getter, Parameters, put, take};
+use crate::game::reflection::{
+    self, BoolField, Function, Getter, Parameters, SingleCall, put, take,
+};
 use crate::prelude::log;
 
 /// `ECollisionEnabled::NoCollision`.
@@ -36,42 +38,6 @@ struct IndexedCall {
     function: Function,
     index: usize,
     value: usize,
-}
-
-/// A function taking one parameter.
-struct SingleCall {
-    function: Function,
-    value: usize,
-}
-
-impl SingleCall {
-    fn find(
-        class: *const UClass,
-        name: &'static str,
-        parameter: &'static str,
-        kind: &'static str,
-        size: i32,
-    ) -> Result<Self, String> {
-        let function = Function::find(class, name)?;
-        Ok(Self {
-            value: function.parameter(parameter, kind, size)?,
-            function,
-        })
-    }
-
-    /// Calls it on `object` with `value`.
-    ///
-    /// # Safety
-    /// `object` must be a live object whose class has the function, and `T` the parameter's type.
-    /// Game thread only.
-    unsafe fn call<T>(&self, object: *mut UObjectBase, value: T) {
-        let mut parameters = Parameters::new();
-        // SAFETY: per the contract.
-        unsafe {
-            put(&mut parameters, self.value, value);
-            self.function.call(object, &mut parameters);
-        }
-    }
 }
 
 /// Makes and changes mesh components, and reads the components they copy (after engine init).

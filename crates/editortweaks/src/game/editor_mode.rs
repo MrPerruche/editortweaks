@@ -6,9 +6,10 @@
 //! 25831956); see `docs/re/editor-input.md`.
 
 use brickrust::ue::coreuobject::UObjectBase;
+use brickrust::ue::tarray::TArray;
 use brickrust::ue::uclass::{UClass, UStruct};
 
-use crate::framework::sig::{self, CodeShape};
+use crate::framework::sig::{self, CodeShape, FunctionSig};
 use crate::game::reflection;
 
 /// `virtual bool UBrickEditorMoveMode::ShouldCaptureMouse() const` (BRMK 0xEAD40, game RVA
@@ -29,6 +30,96 @@ pub const SHOULD_CAPTURE_MOUSE: CodeShape = CodeShape {
     // The axis's offset at +2, the type's at +8.
     shape: "83 79 ?? 00 74 09 80 79 ?? 00 74 03 b0 01 c3 32 c0 c3",
 };
+
+/// `virtual void UBrickEditorMode::ReleaseObjectAtScreenPosition(const FVector2D&, bool bAdd)` (BRMK
+/// 0xD57E0, game RVA 0xCFF240; the default mode keeps it): the left click's release
+/// (`HandleSelect`, see `game::editor_input::SELECT`). If the object under the cursor is the one
+/// the press was on, it selects it, or nothing (a click on no brick):
+///
+/// ```text
+/// TArray<UBrickEditorObject*> Objects;
+/// if (Object) Objects.Add(Object);
+/// this->SelectObjects(Objects, bAdd, true);      // virtual: game +0x2F0, BRMK +0x3B0
+/// ```
+///
+/// `SelectObjects(const TArray<UBrickEditorObject*>&, bool bAdd, bool bClicked)` is the default
+/// mode's (BRMK 0xE4DE0, game 0xD05220; the base mode's does nothing), which calls
+/// `ABrickEditor::SelectObjects(Objects, ESelectObjectsMode, ...)`: with no objects, it unselects
+/// everything (unless adding); adding, it adds them (mode 1), or removes them if the first one is
+/// the primary selected object (mode 2); else they replace the selection (mode 4). `bClicked`
+/// lets a click on the only selected brick select its group instead (a user setting).
+pub const SELECT_OBJECTS_CALL: FunctionSig = FunctionSig {
+    name: "UBrickEditorMode::ReleaseObjectAtScreenPosition",
+    // The objects, `bClicked` (true) and `bAdd`, then the virtual call (its offset at +17).
+    pattern: "48 8d 54 24 ?? 41 b1 01 44 0f b6 ?? 48 8b ?? ff 90 ?? ?? 00 00",
+};
+
+/// Where [`SELECT_OBJECTS_CALL`]'s match holds `SelectObjects`'s vtable offset.
+const SELECT_OBJECTS_SLOT: usize = 17;
+
+type SelectObjectsFn = unsafe extern "C" fn(
+    mode: *mut UObjectBase,
+    objects: *const TArray<*mut UObjectBase>,
+    add: bool,
+    clicked: bool,
+);
+
+/// Selecting objects the way a click does (after engine init).
+pub struct Selector {
+    /// Offset of `SelectObjects` in an editor mode's vtable.
+    slot: usize,
+}
+
+pub fn selector() -> Result<Selector, String> {
+    let found = SELECT_OBJECTS_CALL.locate()?;
+    // SAFETY: displacement bytes inside the matched pattern.
+    let slot = unsafe {
+        found
+            .address
+            .add(SELECT_OBJECTS_SLOT)
+            .cast::<u32>()
+            .read_unaligned()
+    } as usize;
+    if !slot.is_multiple_of(8) || slot >= 0x1000 {
+        return Err(format!(
+            "{}: unexpected vtable offset {slot:#x}",
+            SELECT_OBJECTS_CALL.name
+        ));
+    }
+    Ok(Selector { slot })
+}
+
+impl Selector {
+    /// Makes `objects` the selection of the editor whose current mode is `mode`, or adds them to it
+    /// (`add`; then none may be selected already, or they may be unselected instead), like a click
+    /// with or without the add key does. No objects and not adding: nothing stays selected.
+    ///
+    /// # Safety
+    /// `mode` must be a live editor's default mode (see [`EditorModes::default_mode`]), `objects`
+    /// live editor objects of that editor. Game thread only.
+    pub unsafe fn select(&self, mode: *mut UObjectBase, objects: &[*mut UObjectBase], add: bool) {
+        let Ok(count) = i32::try_from(objects.len()) else {
+            return;
+        };
+        // The mode only reads the array (a `const&`), so it may point to our memory.
+        let array = TArray {
+            data: objects.as_ptr().cast_mut(),
+            num: count,
+            max: count,
+        };
+        // SAFETY: per the contract; the slot comes from the game's own call, and the mode's vtable
+        // has it (every editor mode's does).
+        unsafe {
+            let vtable = (*mode).vtable.cast::<u8>();
+            let select = vtable.add(self.slot).cast::<*const u8>().read();
+            if !sig::is_code(select) {
+                return;
+            }
+            let select: SelectObjectsFn = core::mem::transmute(select);
+            select(mode, &array, add, false);
+        }
+    }
+}
 
 /// The gizmo axis type of moves following the mouse in the plane across the axis, where Shift
 /// (`MovePerpendicular`) moves bricks along the axis instead: G (`Action_MoveSelection` starts a
@@ -171,6 +262,18 @@ impl EditorModes {
         unsafe {
             let mode = self.current(editor);
             !mode.is_null() && self.is_a(mode, self.default_mode)
+        }
+    }
+
+    /// `editor`'s current mode if it's the default one (see [`Self::is_editing`]).
+    ///
+    /// # Safety
+    /// `editor` must be a live `ABrickEditor`.
+    pub unsafe fn default_mode(&self, editor: *const UObjectBase) -> Option<*mut UObjectBase> {
+        // SAFETY: per the contract.
+        unsafe {
+            let mode = self.current(editor);
+            (!mode.is_null() && self.is_a(mode, self.default_mode)).then_some(mode)
         }
     }
 

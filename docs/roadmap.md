@@ -37,23 +37,50 @@ likely approach are first guesses, to be revised as the editor gets reverse engi
   untested in game yet. Brick places are `f32`: 0.5 cm steps past 42 km, 1 cm past 84 km.
 - **Camera speed**: exponential speed steps. Done 2026-10-09 as `features/camera_speed`
   (slowest, fastest and step count in its constants).
+- **Orthographic view**: a key (Numpad 5) switches the editor's view to orthographic. Started
+  2026-10-14 as `features/ortho_view` (see `docs/re/editor-camera.md`). First test: worked, but the
+  sky broke (fixed by shrinking it while orthographic) and the switch jumped in size; now it keeps
+  what's in the middle the same size (a 0.3 s dolly zoom, the camera moved back when leaving) and
+  the zoom steps zoom it without limits. Second test: the sky renders; but switches often leapt
+  hundreds of metres to kilometres (the trace went through the vehicle), and turning felt random.
+  Now the switch keeps the size of the brick nearest the middle of the view, and turning the camera
+  turns around the brick in the middle. Third test: both fine; but faces flickered at half a
+  millimetre (10 km of depth) and the view couldn't look inside the vehicle (it showed from 100 m
+  behind the camera, "camera super far + 1° FOV"). Now it shows from the camera on, cutting through
+  what the camera is in, as deep as its width calls for, and the game's zoom notification says
+  "Perspective 20" or "Orthographic 2.4 m" (asked for in the same test). Fourth test: fine; asked
+  for Shift + right drag to pan, and leaving the editor while orthographic broke the view on coming
+  back (old frames smeared: the sky stayed unshrunk). Now Shift + right drag pans either view
+  (`keybinds::PAN_VIEW`) and leaving the editor switches back to perspective. Possible follow-ups:
+  focus (`FocusCamera`) fitting the zoom, thumbnails taken from an orthographic view, a narrower
+  smallest width.
 - **Slower moves**: Ctrl slows down moving bricks and turning the camera with the mouse, Shift
   moving bricks by a gizmo handle. Done 2026-10-09 as `features/move_slowdown` (factors in its
   constants). Shift replaced Alt (2026-10-10, Alt is the resize tool's key); it leaves the camera
   and G/dragged moves alone (there it's the game's "move perpendicular").
 - **Rebindable keys**: the mod's keys in the game's own input settings. Done 2026-10-10 as
   `features/keybinds`: an "Editor tweaks" category of their own (2026-10-14; before, a section of
-  the editor's), listed after the editor's, by section: fast editing (fast editing, use models,
-  snap, next orientation), fast editing: lines (line point, slide along line, clear line), slow
-  movement (slow, super slow), sliders (value scrubbing). Saved with the game's keys (`Input.ini` keeps
-  only what differs from the defaults, so a new default key reaches players who didn't rebind it). Not rebindable: Shift/Ctrl during an Alt-drag (the game's own slider keys) and the resize tool's mouse
-  buttons (the game's `Select` / `MoveCamera`, rebindable there).
+  the editor's), listed after the editor's, by section: selection (drag select, add to drag
+  selection; 2026-10-14), fast editing (fast editing, use models, snap, next orientation), fast
+  editing: lines (line point, slide along line, clear line), slow movement (slow, super slow),
+  view (orthographic view, pan view), sliders (value scrubbing). Default keys may need modifier keys (`Ctrl+RightMouseButton`). Saved
+  with the game's keys (`Input.ini` keeps only what differs from the defaults, so a new default key
+  reaches players who didn't rebind it). Not rebindable: Shift/Ctrl during an Alt-drag (the game's
+  own slider keys) and the resize tool's mouse buttons (the game's `Select` / `MoveCamera`,
+  rebindable there, and swapped by the click swap setting).
+- **Swap left and right click** in the editor: a setting (2026-10-14, `features/click_swap`), off
+  by default. The game's selection keys were already rebindable (Brick editor > Selection), but
+  binding Select to the right button left the camera on it, and "Move camera" is shared with the
+  free camera and vehicles (on the left button it would fire weapons too). So the swap renames the
+  two buttons as they reach the player's input (`UPlayerInput::InputKey`) while the player looks
+  through the editor: the game's actions and the mod's keys follow, menus keep their clicks. See
+  `docs/re/selection.md`. Untested in game yet.
 - **Settings menu**: the mod's settings in the game's options. Started 2026-10-14 as
   `features/settings_menu` and `framework/settings`: an "Editor tweaks" button after the options'
   own (Gameplay, User interface, ...) opens a sub-menu like theirs (Back returns to the options),
   whose page is a settings page like the game's (the gameplay settings page asked for our category
-  instead), with check boxes and lists by section:
-  fast editing snapping (each kind of point), turning to match (faces, edges, square up), lines
+  instead), with check boxes and lists by section: selection (swap left and right click, what a
+  drag select box picks), fast editing snapping (each kind of point), turning to match (faces, edges, square up), lines
   (how long a line lasts), sliders (drag past slider ends). Saved as they change to
   `%LOCALAPPDATA%\BrickRigs\SavedRemastered\Config\WindowsNoEditor\EditorTweaks.ini`, read at
   start-up. A feature's setting is a `Toggle` or `Choice` static next to its code, listed in
@@ -87,7 +114,19 @@ likely approach are first guesses, to be revised as the editor gets reverse engi
   that deform the mesh, so their shapes show a plain version of the material (the brick's
   parameters on the plain scalable brick's base material); 2026-10-13, untested in game yet.
   Ideas: the complex collision too, a key to switch, only the selection.
-- **Drag to select**: box selection.
+- **Drag to select**: box selection. Started 2026-10-14 as `features/drag_select`: in the editor's
+  default mode, Ctrl + right drag (the "Drag select" key, rebindable) draws a box from where it was
+  pressed; letting go selects the bricks it picks through the editor mode's own `SelectObjects`
+  (replacing the selection, or adding with Shift, "Add to drag selection"). A setting picks the
+  bricks it touches (default), those inside it, or those whose center is; bricks behind others
+  count, hidden ones don't. First version (boxes and lines) worked in game. Then, at the user's
+  request: bricks picked by their shape (what a click hits: their complex collision), shown while
+  dragging with the game's own selection outline as letting go would leave them, and the box drawn
+  with the game's UI in the UI style's highlight color, see-through inside (untested in game yet).
+  See `docs/re/selection.md`. Ideas: only visible bricks (a setting), removing from the selection,
+  the UI style's marquee border.
+- **Selection "mesh quality"**: a setting to improve the "mesh quality" of selection (the user's
+  idea, 2026-10-14, for later: to be specified).
 - **Advanced resizing**:
   - Scale gizmo.
   - Push/extend the edges of scalable bricks. Started 2026-10-10 as `features/brick_resize`: in
@@ -152,6 +191,15 @@ likely approach are first guesses, to be revised as the editor gets reverse engi
     (see `docs/re/brick-models.md`). Untested in game yet. Later: the same for moving bricks.
 - **Reference previews**: import 3D models and images as non-brick previews.
   - View mode showing the distance between the model and the bricks; opacity setting.
+- **Map in the editor** (city covers, asked 2026-10-14): in the panel when nothing is selected, show
+  the map around the vehicle (a toggle, later an opacity slider) and pick one of the map's garages,
+  its spawn point marked with a 3-axis cross, so the map shows as it will be around the vehicle
+  spawned there. Investigated 2026-10-14, nothing built yet: report `docs/city-cover-helper.md`,
+  findings `docs/re/map-in-editor.md`. In short: the editor is an actor in the map's world (100 m
+  above its origin) that hides every other actor each frame; a garage places the vehicle's bounding
+  box centre on its spawn point. Plan: move the editor to where the vehicle will spawn and take the
+  map back out of the hidden list, after a test version checks the risks (editor moved and turned,
+  collision when hosting, the placement prediction).
 
 ## First technical milestones
 

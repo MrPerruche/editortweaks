@@ -12,6 +12,8 @@
 
 use core::ops::Mul;
 
+pub mod hull;
+
 /// A point or direction (`FVector`), or a rotator.
 pub type Vec3 = [f64; 3];
 

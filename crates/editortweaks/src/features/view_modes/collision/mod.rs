@@ -17,7 +17,6 @@
 //! (switching to it, edits, moves), [`remove`] after it updates one in any other, [`keep_only`]
 //! after every change of the editor (deleted bricks), and [`after_tick`] every frame.
 
-mod hull;
 mod mesh;
 
 use std::collections::hash_map::DefaultHasher;

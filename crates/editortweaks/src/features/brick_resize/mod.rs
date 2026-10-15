@@ -65,10 +65,11 @@
 //!
 //! How: the editor's tick (`ABrickEditor::Tick`, hooked) finds what the mouse points at among the
 //! bricks' boxes or models ([`scene`]) and draws lines through the engine's line batcher
-//! (`game::line_batcher`). The editor's left click (`Action_Select`, its reflected handler hooked)
-//! starts and ends a resize instead of selecting while the resize key is held over a scalable
-//! brick; the right button's (`Action_MoveCamera`) counts right clicks instead of moving the camera
-//! meanwhile, and is the line key's (when bound to it) while a line point can be placed.
+//! (`game::line_batcher`). The editor's left click (`Action_Select`, taken through
+//! [`super::editor_buttons`]) starts and ends a resize instead of selecting while the resize key is
+//! held over a scalable brick; the right button's (`Action_MoveCamera`) counts right clicks instead
+//! of moving the camera meanwhile, and is the line key's (when bound to it) while a line point can
+//! be placed.
 //! While a button is held the engine reports the mouse's movement to the editor, which would turn
 //! the camera with it: the resize takes it instead ([`super::mouse_moves`]), and follows it when
 //! the engine holds the cursor still ([`Drag::point`]). Each change writes `BrickSize` and tells the
@@ -89,21 +90,19 @@ mod resize;
 mod scene;
 mod snap;
 
-use core::ffi::c_void;
 use std::collections::HashSet;
 use std::sync::{Mutex, Once, OnceLock, PoisonError, TryLockError};
 use std::time::Instant;
 
 use brickrust::ue::coreuobject::UObjectBase;
 
+use super::editor_buttons::{self, Button, Click, Press};
 use super::keybinds;
-use super::mouse_moves::{self, Direction, Handling, Movement};
+use super::mouse_moves::{self, Handling, Movement, Pointer};
 use super::precise_moves::{self, Place};
-use crate::framework::hook;
 use crate::framework::settings::Section;
 use crate::game::brick_editor::{self, BrickEditor};
 use crate::game::brick_model::BrickModels;
-use crate::game::editor_input::{self, ButtonAction, Click};
 use crate::game::editor_mode::{self, EditorModes};
 use crate::game::editor_object::{
     self, LocalBounds, Selection, SpawnTransforms, Vector, WorldTransforms,
@@ -112,7 +111,6 @@ use crate::game::editor_view::{self, Bricks, EditorCode};
 use crate::game::line_batcher::{self, LineBatcher};
 use crate::game::mirror_mode::{self, MirrorMode};
 use crate::game::move_mode::{self, Move, MoveMode};
-use crate::game::reflection::NativeThunk;
 use crate::game::scalable_brick::BrickSizes;
 use crate::game::viewport::{self, Viewport};
 use crate::game::weak_object::WeakObject;
@@ -148,8 +146,6 @@ pub static SETTINGS: [Section; 3] = [
     },
 ];
 
-static ORIGINAL_SELECT: OnceLock<NativeThunk> = OnceLock::new();
-static ORIGINAL_MOVE_CAMERA: OnceLock<NativeThunk> = OnceLock::new();
 /// Set once everything is found; until then (or if that fails) the hooks change nothing.
 static GAME: OnceLock<Game> = OnceLock::new();
 static STATE: Mutex<State> = Mutex::new(State::new());
@@ -195,10 +191,6 @@ struct Game {
     bounds: LocalBounds,
     viewport: Viewport,
     lines: LineBatcher,
-    /// The left button: starts and ends resizing.
-    select: ButtonAction,
-    /// The right button: looks deeper for snap targets while resizing.
-    move_camera: ButtonAction,
     /// To prefer selected bricks; without it none is.
     selection: Option<Selection>,
     /// For the counterparts of resized bricks; without it they stay as they are.
@@ -251,31 +243,14 @@ fn engine_init() -> Result<(), String> {
         bounds: LocalBounds::find()?,
         viewport: viewport::find()?,
         lines: line_batcher::find()?,
-        select: editor_input::button_action(editor_input::SELECT)?,
-        move_camera: editor_input::button_action(editor_input::MOVE_CAMERA)?,
         selection,
         mirror: optional(mirror_mode::find(), "mirrored counterparts won't follow"),
         models: optional(BrickModels::find(), "bricks keep their boxes on models"),
         moves,
     };
-    let (select, move_camera) = (game.select.thunk, game.move_camera.thunk);
     let _ = GAME.set(game);
     mouse_moves::listen(take_movement)?;
-    // SAFETY: both targets are exec thunks, and the detours are NativeThunks.
-    unsafe {
-        hook::install_typed(
-            "UBaseEditorInputComponent::execAction_Select",
-            select,
-            select_detour as NativeThunk,
-            &ORIGINAL_SELECT,
-        )?;
-        hook::install_typed(
-            "UEditorInputComponent::execAction_MoveCamera",
-            move_camera,
-            move_camera_detour as NativeThunk,
-            &ORIGINAL_MOVE_CAMERA,
-        )
-    }
+    editor_buttons::listen(on_button)
 }
 
 /// What a part the feature can do without gives, or `None` after logging what it does without.
@@ -298,77 +273,21 @@ fn after_tick(editor: *mut UObjectBase, _delta: f32) {
     unsafe { state.tick(game, editor) };
 }
 
-unsafe extern "C" fn select_detour(context: *mut c_void, stack: *mut c_void, result: *mut c_void) {
-    let original = *ORIGINAL_SELECT.get().expect("hook recorded before use");
-    // SAFETY: the thunk's own arguments.
+/// The left button (`Select`) starts and ends resizing or moving; the right one (`MoveCamera`) looks
+/// deeper for snap targets while dragging, or places line points (see [`State::right_click`]).
+/// Whether the game's handler is skipped.
+fn on_button(press: &Press) -> bool {
+    let Some(game) = GAME.get() else {
+        return false;
+    };
+    let mut state = STATE.lock().unwrap_or_else(PoisonError::into_inner);
+    // SAFETY: an input handler's call, on the game thread.
     unsafe {
-        on_button(
-            |game| &game.select,
-            |state, game, click| match click {
-                Click::Pressed => state.press(game),
-                Click::Released => state.release(game),
-            },
-            context,
-            stack,
-            result,
-            original,
-        )
-    }
-}
-
-unsafe extern "C" fn move_camera_detour(
-    context: *mut c_void,
-    stack: *mut c_void,
-    result: *mut c_void,
-) {
-    let original = *ORIGINAL_MOVE_CAMERA
-        .get()
-        .expect("hook recorded before use");
-    // SAFETY: the thunk's own arguments.
-    unsafe {
-        on_button(
-            |game| &game.move_camera,
-            |state, _, click| state.right_click(click),
-            context,
-            stack,
-            result,
-            original,
-        )
-    }
-}
-
-/// Runs a button action's thunk `original` with its arguments, unless `handle` (given the game,
-/// the state and the button's change) says it handled the call: then the game's handler is skipped.
-///
-/// # Safety
-/// `context`, `stack` and `result` must be the arguments `original` (`action`'s thunk) was called
-/// with, on the game thread.
-unsafe fn on_button(
-    action: impl FnOnce(&Game) -> &ButtonAction,
-    handle: impl FnOnce(&mut State, &Game, Click) -> bool,
-    context: *mut c_void,
-    stack: *mut c_void,
-    result: *mut c_void,
-    original: NativeThunk,
-) {
-    // SAFETY: per the contract.
-    unsafe {
-        if let Some(game) = GAME.get() {
-            let action = action(game);
-            if action.is_editor_input(context)
-                && let Some(click) = action.click(stack)
-            {
-                let handled = {
-                    let mut state = STATE.lock().unwrap_or_else(PoisonError::into_inner);
-                    handle(&mut state, game, click)
-                };
-                if handled {
-                    action.handled(result);
-                    return;
-                }
-            }
+        match (press.button, press.click) {
+            (Button::Select, Click::Pressed) => state.press(game),
+            (Button::Select, Click::Released) => state.release(game),
+            (Button::MoveCamera, click) => state.right_click(click),
         }
-        original(context, stack, result);
     }
 }
 
@@ -381,12 +300,7 @@ fn take_movement(movement: &Movement) -> Handling {
         // Only the game thread uses the state, and not around input handlers.
         Err(TryLockError::WouldBlock) => return Handling::Pass,
     };
-    let pixels = movement.value / mouse_moves::AXIS_PER_PIXEL;
-    let moved = match movement.direction {
-        Direction::Right => [pixels, 0.0],
-        // Up is positive, and the screen's y goes down.
-        Direction::Up => [0.0, -pixels],
-    };
+    let moved = movement.pixels();
     // A press of the line key: moved too far, it's no click.
     state.line_tool.mouse_moved(moved);
     let Some(drag) = &mut state.drag else {
@@ -396,8 +310,7 @@ fn take_movement(movement: &Movement) -> Handling {
             Handling::Pass
         };
     };
-    drag.pointer.moved[0] += moved[0];
-    drag.pointer.moved[1] += moved[1];
+    drag.pointer.moved(moved);
     Handling::Take
 }
 
@@ -554,17 +467,6 @@ impl TurnChoice {
     }
 }
 
-/// Where a drag points (screen pixels), see [`Self::point`].
-struct Pointer {
-    at: [f32; 2],
-    /// Where the cursor was when the button went down.
-    pressed_at: [f32; 2],
-    /// Whether the cursor has moved since (else the engine holds it still).
-    cursor_moves: bool,
-    /// The mouse's movement not yet added (pixels), from [`take_movement`].
-    moved: [f32; 2],
-}
-
 /// A brick changed by a resize, as it was grabbed.
 struct Edited {
     object: WeakObject,
@@ -603,40 +505,6 @@ struct State {
 
 // SAFETY: object pointers are only used on the game thread (the mutex just satisfies statics).
 unsafe impl Send for State {}
-
-impl Pointer {
-    fn new(mouse: [f32; 2]) -> Self {
-        Self {
-            at: mouse,
-            pressed_at: mouse,
-            cursor_moves: false,
-            moved: [0.0; 2],
-        }
-    }
-
-    /// Where the drag points now (screen pixels), given where the cursor is (if known). While a
-    /// button is held over the 3D view, the engine may hide the cursor and hold it where it was
-    /// pressed: then the mouse's movement moves the pointer from there. Once the cursor moves, the
-    /// pointer is the cursor.
-    fn point(&mut self, cursor: Option<[f32; 2]>) -> [f32; 2] {
-        let moved = core::mem::take(&mut self.moved);
-        if let Some(cursor) = cursor
-            && (cursor[0] - self.pressed_at[0]).abs() + (cursor[1] - self.pressed_at[1]).abs() > 0.5
-        {
-            self.cursor_moves = true;
-        }
-        self.at = match cursor {
-            Some(cursor) if self.cursor_moves => cursor,
-            _ => [self.at[0] + moved[0], self.at[1] + moved[1]],
-        };
-        self.at
-    }
-
-    /// Whether the mouse moved while the engine held the cursor still: then the pointer shows.
-    fn held_still(&self) -> bool {
-        !self.cursor_moves && self.at != self.pressed_at
-    }
-}
 
 impl Drag {
     /// Whether what holds it is still down.
@@ -1110,7 +978,7 @@ impl State {
         LOG_CURSOR.call_once(|| {
             log!(
                 "while dragging, the cursor {}",
-                if drag.pointer.cursor_moves {
+                if drag.pointer.cursor_moves() {
                     "moves"
                 } else {
                     "stays still: following the mouse's movement"
@@ -1181,7 +1049,7 @@ impl State {
                     .call_once(|| log!("nothing can be shown: no line batcher in this world"));
                 return;
             }
-            game.lines.replace(batcher, &lines);
+            game.lines.replace(batcher, "brick_resize", &lines);
         }
         self.drawn = !lines.is_empty();
     }

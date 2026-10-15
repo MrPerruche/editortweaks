@@ -101,6 +101,12 @@ sentence case: "Move perpendicular", "Add to selection".
 
 Which rows, and their sections (BRMK, read 2026-10-14):
 
+- A row is listed if it's rebindable (`bCanBeRebound`, BRMK row +0x109) and, with no search text,
+  its category leads to the chosen one (BRMK 0x3BB260 lists the row's category and its parents),
+  else if its labels contain the search text (the predicate inside the filter BRMK 0x2F3200, called
+  by `ReflectBrickProperties` at 0x35279E on `GetInputTableRows`'s map). Every row of the game's
+  table is rebindable, `bHideFromInputHelp` ones too: `Select` and `AddToSelection` are listed
+  under Brick editor > Selection, `MoveCamera` under Camera.
 - The dropdown's options are `GetInputCategories`, in the array's order.
 - A row belongs to the chosen category if its `InputCategory` leads to it:
   `UInputCategory::ResolveInputCategory(Object, bTopMost)` (BRMK 0x2D9B20) follows
@@ -137,7 +143,9 @@ Both slots are read from `AddRow` (`input_table::ADD_ROW`). The table and its ca
 made with `StaticConstructObject_Internal` (outer: the asset manager; `RF_Transient |
 RF_MarkAsRootSet`).
 
-The mod's rows: `PressReleaseAction`, no context tags, `bCanBeRebound`, `bHideFromInputHelp`. Their
+The mod's rows: `PressReleaseAction`, no context tags, `bCanBeRebound`, `bHideFromInputHelp`,
+default mappings with their modifier keys (`FDefaultInputMapping::bShift`, ..., e.g. Ctrl + right
+mouse button for drag select). Their
 categories: a top one, `IC_EditorTweaks` ("Editor tweaks"), which the mod adds to
 `InputCategories` after each load, right after `IC_BrickEditor` (last if that isn't there); and
 inside it one subcategory per section (`IC_EditorTweaks_FastEditing`, ...), its `SortPriority`

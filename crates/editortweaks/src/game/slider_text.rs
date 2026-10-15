@@ -60,6 +60,17 @@ impl FString {
         // SAFETY: per the contract, `data` holds `num` characters.
         String::from_utf16_lossy(unsafe { core::slice::from_raw_parts(self.data, len) })
     }
+
+    /// Frees the characters of a string the game handed over (allocated with `FMemory`).
+    ///
+    /// # Safety
+    /// `self` must be a live string that's ours to free. Game thread only.
+    pub unsafe fn free(self) {
+        if !self.data.is_null() {
+            // SAFETY: per the contract.
+            unsafe { brickrust::ue::fmalloc::free(self.data.cast_mut().cast()) };
+        }
+    }
 }
 
 /// A string of ours in `FString` layout, for game functions that only read their string argument

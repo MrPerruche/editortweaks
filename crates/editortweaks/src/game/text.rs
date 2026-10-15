@@ -46,8 +46,9 @@ pub type AsNumberFn = unsafe extern "C" fn(
 ) -> *mut c_void;
 
 /// An `FText` (UE 4.27, 0x18 bytes): a thread-safe shared reference to its text data, and flags.
-/// A value of this type holds one reference, which it never gives back: keep it for the whole game
-/// (e.g. in a static) and hand out copies with [`Text::assign_to`].
+/// A value of this type holds one reference, which it only gives back through [`Text::release`]:
+/// keep it for the whole game (e.g. in a static) and hand out copies with [`Text::assign_to`], or
+/// release it once used.
 #[repr(C)]
 pub struct Text {
     data: *mut c_void,
@@ -98,7 +99,7 @@ impl Text {
     ///
     /// # Safety
     /// `self` must hold a live reference. Game thread only.
-    unsafe fn release(self) {
+    pub unsafe fn release(self) {
         let controller = self.controller;
         if controller.is_null() {
             return;

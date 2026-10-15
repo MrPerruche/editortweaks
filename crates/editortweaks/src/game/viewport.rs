@@ -1,6 +1,6 @@
 //! The view through a player controller, from its reflected functions (engine, UE 4.27): where the
-//! mouse is, the ray under a point of the screen, and where a point of the world shows on screen.
-//! Screen positions are in viewport pixels, like the mouse's.
+//! mouse is, the ray under a point of the screen, where a point of the world shows on screen, and
+//! the viewport's size. Screen positions are in viewport pixels, like the mouse's.
 
 use brickrust::ue::coreuobject::UObjectBase;
 use brickrust::ue::uclass::UFunction;
@@ -43,11 +43,19 @@ struct Project {
     result: usize,
 }
 
+/// `void APlayerController::GetViewportSize(int32& SizeX, int32& SizeY) const`.
+struct ViewportSize {
+    function: *const UFunction,
+    x: usize,
+    y: usize,
+}
+
 /// A player controller's view functions (after engine init).
 pub struct Viewport {
     mouse_position: MousePosition,
     deproject: Deproject,
     project: Project,
+    size: ViewportSize,
 }
 
 // SAFETY: reflection records living as long as the game; only used on the game thread.
@@ -74,6 +82,8 @@ pub fn find() -> Result<Viewport, String> {
     let deproject = function(DEPROJECT)?;
     const PROJECT: &str = "ProjectWorldLocationToScreen";
     let project = function(PROJECT)?;
+    const SIZE: &str = "GetViewportSize";
+    let size = function(SIZE)?;
     Ok(Viewport {
         mouse_position: MousePosition {
             function: mouse,
@@ -94,6 +104,11 @@ pub fn find() -> Result<Viewport, String> {
             location: parameter(project, PROJECT, "WorldLocation", "StructProperty", 12)?,
             screen: parameter(project, PROJECT, "ScreenLocation", "StructProperty", 8)?,
             result: parameter(project, PROJECT, "ReturnValue", "BoolProperty", 1)?,
+        },
+        size: ViewportSize {
+            function: size,
+            x: parameter(size, SIZE, "SizeX", "IntProperty", 4)?,
+            y: parameter(size, SIZE, "SizeY", "IntProperty", 4)?,
         },
     })
 }
@@ -118,6 +133,25 @@ impl Viewport {
                 base.add(function.y).cast::<f32>().read(),
             ])
         }
+    }
+
+    /// The viewport's width and height in pixels, if it has any.
+    ///
+    /// # Safety
+    /// As for [`Self::mouse`].
+    pub unsafe fn size(&self, controller: *mut UObjectBase) -> Option<[i32; 2]> {
+        let function = &self.size;
+        let mut parameters = Parameters::new();
+        // SAFETY: per the contract; every field lies within the checked parameter size.
+        let size = unsafe {
+            let base = parameters.as_mut_ptr();
+            reflection::call(controller, function.function, base);
+            [
+                base.add(function.x).cast::<i32>().read_unaligned(),
+                base.add(function.y).cast::<i32>().read_unaligned(),
+            ]
+        };
+        (size[0] > 0 && size[1] > 0).then_some(size)
     }
 
     /// The ray from the camera through the screen position `screen`.

@@ -285,6 +285,18 @@ impl Collision {
         }
     }
 
+    /// Whether `brick` collides with a body setup of its own rather than its mesh's: a spinner's,
+    /// made for its shape and size (`SpinnerBodySetup`: convex pieces along its arc, in the brick's
+    /// space and unscaled, which clicks trace too, see `docs/re/selection.md`).
+    ///
+    /// # Safety
+    /// `brick` must be a live brick.
+    pub unsafe fn has_own_body_setup(&self, brick: *mut UObjectBase) -> bool {
+        // SAFETY: per the contract.
+        self.spinner
+            .is_some_and(|(spinner, _)| unsafe { is_a(brick, &[spinner]) })
+    }
+
     /// The body setup `brick` collides with (`UBrick::GetBodySetup`: its mesh's, a spinner's own),
     /// shown by `component` (see [`Collision::component_of`]), and its static mesh.
     ///
@@ -299,8 +311,8 @@ impl Collision {
         unsafe {
             let mesh = read::<*mut UObjectBase>(component.cast(), self.static_mesh);
             let mesh = (!mesh.is_null()).then_some(mesh);
-            if let Some((spinner, offset)) = self.spinner
-                && is_a(brick, &[spinner])
+            if let Some((_, offset)) = self.spinner
+                && self.has_own_body_setup(brick)
             {
                 let body_setup = read::<*mut UObjectBase>(brick.cast(), offset);
                 return ((!body_setup.is_null()).then_some(body_setup), mesh);

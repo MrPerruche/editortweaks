@@ -5,7 +5,10 @@
 //! 25831956); see `docs/re/editor-operations.md`.
 //!
 //! Lines are kept until replaced ([`LineBatcher::replace`]): the batcher only drops lines with a
-//! positive lifetime, and ours have none.
+//! positive lifetime, and ours have none. The batcher holds a single list, so each feature's lines
+//! are kept apart here (by the feature's name) and drawn together.
+
+use std::sync::{Mutex, PoisonError};
 
 use brickrust::ue::coreuobject::UObjectBase;
 
@@ -51,6 +54,16 @@ pub struct Line {
     /// Drawn over everything, rather than hidden behind what's in front of it.
     pub on_top: bool,
 }
+
+/// A feature's lines, and the batcher they're for (by address).
+struct Layer {
+    owner: &'static str,
+    batcher: usize,
+    lines: Vec<Line>,
+}
+
+/// Every feature's lines, in the order they first drew.
+static LAYERS: Mutex<Vec<Layer>> = Mutex::new(Vec::new());
 
 /// The start of a `TArray`: its element count.
 #[repr(C)]
@@ -113,11 +126,38 @@ impl LineBatcher {
         }
     }
 
-    /// Replaces every line `batcher` shows with `lines` (none to clear it).
+    /// Replaces the lines `owner` (a feature's name) shows through `batcher` with `lines` (none to
+    /// clear them). The other features' lines for it stay.
     ///
     /// # Safety
     /// `batcher` must be a live `ULineBatchComponent` (see [`Self::batcher`]). Game thread only.
-    pub unsafe fn replace(&self, batcher: *mut UObjectBase, lines: &[Line]) {
+    pub unsafe fn replace(&self, batcher: *mut UObjectBase, owner: &'static str, lines: &[Line]) {
+        let mut layers = LAYERS.lock().unwrap_or_else(PoisonError::into_inner);
+        match layers.iter_mut().find(|layer| layer.owner == owner) {
+            Some(layer) => {
+                layer.batcher = batcher as usize;
+                layer.lines = lines.to_vec();
+            }
+            None => layers.push(Layer {
+                owner,
+                batcher: batcher as usize,
+                lines: lines.to_vec(),
+            }),
+        }
+        let lines: Vec<Line> = layers
+            .iter()
+            .filter(|layer| layer.batcher == batcher as usize)
+            .flat_map(|layer| layer.lines.iter().copied())
+            .collect();
+        // SAFETY: per the contract.
+        unsafe { self.draw(batcher, &lines) }
+    }
+
+    /// Replaces every line `batcher` shows with `lines`.
+    ///
+    /// # Safety
+    /// As for [`Self::replace`].
+    unsafe fn draw(&self, batcher: *mut UObjectBase, lines: &[Line]) {
         // SAFETY: per the contract; `FBatchedLine`s are plain data, so emptying the array only
         // needs its count reset (the engine copies the lines for rendering when it's marked dirty,
         // on the game thread at the end of the frame). Every call marks it dirty.
