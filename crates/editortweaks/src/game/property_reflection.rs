@@ -1,25 +1,107 @@
-//! Rows of our own in the game's property panels: our settings in a settings page. A panel lists
-//! the brick properties an object reflects (`IBrickPropertyInterface::ReflectBrickProperties`): each
-//! one is added to an `FBrickPropertyReflection` ([`Reflection`]) under a category (a titled
-//! section), with its display name ([`ADD_PROPERTY`]). Brick properties are small C++ objects
-//! (`{vtable, FProperty*, FName}`, shared through `TSharedRef`s) whose virtual functions read and
-//! write the value in the reflected object through the `FProperty`. Ours ([`Row`]) copy the game's
-//! tables for a bool (a check box) and an enum (a list) but replace every function touching a value
-//! with ours, which read and write our settings instead: no game field is involved.
+//! Rows of our own in the game's property panels: our settings in a settings page, the map's
+//! controls in the editor's panel. A panel lists the brick properties an object reflects
+//! (`IBrickPropertyInterface::ReflectBrickProperties`): each one is added to an
+//! `FBrickPropertyReflection` ([`Reflection`]) under a category (a titled section), with its display
+//! name ([`ADD_PROPERTY`]). Brick properties are small C++ objects (`{vtable, FProperty*, FName}`,
+//! shared through `TSharedRef`s) whose virtual functions read and write the value in the reflected
+//! object through the `FProperty`. Ours ([`Row`]) copy the game's tables for a bool (a check box)
+//! and an enum (a list, its items side by side or a dropdown) but replace every function touching a
+//! value with ours, which read and write a [`Value`] of ours instead: no game field is involved.
 //!
 //! Found in game 1.11.7 (build 25831956); see `docs/re/settings-menu.md`.
 
 use core::ffi::c_void;
+use std::sync::{Once, OnceLock};
 
 use brickrust::ue::fmalloc;
 use brickrust::ue::fname::FName;
 use brickrust::ue::tarray::TArray;
 
-use crate::framework::settings::Setting;
+use crate::framework::settings::{Choice, Setting, Toggle};
 use crate::framework::sig::{CodeShape, FunctionSig, StringRefSig, VtableSig};
-use crate::game::kismet;
+use crate::game::kismet::{self, Texts};
 use crate::game::slider_text::{FString, OwnedFString};
 use crate::game::text::Text;
+use crate::prelude::log;
+
+/// What a row of ours shows and changes: one of the mod's settings, or a feature's own value.
+#[derive(Clone, Copy)]
+pub enum Value {
+    /// A check box.
+    Check(&'static dyn Check),
+    /// A list to choose an item from.
+    List(&'static dyn List),
+}
+
+/// A value shown as a check box. Its functions run on the game thread, whenever a panel lists the
+/// row or changes it.
+pub trait Check: Sync {
+    fn checked(&self) -> bool;
+    fn set_checked(&self, checked: bool);
+}
+
+/// A value chosen from a list. Its functions run on the game thread, whenever a panel lists the
+/// row or changes it.
+pub trait List: Sync {
+    /// The items' names, in order: asked each time a panel lists the row, so they may change. Only
+    /// the first [`MAX_ITEMS`] are listed.
+    fn items(&self) -> Vec<String>;
+    /// The index of the chosen item.
+    fn chosen(&self) -> usize;
+    /// Chooses the item at `index`; whether it could.
+    fn choose(&self, index: usize) -> bool;
+    /// Whether a panel shows the list as a dropdown (a combo box, like the siren brick's type)
+    /// rather than its items side by side in one row, the game's default (fine for a few short
+    /// items).
+    fn dropdown(&self) -> bool {
+        false
+    }
+}
+
+/// How many items a list can have: the game sets an item's index as a byte.
+pub const MAX_ITEMS: usize = 256;
+
+impl Check for Toggle {
+    fn checked(&self) -> bool {
+        self.get()
+    }
+
+    fn set_checked(&self, checked: bool) {
+        self.set(checked);
+    }
+}
+
+impl List for Choice {
+    fn items(&self) -> Vec<String> {
+        self.options
+            .iter()
+            .map(|option| option.name.to_owned())
+            .collect()
+    }
+
+    fn chosen(&self) -> usize {
+        usize::from(self.get())
+    }
+
+    fn choose(&self, index: usize) -> bool {
+        match u8::try_from(index) {
+            Ok(option) if index < self.options.len() => {
+                self.set(option);
+                true
+            }
+            _ => false,
+        }
+    }
+}
+
+impl From<Setting> for Value {
+    fn from(setting: Setting) -> Self {
+        match setting {
+            Setting::Toggle(toggle) => Value::Check(toggle),
+            Setting::Choice(choice) => Value::List(choice),
+        }
+    }
+}
 
 /// `UBrickUserSettings::ReflectBrickProperties` (game 0xE8E380): the game's settings, by category.
 /// A settings page asks for its categories (gameplay tags) through the reflection's filter.
@@ -62,6 +144,14 @@ type AddPropertyFn = unsafe extern "C" fn(
 /// Offset of an edit info's description (`FText`), the row's tooltip: the game writes it right
 /// after `AddProperty` (e.g. for `bAutoCounterSteering`, game 0xE8FEF9).
 const EDIT_INFO_DESCRIPTION: usize = 0x80;
+
+/// Offsets of how an edit info has a list shown, which `UEnumPropertyWidget::UpdateValue` (game
+/// 0xF03A30, the reads at 0xF03D83) passes to its combo box: `MaxListItems` (our name; `int32`)
+/// shows the items side by side when there are at most that many, else a dropdown; -1, the
+/// default, always side by side, 0 always a dropdown (as the siren brick's type sets it). A flag
+/// before it makes the widget pass 0 instead (false by default; what else it does is unknown).
+const EDIT_INFO_LIST_FLAG: usize = 0xB1;
+const EDIT_INFO_MAX_LIST_ITEMS: usize = 0xB4;
 
 /// The game's brick property classes ours copy the tables of.
 const BOOL_PROPERTY: VtableSig = VtableSig {
@@ -126,15 +216,20 @@ pub struct Reflection {
 const _: () = assert!(core::mem::offset_of!(Reflection, categories) == 0x20);
 
 impl Reflection {
-    /// Whether this reflection lists rows to show in the category `tag` (not to save or load them).
-    pub fn shows(&self, tag: &FName) -> bool {
+    /// The categories (gameplay tags) this reflection lists rows to show for; none when it lists
+    /// them to save or load them.
+    pub fn shown_categories(&self) -> &[FName] {
         if self.is_serializing || self.categories.data.is_null() {
-            return false;
+            return &[];
         }
         let count = usize::try_from(self.categories.num).unwrap_or(0);
         // SAFETY: a live array of `num` names, read on the game thread during the reflection.
-        let categories = unsafe { core::slice::from_raw_parts(self.categories.data, count) };
-        categories.iter().any(|category| {
+        unsafe { core::slice::from_raw_parts(self.categories.data, count) }
+    }
+
+    /// Whether this reflection lists rows to show in the category `tag` (not to save or load them).
+    pub fn shows(&self, tag: &FName) -> bool {
+        self.shown_categories().iter().any(|category| {
             category.comparison_index == tag.comparison_index && category.number == tag.number
         })
     }
@@ -215,21 +310,35 @@ impl Rows {
         }
     }
 
-    /// A row for `setting`, which calls `changed` after the menu changed it. Game thread only,
+    /// A row for `setting`, which calls `changed` after a panel changed it. Game thread only,
     /// after engine init (it makes names and texts).
-    pub fn row(&self, setting: Setting, changed: fn()) -> Result<Row, String> {
-        let (table, options) = match setting {
-            Setting::Toggle(_) => (self.bool_table, Vec::new()),
-            Setting::Choice(choice) => (
-                self.enum_table,
-                choice
-                    .options
-                    .iter()
-                    .map(|option| kismet::string_to_text(option.name))
-                    .collect::<Result<Vec<Text>, String>>()?,
-            ),
+    pub fn setting_row(&self, setting: Setting, changed: fn()) -> Result<Row, String> {
+        self.row(
+            setting.key(),
+            setting.name(),
+            setting.description(),
+            setting.into(),
+            changed,
+        )
+    }
+
+    /// A row called `name` (`description` is its tooltip) showing `value`, which calls `changed`
+    /// after a panel changed it. `key` tells it from our other rows. Game thread only, after engine
+    /// init (it makes names and texts).
+    pub fn row(
+        &self,
+        key: &str,
+        name: &str,
+        description: &str,
+        value: Value,
+        changed: fn(),
+    ) -> Result<Row, String> {
+        let texts = texts()?;
+        let table = match value {
+            Value::Check(_) => self.bool_table,
+            Value::List(_) => self.enum_table,
         };
-        let key = format!("EditorTweaks_{}", setting.key());
+        let key = format!("EditorTweaks_{key}");
         let shared = Box::into_raw(Box::new(Shared {
             controller: Controller {
                 vtable: &KEPT,
@@ -242,18 +351,18 @@ impl Rows {
                 field: core::ptr::null(),
                 name: kismet::string_to_name(&key)?,
                 functions: [0; 4],
-                setting,
+                value,
                 changed,
-                options: options.leak(),
-                empty: Box::leak(Box::new(kismet::string_to_text("")?)),
+                texts,
+                empty: Box::leak(Box::new(texts.text(""))),
             },
         }));
         // Kept for the whole game: the game holds references to it.
         Ok(Row {
             shared,
             key: OwnedFString::new(&key),
-            name: kismet::string_to_text(setting.name())?,
-            description: kismet::string_to_text(setting.description())?,
+            name: texts.text(name),
+            description: texts.text(description),
         })
     }
 
@@ -280,10 +389,38 @@ impl Rows {
                 controller: &raw mut (*row.shared).controller,
             };
             let info = (self.add_property)(reflection, &shared, row.key.as_ptr(), &row.name);
-            if !info.is_null() {
-                row.description
-                    .assign_to(info.add(EDIT_INFO_DESCRIPTION).cast());
+            if info.is_null() {
+                return;
             }
+            row.description
+                .assign_to(info.add(EDIT_INFO_DESCRIPTION).cast());
+            if matches!((*row.shared).property.value, Value::List(list) if list.dropdown()) {
+                show_as_dropdown(info);
+            }
+        }
+    }
+}
+
+/// Has the list whose edit info is `info` shown as a dropdown, as the siren brick's type does
+/// (`MaxListItems` 0, BRMK 0x178E08). Only if the edit info holds what `AddProperty` gives
+/// it, so that a game update moving the fields can't have us write over another one: the list then
+/// shows its items side by side, and the log says so once.
+///
+/// # Safety
+/// `info` must be the edit info `AddProperty` just returned. Game thread only.
+unsafe fn show_as_dropdown(info: *mut u8) {
+    static MOVED: Once = Once::new();
+    // SAFETY: per the contract; the edit info (0xD8 bytes, 8-aligned) holds a flag and an `int32`
+    // at these offsets.
+    unsafe {
+        let flag = info.add(EDIT_INFO_LIST_FLAG).read();
+        let max_items = info.add(EDIT_INFO_MAX_LIST_ITEMS).cast::<i32>();
+        if flag == 0 && max_items.read() == -1 {
+            max_items.write(0);
+        } else {
+            MOVED.call_once(|| {
+                log!("a list's edit info isn't as expected: lists show as rows of buttons")
+            });
         }
     }
 }
@@ -376,6 +513,17 @@ struct SharedRef {
     controller: *mut Controller,
 }
 
+/// The text conversions our rows make their texts with, found once (after engine init: finding
+/// them walks every object).
+fn texts() -> Result<&'static Texts, String> {
+    static TEXTS: OnceLock<Texts> = OnceLock::new();
+    if let Some(texts) = TEXTS.get() {
+        return Ok(texts);
+    }
+    let found = kismet::texts()?;
+    Ok(TEXTS.get_or_init(|| found))
+}
+
 /// A brick property of ours: the game's layout (its table, the `FProperty` it would edit, its name,
 /// and for an enum the functions giving its items and checking values), then what our functions
 /// need.
@@ -387,10 +535,10 @@ struct Property {
     name: FName,
     /// An enum's `TFunction`s, empty: we replaced the functions calling them.
     functions: [usize; 4],
-    setting: Setting,
+    value: Value,
     changed: fn(),
-    /// A choice's options' names, in order.
-    options: &'static [Text],
+    /// For a list's items' names, made each time it's listed.
+    texts: &'static Texts,
     /// An empty text, for the list items' other texts.
     empty: &'static Text,
 }
@@ -448,10 +596,10 @@ unsafe extern "C" fn get_bool(
 ) -> bool {
     // SAFETY: `this` is one of our properties, `value` room for a bool.
     unsafe {
-        let Setting::Toggle(toggle) = (*this).setting else {
+        let Value::Check(check) = (*this).value else {
             return false;
         };
-        value.write(u8::from(toggle.get()));
+        value.write(u8::from(check.checked()));
     }
     true
 }
@@ -459,10 +607,10 @@ unsafe extern "C" fn get_bool(
 unsafe extern "C" fn set_bool(this: *const Property, _container: *const c_void, value: u8) -> bool {
     // SAFETY: `this` is one of our properties.
     let property = unsafe { &*this };
-    let Setting::Toggle(toggle) = property.setting else {
+    let Value::Check(check) = property.value else {
         return false;
     };
-    toggle.set(value != 0);
+    check.set_checked(value != 0);
     (property.changed)();
     true
 }
@@ -474,10 +622,10 @@ unsafe extern "C" fn get_choice(
 ) -> bool {
     // SAFETY: `this` is one of our properties, `value` room for an `int32`.
     unsafe {
-        let Setting::Choice(choice) = (*this).setting else {
+        let Value::List(list) = (*this).value else {
             return false;
         };
-        value.write(i32::from(choice.get()));
+        value.write(i32::try_from(list.chosen()).unwrap_or(0));
     }
     true
 }
@@ -489,14 +637,13 @@ unsafe extern "C" fn set_choice(
 ) -> bool {
     // SAFETY: `this` is one of our properties.
     let property = unsafe { &*this };
-    let Setting::Choice(choice) = property.setting else {
+    let Value::List(list) = property.value else {
         return false;
     };
     // SAFETY: as for this function.
-    if !unsafe { choice_allowed(this, container, value) } {
+    if !unsafe { choice_allowed(this, container, value) } || !list.choose(usize::from(value)) {
         return false;
     }
-    choice.set(value);
     (property.changed)();
     true
 }
@@ -508,7 +655,10 @@ unsafe extern "C" fn choice_allowed(
 ) -> bool {
     // SAFETY: `this` is one of our properties.
     let property = unsafe { &*this };
-    usize::from(value) < property.options.len()
+    let Value::List(list) = property.value else {
+        return false;
+    };
+    usize::from(value) < list.items().len().min(MAX_ITEMS)
 }
 
 unsafe extern "C" fn choice_items(
@@ -519,8 +669,14 @@ unsafe extern "C" fn choice_items(
     // SAFETY: `this` is one of our properties, `items` the game's `TArray<FEnumPropertyItem>`.
     unsafe {
         let property = &*this;
-        for (value, name) in property.options.iter().enumerate() {
-            append_item(&mut *items, value as i32, name, property.empty);
+        let Value::List(list) = property.value else {
+            return;
+        };
+        for (value, name) in list.items().iter().take(MAX_ITEMS).enumerate() {
+            let name = property.texts.text(name);
+            append_item(&mut *items, value as i32, &name, property.empty);
+            // The item holds its own reference now.
+            name.release();
         }
     }
 }

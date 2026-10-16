@@ -28,6 +28,7 @@ pub fn resolve(pointer: FWeakObjectPtr) -> Option<*mut UObjectBase> {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct WeakObject {
     object: *mut UObjectBase,
     index: i32,
@@ -54,6 +55,20 @@ impl WeakObject {
                 && (*array.Get(self.index)).object == self.object
         };
         alive.then_some(self.object)
+    }
+
+    /// The object, unless it was destroyed since or is being destroyed (pending kill or
+    /// unreachable, like an actor's components once it's destroyed). Game thread only.
+    pub fn get_live(&self) -> Option<*mut UObjectBase> {
+        // SAFETY: as in `get`; only the slot is read.
+        let live = unsafe {
+            let array = &GObjects().array;
+            (0..array.Count()).contains(&self.index) && {
+                let item = &*array.Get(self.index);
+                item.object == self.object && item.flags & DYING == 0
+            }
+        };
+        live.then_some(self.object)
     }
 
     /// Whether this refers to `object` (alive or not).

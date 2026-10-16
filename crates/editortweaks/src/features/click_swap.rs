@@ -12,16 +12,20 @@
 //! while the player looks through the editor ([`ViewTargets::in_editor`]) with the setting on comes
 //! in as the other button, and its release the same way as its press, so no button stays down when
 //! the setting or the view changes in between.
+//!
+//! The same hook tells `keybinds` which keys reach the viewport, as they come in (before the swap).
 
 use std::sync::{Mutex, OnceLock, PoisonError};
 
 use brickrust::ue::coreuobject::UObjectBase;
 use brickrust::ue::fname::FName;
 
+use super::keybinds;
 use crate::framework::hook;
 use crate::framework::settings::Toggle;
 use crate::game::kismet;
 use crate::game::player_input::{self, InputKeyFn, Key, ViewTargets};
+use crate::platform::keyboard;
 use crate::prelude::*;
 
 /// Whether the mouse buttons are swapped in the editor.
@@ -88,6 +92,8 @@ fn engine_init() -> Result<(), String> {
         )?;
     }
     let _ = GAME.set(game);
+    // The hook also tells the keybinds which keys the viewport gets (`keybinds::key_delivered`).
+    keyboard::track_delivery();
     Ok(())
 }
 
@@ -99,6 +105,9 @@ unsafe extern "C" fn input_key(
     gamepad: bool,
 ) -> bool {
     let original = *ORIGINAL.get().expect("hook recorded before use");
+    // SAFETY: the function's own argument: the caller's live copy of the key. Before the swap
+    // below, which only touches mouse buttons: the keybinds want the physical key.
+    unsafe { keybinds::key_delivered(&(*key).name, event) };
     if let Some(game) = GAME.get() {
         // SAFETY: the function's own arguments: a live player input and the caller's copy of the
         // key, on the game thread.

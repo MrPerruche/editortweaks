@@ -25,10 +25,11 @@
 //! - Leaving the editor switches back to perspective at once: the game's view of the vehicle or
 //!   player is perspective, and coming back the editor's view starts as the game makes it.
 //!
-//! In both views, [`keybinds::PAN_VIEW`] (Shift + right mouse button) held while the camera is moved
-//! pans it: the mouse moves it across the view, so that what's in the view follows the mouse, rather
-//! than turning it. In the perspective view, what's as deep as the vehicle (found as in a switch,
-//! when the pan starts) follows it.
+//! In the orthographic view, [`keybinds::PAN_VIEW`] (Shift + right mouse button) held while the
+//! camera is moved pans it: the mouse moves it across the view, so that what's in the view follows
+//! the mouse, rather than turning it. In the perspective view it does nothing (a pan still under
+//! way when the view switches to perspective finishes there, following what's as deep as the
+//! vehicle, found as in a switch).
 //!
 //! How: the camera manager's `ApplyCameraModifiers` (`game::camera_manager`) is hooked: every frame,
 //! after the view target made its view, the editor's view becomes what it should be (the camera
@@ -50,6 +51,7 @@ use std::time::{Duration, Instant};
 
 use brickrust::ue::coreuobject::UObjectBase;
 
+use super::editor_frame;
 use super::keybinds;
 use super::mouse_moves::{self, Handling, Movement};
 use crate::framework::hook;
@@ -375,7 +377,7 @@ fn take_pan(movement: &Movement) -> Handling {
         // Only the game thread uses the state, and not around input handlers.
         Err(TryLockError::WouldBlock) => return Handling::Pass,
     };
-    if !state.editor_viewed {
+    if !state.editor_viewed || !matches!(state.mode, Mode::Orthographic | Mode::Entering { .. }) {
         return Handling::Pass;
     }
     let [right, down] = movement.pixels();
@@ -815,7 +817,12 @@ impl Parts {
     unsafe fn move_camera(&self, frame: &mut Frame, offset: Vec3) -> Vec3 {
         // SAFETY: per the contract.
         unsafe {
-            let moved = widen(self.editor.move_camera(frame.editor, narrow(offset)));
+            // The game keeps the camera's location in the editor's space (which is the world's
+            // unless the editor is turned, see `editor_frame`).
+            let wanted = editor_frame::to_editor_space(offset);
+            let moved = editor_frame::to_world_space(widen(
+                self.editor.move_camera(frame.editor, narrow(wanted)),
+            ));
             frame.location = add(frame.location, moved);
             self.view.set_location(frame.view, narrow(frame.location));
             moved

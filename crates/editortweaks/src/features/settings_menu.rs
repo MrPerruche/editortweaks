@@ -8,25 +8,23 @@
 //! the page, a settings page that lists the game's settings of its categories. Ours is the gameplay
 //! settings page (`WBP_GameplaySettings`, nothing but a settings page for the gameplay category),
 //! listing our category instead while in our context, and the game's settings list
-//! (`UBrickUserSettings::ReflectBrickProperties`) gets our rows when a page asks for our category.
-//! We only add our button and show our page where the menu's Blueprint does for its own contexts:
-//! once it made the new context's buttons, before the panel pools the unused ones. See `game::menu`
-//! and `game::property_reflection`.
+//! (`UBrickUserSettings::ReflectBrickProperties`, shared through `features::settings_list`) gets our
+//! rows when a page asks for our category. We only add our button and show our page where the
+//! menu's Blueprint does for its own contexts: once it made the new context's buttons, before the
+//! panel pools the unused ones. See `game::menu` and `game::property_reflection`.
 
-use std::sync::{Mutex, Once, OnceLock};
+use std::sync::{Mutex, OnceLock};
 
 use brickrust::ue::coreuobject::UObjectBase;
 use brickrust::ue::fname::FName;
-use core::ffi::c_void;
 
+use super::settings_list;
 use crate::features::SETTINGS;
 use crate::framework::hook;
-use crate::framework::settings;
 use crate::game::kismet;
 use crate::game::menu::{
     self, AddPropertiesFn, ClickedFn, Menus, OpenMenuFn, RemoveUnusedButtonsFn,
 };
-use crate::game::property_reflection::{REFLECT_USER_SETTINGS, ReflectFn, Reflection, Row, Rows};
 use crate::game::text::Text;
 use crate::game::weak_object::WeakObject;
 use crate::prelude::*;
@@ -52,18 +50,13 @@ const OPTIONS: &str = "Options";
 /// The last part of our context, a sub-context of the options (as `Gameplay` is).
 const CONTEXT: &str = "EditorTweaks";
 
-static ROWS: OnceLock<Rows> = OnceLock::new();
 static MENUS: OnceLock<Menus> = OnceLock::new();
 static OURS: OnceLock<Ours> = OnceLock::new();
 
-static ORIGINAL_REFLECT: OnceLock<ReflectFn> = OnceLock::new();
 static ORIGINAL_OPEN_MENU: OnceLock<OpenMenuFn> = OnceLock::new();
 static ORIGINAL_REMOVE_UNUSED_BUTTONS: OnceLock<RemoveUnusedButtonsFn> = OnceLock::new();
 static ORIGINAL_CLICKED: OnceLock<ClickedFn> = OnceLock::new();
 static ORIGINAL_ADD_PROPERTIES: OnceLock<AddPropertiesFn> = OnceLock::new();
-
-/// Logs the first time our page lists our settings.
-static LOG_SHOWN: Once = Once::new();
 
 /// Names and texts, made once after engine init.
 struct Ours {
@@ -72,8 +65,6 @@ struct Ours {
     icon: FName,
     page: FName,
     context: FName,
-    /// Each section's title and rows.
-    sections: Vec<(Text, Vec<Row>)>,
 }
 
 // SAFETY: names and texts kept for the whole game; only used on the game thread.
@@ -113,17 +104,7 @@ impl Feature for SettingsMenu {
     }
 
     fn on_load(&self) -> LoadResult {
-        let _ = ROWS.set(Rows::find()?);
-        let target = REFLECT_USER_SETTINGS.resolve()?;
-        // SAFETY: `target` is the start of ReflectBrickProperties, which `reflect` matches.
-        unsafe {
-            hook::install_typed(
-                REFLECT_USER_SETTINGS.name,
-                target,
-                reflect as ReflectFn,
-                &ORIGINAL_REFLECT,
-            )
-        }
+        settings_list::install()
     }
 
     fn on_engine_init(&self) {
@@ -136,23 +117,22 @@ impl Feature for SettingsMenu {
 
 /// Makes our names, texts and rows, finds the menus and hooks them.
 fn start() -> Result<(), String> {
-    let rows = ROWS.get().ok_or("not loaded")?;
     let mut sections = Vec::new();
     for section in SETTINGS.iter().copied().flatten() {
         let rows = section
             .settings
             .iter()
-            .map(|&setting| rows.row(setting, changed))
+            .map(|&setting| settings_list::setting_row(setting))
             .collect::<Result<Vec<_>, _>>()?;
         sections.push((kismet::string_to_text(section.title)?, rows));
     }
+    settings_list::add(CATEGORY, sections)?;
     let _ = OURS.set(Ours {
         category: kismet::string_to_name(CATEGORY)?,
         title: kismet::string_to_text(TITLE)?,
         icon: kismet::string_to_name(ICON)?,
         page: kismet::string_to_name(PAGE)?,
         context: kismet::string_to_name(CONTEXT)?,
-        sections,
     });
     let found = Menus::find()?;
     let menus = MENUS.get_or_init(|| found);
@@ -185,38 +165,6 @@ fn start() -> Result<(), String> {
         )?;
     }
     Ok(())
-}
-
-/// A setting changed in the menu: saves them all.
-fn changed() {
-    if let Err(reason) = settings::save(SETTINGS) {
-        log!("settings not saved: {reason}");
-    }
-}
-
-/// The game's settings list: adds our sections when the panel asks for our category.
-unsafe extern "C" fn reflect(settings: *const c_void, reflection: *mut Reflection) {
-    let Some(original) = ORIGINAL_REFLECT.get() else {
-        return;
-    };
-    // SAFETY: forwards the caller's arguments.
-    unsafe { original(settings, reflection) };
-    let (Some(rows), Some(ours)) = (ROWS.get(), OURS.get()) else {
-        return;
-    };
-    // SAFETY: the reflection the game is filling, on the game thread.
-    unsafe {
-        if !(*reflection).shows(&ours.category) {
-            return;
-        }
-        for (title, section) in &ours.sections {
-            rows.add_category(reflection, title);
-            for row in section {
-                rows.add_row(reflection, row);
-            }
-        }
-    }
-    LOG_SHOWN.call_once(|| log!("settings page shown"));
 }
 
 /// A menu opens a context: notes which while it does (see `remove_unused_buttons`).

@@ -5,6 +5,7 @@ use brickrust::ue::coreuobject::UObjectBase;
 use brickrust::ue::tshared::FWeakObjectPtr;
 
 use crate::game::editor_object::Vector;
+use crate::game::editor_trace;
 use crate::game::reflection::{self, Function, Parameters};
 use crate::game::weak_object;
 
@@ -78,7 +79,8 @@ pub fn find() -> Result<LineTrace, String> {
 impl LineTrace {
     /// What the line from `start` to `end` first hits that blocks visibility (complex collision,
     /// like the editor's clicks), in the world of `world` (an object in it). Nothing is left out:
-    /// the bricks the editor shows are its own components.
+    /// the bricks the editor shows are its own components. While the editor's queries are kept to
+    /// its own components (`game::editor_trace`, the map shown around it), so is this one.
     ///
     /// # Safety
     /// `world` must be a live object in the world to trace (e.g. an actor). Game thread only.
@@ -97,7 +99,7 @@ impl LineTrace {
             reflection::put(&mut parameters, self.start, start);
             reflection::put(&mut parameters, self.end, end);
             reflection::put(&mut parameters, self.complex, true);
-            self.function.call(self.library, &mut parameters);
+            editor_trace::as_editor(|| self.function.call(self.library, &mut parameters));
             if reflection::take::<u8>(&parameters, self.result) == 0 {
                 return None;
             }

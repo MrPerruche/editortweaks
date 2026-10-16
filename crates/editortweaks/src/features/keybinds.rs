@@ -10,8 +10,14 @@
 //! a table of ours with one row per keybind joins them, in a top category of ours (listed right
 //! after the editor's) with a subcategory per section (`game::input_table`). The player's input
 //! then binds them like the game's actions, and [`Keybind::is_held`] reads its bindings
-//! (`game::player_input`) and the keyboard. If any of that isn't found (e.g. after a game update),
-//! the keybinds keep their default keys.
+//! (`game::player_input`) and the keyboard (`platform::keyboard`: only while the game's window is
+//! focused, and keys that type text only if the viewport got them, so not while typing in a text
+//! box; see [`key_delivered`]). If any of that isn't found (e.g. after a game update), the keybinds
+//! keep their default keys.
+//!
+//! Default keys are `FKey` names, which Unreal derives from Windows' virtual keys: the top row's
+//! digits (`One`..) are the same physical keys on every layout (on AZERTY, the one typing `&`),
+//! letters follow the layout like the game's own (a letter's key is where the layout puts it).
 
 use std::sync::{Mutex, Once, OnceLock, PoisonError};
 
@@ -23,6 +29,7 @@ use crate::framework::hook;
 use crate::game::input_table::{self, Action, InputTables, LoadAssetLibrariesFn};
 use crate::game::kismet;
 use crate::game::player_input::{self, Chord, PlayerInputs};
+use crate::game::reflection;
 use crate::game::text::Text;
 use crate::platform::keyboard;
 use crate::prelude::*;
@@ -133,16 +140,25 @@ pub static ORTHO_VIEW: Keybind = Keybind::new(
     "EditorTweaks_OrthoView",
     "Orthographic view",
     "Press in the editor to switch between the normal view and an orthographic one (no perspective, like a field of view of 0). The zoom sets how wide it is.",
-    &["NumPadFive"],
+    &["One"],
 );
 
 /// Held while the editor's camera is moved (its right or middle mouse button held), the mouse pans
-/// the view rather than turning it, in either view (`ortho_view`).
+/// the view rather than turning it, in the orthographic view only (`ortho_view`).
 pub static PAN_VIEW: Keybind = Keybind::new(
     "EditorTweaks_PanView",
     "Pan view",
-    "Hold while moving the camera in the editor (right mouse button) to pan the view: the mouse moves the camera sideways and up or down instead of turning it.",
+    "Hold while moving the camera in the orthographic view (right mouse button) to pan the view: the mouse moves the camera sideways and up or down instead of turning it.",
     &["Shift+RightMouseButton"],
+);
+
+/// Shows or hides the map around the vehicle in the editor, like the "Show map" row of the editor's
+/// panel (`map_in_editor`).
+pub static SHOW_MAP: Keybind = Keybind::new(
+    "EditorTweaks_ShowMap",
+    "Show map",
+    "Press in the editor to show the map around the vehicle, placed as it will be when the vehicle is spawned at the garage selected in the editor's panel (Map, with nothing selected); if none is, the garage the editor was opened from, else the first. Press again to hide it.",
+    &["Zero"],
 );
 
 /// Keeps a dragged slider's value changing while held (`slider_drag`).
@@ -154,7 +170,7 @@ pub static KEEP_DRAGGING_SLIDERS: Keybind = Keybind::new(
 );
 
 /// Every keybind, by section, in the order the settings list them.
-static SECTIONS: [Section; 6] = [
+static SECTIONS: [Section; 7] = [
     Section {
         name: "IC_EditorTweaks_Selection",
         title: "Selection",
@@ -184,6 +200,11 @@ static SECTIONS: [Section; 6] = [
         name: "IC_EditorTweaks_View",
         title: "View",
         keybinds: &[&ORTHO_VIEW, &PAN_VIEW],
+    },
+    Section {
+        name: "IC_EditorTweaks_Map",
+        title: "Map",
+        keybinds: &[&SHOW_MAP],
     },
     Section {
         name: "IC_EditorTweaks_Sliders",
@@ -269,6 +290,26 @@ impl Keybind {
             players.chords(input, action, |chord| held |= is_chord_held(&chord));
             Some(held)
         }
+    }
+}
+
+/// Tells the keyboard state that the game's viewport got `event` for `key`, a key of the player's
+/// input (called by the hooked `UPlayerInput::InputKey`): keys a focused text box takes never get
+/// here, so they don't count as held (see `platform::keyboard`).
+///
+/// # Safety
+/// `key` must be a valid name (of the live name pool).
+pub unsafe fn key_delivered(key: &FName, event: i32) {
+    let down = match event {
+        player_input::PRESSED | player_input::REPEAT | player_input::DOUBLE_CLICK => true,
+        player_input::RELEASED => false,
+        // Axes (the mouse's movement, ...): no key.
+        _ => return,
+    };
+    // SAFETY: per the contract.
+    let name = unsafe { reflection::name_text(key) };
+    if let Some(key) = keyboard::virtual_key(&name) {
+        keyboard::key_delivered(key, down);
     }
 }
 

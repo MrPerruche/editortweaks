@@ -127,7 +127,8 @@ if (Reflection.ShouldReflect(Tags.Gameplay))            // game 0xE721C0: is the
   (our name; BRMK 0x85540, game 0xCCCFB0): makes the property's instance (with the reflection's
   path), then a shared `FBrickPropertyEditInfo` (game 0xCC1C60, 0xE8 bytes with the reference
   counts; neither reads the property's field), appends it to +0x50 and returns it. Its display
-  name is at +0x40, the description at +0x80, read-only +0xB1, color style +0xB2.
+  name is at +0x40, the description at +0x80, a flag +0xB1 (see "How a list shows"), color style
+  +0xB2 (unconfirmed), and how a list shows at +0xB4 and +0xB8.
 - `UBrickUserSettings::PostModifyBrickProperty` (after a value is set from the panel) saves the
   game's config and compares the changed property's name with its own (volumes, HUD, ...): other
   names do nothing there.
@@ -161,11 +162,46 @@ a longer subclass table (0x38DC3E8, 24 slots). Ours copy the table and replace 4
 19 (and 20, 21) with functions reading and writing our settings; the field stays null. The game's
 own functions in the other slots only go through those.
 
+Since 2026-10-15 the hook of `ReflectBrickProperties` is shared (`features/settings_list.rs`): a
+feature adds a listing (a tag and its sections), so the editor's side panel gets the map's rows
+under `Properties.Editor` too (`docs/re/map-in-editor.md`). A row's value is a check box or a list
+read and written through our functions (`property_reflection::Check`, `List`): one of the mod's
+settings (saved when changed), or a feature's own value (the map's garage, Show map). A list's
+items are made each time the game asks for them (slot 20), their names as new texts released once
+copied into the items; at most 256, since slots 19 and 21 take the index as a byte.
+
 Enum items: `FEnumPropertyItem` (game 0xA8 bytes): value `int32` +0, `FDisplayInfo` +8 (name
 `FText`, then the icon's `TSoftObjectPtr` with its weak object index -1 at +0x20), three texts
 +0x48, +0x60, +0x78 (empty in the game's lists), a pointer +0x90 (null), two flags +0x98, +0x99
 (false) and one +0xA0 (true), as `TransmissionMode`'s list makes them (game 0xE6C4B0, with
 `FDisplayInfo`'s constructor 0xCC42F0 and the item's copy constructor 0xCC4380).
+
+## How a list shows
+
+Found 2026-10-15. An enum row is a `UEnumPropertyWidget` (game 1.11.7: its edit info at +0x268,
+its `UBrickComboBoxWidget` at +0x288). Its `UpdateValue` (BRMK 0x3FCD70, game 0xF03A30) lists the
+items (slot 20, keeping those slot 21 allows), then passes two fields of the row's edit info to
+the combo box (the reads at game 0xF03D83):
+
+| Edit info (game) | BRMK | Default | Combo box |
+|---|---|---|---|
+| +0xB1 flag | +0xB9 | false | if set, `SetMaxListItems(0)` instead of the next field |
+| +0xB4 `int32` | +0xBC | -1 | `SetMaxListItems` (BRMK 0x450D50, combo +0x478 there) |
+| +0xB8 `int32` | +0xC0 | 0 | `SetMaxItemsPerRow` (BRMK 0x450CE0) |
+
+`UBrickComboBoxWidget::InitItemsInternal` (BRMK 0x437C20) then shows the items side by side, as
+buttons in rows of `MaxItemsPerRow` (0: one row), if `MaxListItems` is -1, or isn't 0 and the
+count is at most `MaxListItems`; else a dropdown (the selected item, opening a list:
+`UWindowManagerWidget::OpenComboBoxList`). Its `UpdateUseItemList` event tells the Blueprint.
+The defaults (-1, 0) put every item in one row, so a long list's buttons get very thin. The
+game's long lists set the field after `AddProperty`: the siren brick's `SirenType` to 0, always a
+dropdown (BRMK 0x178E08); the match's `Weather` to 10 with 6 per row (BRMK 0x34D867); the
+editor's view mode only 3 per row (BRMK 0x355BAA).
+
+Ours (`property_reflection::List::dropdown`, the map's garage list) set +0xB4 to 0 like the
+siren's, only if the edit info still holds -1 there and false at +0xB1 (else the log says so once
+and the list keeps its buttons). +0xB1 isn't written: the widget treats it as "always a dropdown",
+but other code may read it as something else (a read-only row, perhaps).
 
 ## Settings file
 

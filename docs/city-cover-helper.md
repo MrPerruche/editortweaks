@@ -1,5 +1,11 @@
 # City cover helper: investigation report
 
+**Status (2026-10-15):** phases 1 and 2 are built as `features/map_in_editor`: the panel rows below
+(a garage list, the pinned option, Show map as a toggle with no opacity) and a show map key, but no
+keys for the next and previous garage (the list replaced them). What differs from this plan is
+listed in `docs/re/map-in-editor.md` ("Built"). The risks below are the checklist; their status is
+noted under each.
+
 2026-10-14. Whether the editor can show the map and the map's garages, to help build "city covers"
 (vehicles covering the map, spawned at a set garage so they line up), and how to build it. The game
 findings behind it, with addresses and how they were found, are in `docs/re/map-in-editor.md`.
@@ -46,7 +52,8 @@ player's view. Nothing is unloaded, and the map's collision stays where it is.
 - With bricks placed far out, a city cover is bigger than the box on every axis, so its box centre
   lands exactly on the spawn point. That is why the trick lines up reliably.
 - The game also checks for things in the way (other vehicles, characters) and may shift the
-  vehicle sideways. Buildings and terrain are ignored at a garage.
+  vehicle sideways. Buildings and terrain are ignored at a garage. A vehicle spawned pinned, as a
+  cover is, is never shifted.
 
 So, in the editor:
 
@@ -69,10 +76,15 @@ there; `settings_menu`'s hook can add our rows to that list):
 | Spawned pinned | which spawn point of the garage to use | follow the vehicle browser's spawn option if it is readable, else on |
 | Show map | off / on (later: an opacity slider, 0 = off) | off |
 
-Plus rebindable keys for next and previous garage (memory "tunables-and-keys").
+Plus rebindable keys for next and previous garage (memory "tunables-and-keys"). Built 2026-10-15
+with a show map key instead: the list made the garage keys unneeded. The pinned option defaults to
+on (the browser's spawn option isn't saved and starts at None, so following it would mean
+unpinned).
 
 - Our panel rows today are check boxes and lists (`game/property_reflection.rs`). A list of
-  garages ("Garage 3 of 12", the entry garage marked) works with that now.
+  garages ("Garage 3 of 12", the entry garage marked) works with that now; its items are worked
+  out each time the panel lists it. Built as a dropdown: the game's default puts a list's items
+  side by side in one row, too thin for a dozen garages.
 - A slider row like the user described, or an opacity slider, needs a numeric row type: a copy of
   the game's float property table, found by its type name like the bool and list ones.
 
@@ -171,9 +183,18 @@ garage and un-hides the map, and the log prints the predicted vehicle transform.
    push other players' vehicles, which breaks the "client side only" rule.
    - Check an editor brick's collision setting (reflected).
    - If it isn't query-only: refuse to move the editor when hosting, or use the picture approach.
+
+   Status (2026-10-15): it isn't (queries and physics). The map first showed only in a
+   single-player game. Now the editor and the world are kept apart while it shows: the editor's
+   components collide with nothing but the editor's own clicks, which go to a channel of their own,
+   and characters and vehicles are hidden from this player's view only. So the map shows alone,
+   hosting or joined (`docs/re/map-in-editor.md`, "Multiplayer").
 3. **Clicks hitting the map.** With the map shown, a click goes to what you see, so a brick under
    a road surface can't be clicked through it. That is probably fine; if not, the editor's trace
    could be made to ignore the map's components.
+
+   Status (2026-10-15): it ignores them now, as a side effect of risk 2's fix: clicks reach the
+   bricks through the map.
 4. **The prediction.** Compare the predicted transform with a vehicle really spawned at a few
    garages:
    - a small vehicle (pushed to the box's back and floor);
@@ -181,6 +202,13 @@ garage and un-hides the map, and the log prints the predicted vehicle transform.
    - pinned and not pinned.
 
    The game computes the offset in two passes whose interplay isn't untangled yet.
+
+   Status (2026-10-15): at the central garage the mod's prediction from the garage's fields at run
+   time matches the level data and the game's code, redone offline. Covers looked 20 to 50 m off
+   there while the setting for the pinned spawn point was off. Pinned, they land 25 m further out,
+   and that garage is the only one of City2's 14 with a pinned spawn point. The setting now defaults
+   to on, as planned above. Still to confirm in game (`docs/re/map-in-editor.md`, "Where a vehicle
+   lands").
 5. **Thumbnails.** When saving, check the vehicle's thumbnail doesn't show the map; if it does,
    hide the map during the capture.
 6. **Speed.**
@@ -206,7 +234,7 @@ without the hiding hook, no prediction without the garage interface, the cross a
 still working.
 
 Purely client side: the vehicle file is unchanged, the game's spawning isn't touched, and moving
-the editor only moves the local editor actor (risk 2 is the one to confirm).
+the editor only moves the local editor actor, kept apart from the world while the map shows (risk 2).
 
 ## Phases
 

@@ -3,6 +3,7 @@
 //! Each module documents what it binds and how it was found (BRMK export name, pattern, ...),
 //! so it can be found again after a game update. Prefer reflection names over hardcoded offsets.
 
+pub mod actor;
 pub mod actuator;
 pub mod axle;
 pub mod brick_editor;
@@ -11,12 +12,18 @@ pub mod brick_model;
 pub mod brick_property;
 pub mod camera_manager;
 pub mod collision;
+pub mod component_collision;
 pub mod editor_camera;
 pub mod editor_input;
 pub mod editor_mode;
 pub mod editor_object;
+pub mod editor_panel;
 pub mod editor_static_info;
+pub mod editor_trace;
 pub mod editor_view;
+pub mod garage;
+pub mod hidden_actors;
+pub mod hidden_components;
 pub mod input_table;
 pub mod kismet;
 pub mod line_batcher;
@@ -26,6 +33,7 @@ pub mod mesh_builder;
 pub mod mesh_component;
 pub mod mirror_mode;
 pub mod move_mode;
+pub mod net_mode;
 pub mod numeric_property;
 pub mod outline;
 pub mod player_input;

@@ -59,6 +59,7 @@ pub type InputKeyFn = unsafe extern "C" fn(
 /// `EInputEvent`: what happened to the key.
 pub const PRESSED: i32 = 0;
 pub const RELEASED: i32 = 1;
+pub const REPEAT: i32 = 2;
 pub const DOUBLE_CLICK: i32 = 3;
 
 /// An `FKey` (UE 4.27, 0x18 bytes): its name, and its details (`TSharedPtr<FKeyDetails>`: the

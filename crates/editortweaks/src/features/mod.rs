@@ -13,9 +13,11 @@ mod drag_select;
 mod editor_bounds;
 /// Shared hooks of the editor's mouse button actions (not a feature).
 mod editor_buttons;
+mod editor_frame;
 mod hello;
 /// The mod's rebindable keys, which other features read.
 mod keybinds;
+mod map_in_editor;
 /// Shared hooks of the editor's mouse movement (not a feature).
 mod mouse_moves;
 mod move_slowdown;
@@ -23,6 +25,8 @@ mod ortho_view;
 mod precise_moves;
 mod precise_sliders;
 mod property_limits;
+/// Shared hook of the game's settings list, where features add rows (not a feature).
+mod settings_list;
 mod settings_menu;
 mod slider_drag;
 mod slider_formulas;
@@ -38,6 +42,7 @@ pub static ALL: &[&dyn Feature] = &[
     &slider_formulas::SliderFormulas,
     &slider_drag::SliderDrag,
     &camera_speed::CameraSpeed,
+    &editor_frame::EditorFrame,
     &ortho_view::OrthoView,
     &editor_bounds::EditorBounds,
     &move_slowdown::MoveSlowdown,
@@ -48,11 +53,17 @@ pub static ALL: &[&dyn Feature] = &[
     &click_swap::ClickSwap,
     &actuator_arrows::ActuatorArrows,
     &suspension_arrows::SuspensionArrows,
+    &map_in_editor::MapInEditor,
     &settings_menu::SettingsMenu,
 ];
 
 /// Every feature's settings, by section of the menu, in the menu's order (see `settings_menu`).
-pub static SETTINGS: &[&[Section]] = &[&SELECTION, &brick_resize::SETTINGS, &slider_drag::SETTINGS];
+pub static SETTINGS: &[&[Section]] = &[
+    &SELECTION,
+    &brick_resize::SETTINGS,
+    &map_in_editor::SETTINGS,
+    &slider_drag::SETTINGS,
+];
 
 /// The settings of selecting bricks: which buttons, and what a box picks.
 static SELECTION: [Section; 1] = [Section {

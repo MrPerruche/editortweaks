@@ -1,7 +1,50 @@
 //! Keyboard and mouse button state, by Windows virtual key or by Unreal key name.
+//!
+//! Keys are polled (`GetAsyncKeyState`), which alone knows nothing of what the game does with
+//! them. [`is_key_down`] therefore counts a key only while
+//! - the game's window is the foreground one ([`is_game_focused`]), and
+//! - for keys that type text or act in menus (all but modifier keys and mouse buttons): the game's
+//!   viewport was given the press ([`key_delivered`], from the hooked `UPlayerInput::InputKey`),
+//!   which a focused text box such as a slider's value keeps from happening. Modifier keys and
+//!   mouse buttons are exempt: they type nothing, and dragged sliders and widgets keep them from the
+//!   viewport too. Without the hook ([`track_delivery`] never called) every key counts.
 
+use core::sync::atomic::{AtomicBool, Ordering};
+
+use windows_sys::Win32::System::Threading::GetCurrentProcessId;
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::*;
-use windows_sys::Win32::UI::WindowsAndMessaging::{GetSystemMetrics, SM_SWAPBUTTON};
+use windows_sys::Win32::UI::WindowsAndMessaging::{
+    GetForegroundWindow, GetSystemMetrics, GetWindowThreadProcessId, SM_SWAPBUTTON,
+};
+
+/// For each virtual key: whether the game's viewport was given its press and not its release yet.
+static DELIVERED: [AtomicBool; 256] = [const { AtomicBool::new(false) }; 256];
+/// Whether [`DELIVERED`] is kept up to date (the key hook is in place).
+static TRACKING: AtomicBool = AtomicBool::new(false);
+
+/// Starts requiring that keys be delivered to the game's viewport (see the module's doc): called
+/// once the hook calling [`key_delivered`] is in place.
+pub fn track_delivery() {
+    TRACKING.store(true, Ordering::Relaxed);
+}
+
+/// Records that the game's viewport got the press (`down`) or release of virtual key `key`.
+pub fn key_delivered(key: VIRTUAL_KEY, down: bool) {
+    if let Some(flag) = DELIVERED.get(usize::from(key)) {
+        flag.store(down, Ordering::Relaxed);
+    }
+}
+
+/// Whether the game's window is the one the user is typing into (a window of this process has the
+/// keyboard focus), as opposed to another application or a background game.
+pub fn is_game_focused() -> bool {
+    // SAFETY: no preconditions; a null window (none focused) has no process, which doesn't match.
+    unsafe {
+        let mut process = 0;
+        GetWindowThreadProcessId(GetForegroundWindow(), &mut process);
+        process != 0 && process == GetCurrentProcessId()
+    }
+}
 
 /// Whether either Alt key is held right now (read like Unreal reads modifier keys).
 pub fn is_alt_down() -> bool {
@@ -30,9 +73,47 @@ pub fn is_mouse_button_down() -> bool {
 }
 
 /// Whether the key Unreal calls `name` (an `FKey` name, e.g. `LeftAlt`, `G`, `Ampersand`) is held
-/// right now; `None` for keys Windows can't tell (gamepad buttons, the mouse wheel, ...).
+/// right now, in the sense of the module's doc; `None` for keys Windows can't tell (gamepad
+/// buttons, the mouse wheel, ...).
 pub fn is_key_down(name: &str) -> Option<bool> {
-    virtual_key(name).map(is_down)
+    let key = virtual_key(name)?;
+    if !is_game_focused() || !is_down(key) {
+        // Let go (or the game isn't looking): whatever was delivered is stale, say a release a
+        // text box took.
+        key_delivered(key, false);
+        return Some(false);
+    }
+    Some(!TRACKING.load(Ordering::Relaxed) || !needs_delivery(key) || delivered(key))
+}
+
+/// Whether the game's viewport got the press of `key` (and not its release).
+fn delivered(key: VIRTUAL_KEY) -> bool {
+    DELIVERED
+        .get(usize::from(key))
+        .is_some_and(|flag| flag.load(Ordering::Relaxed))
+}
+
+/// Whether `key` only counts once the viewport got it: it isn't a modifier key or a mouse button.
+fn needs_delivery(key: VIRTUAL_KEY) -> bool {
+    !matches!(
+        key,
+        VK_SHIFT
+            | VK_LSHIFT
+            | VK_RSHIFT
+            | VK_CONTROL
+            | VK_LCONTROL
+            | VK_RCONTROL
+            | VK_MENU
+            | VK_LMENU
+            | VK_RMENU
+            | VK_LWIN
+            | VK_RWIN
+            | VK_LBUTTON
+            | VK_RBUTTON
+            | VK_MBUTTON
+            | VK_XBUTTON1
+            | VK_XBUTTON2
+    )
 }
 
 fn is_down(key: VIRTUAL_KEY) -> bool {
@@ -135,7 +216,7 @@ const CHARACTER_KEYS: &[(&str, char)] = &[
 /// The virtual key of the key Unreal calls `name`: the reverse of how Unreal names Windows keys.
 /// Keys that type a character are named after it in the current keyboard layout (on AZERTY, the
 /// key typing `&` is `Ampersand`), so they're found through the layout too.
-fn virtual_key(name: &str) -> Option<VIRTUAL_KEY> {
+pub fn virtual_key(name: &str) -> Option<VIRTUAL_KEY> {
     // Unreal's left mouse button is the one acting as left (after swapping), Windows' the
     // physical one.
     // SAFETY: no preconditions.

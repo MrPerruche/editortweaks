@@ -189,12 +189,42 @@ likely approach are first guesses, to be revised as the editor gets reverse engi
     bricks' models replace their boxes: the mouse points at, drags and snaps to their faces, edges
     and vertices (a ramp's slope, a cylinder's rim). Models come from the meshes' complex collision
     (see `docs/re/brick-models.md`). Untested in game yet. Later: the same for moving bricks.
-- **Reference previews**: import 3D models and images as non-brick previews.
-  - View mode showing the distance between the model and the bricks; opacity setting.
+- **Reference images and models** (asked 2026-10-16, planned in `docs/model-io.md`, not started):
+  load images (PNG, JPG) and 3D models (OBJ, glTF/GLB, STL) from files and show them in the editor
+  as non-brick previews, as components of the editor's own actor (the editor hides every other
+  actor's components, `docs/re/map-in-editor.md`) without collision.
+  - Images: a plane in the 3D view (front/side/top presets, size, opacity, flip), to trace over,
+    best with the orthographic view. Texture through the engine's own decoder
+    (`UKismetRenderingLibrary::ImportFileAsTexture2D`/`ImportBufferAsTexture2D`, to verify) or ours
+    (`png`/JPEG crates + `UTexture2D::CreateTransient`). Needs an existing game or engine material
+    with a texture parameter (a material can't be made at run time): probe first; a UMG widget
+    component is the fallback.
+  - Models: parsed in Rust into a neutral `ModelData`, built with the existing `mesh_builder`
+    (UVs, a material slot per imported material, hard/soft edges kept by splitting vertices where
+    imported normals differ), converted from the file's units and axes (setting for OBJ/STL);
+    placement (position, rotation, scale), opacity setting.
+  - View mode showing the distance between the model and the bricks (through `game/editor_view`).
+  - FBX is not planned (decision 2026-10-16: closed format, parser effort for little gain; glTF
+    through Blender instead).
+  - Open: whether references are remembered per vehicle, and how a file is chosen (a drop-in
+    folder listed in the panel first, a Windows file dialog later).
+- **Vehicle export as a 3D model** (asked 2026-10-16, planned in `docs/model-io.md`, not started):
+  write the vehicle (or the selection) as GLB, also OBJ and STL. Geometry from the bricks' models
+  that `game/brick_model` already reads (the complex collision's triangles: positions only, no UVs
+  or normals), one glTF mesh per brick type with a TRS node per brick, a material per brick color.
+  Known gaps to check: bricks with no readable model (spinners, wheels, flaps), the collision LOD
+  against the render mesh. First deliverable of the group (lowest risk, checkable in Blender).
+- **Reference and export plumbing**: a pure-Rust `model_io` module (data, readers, writers, UE <->
+  glTF axes, units and winding), unit tested without the game; built first, shared by the three
+  features above. Order of work and the probes to run in game first: `docs/model-io.md`.
 - **Map in the editor** (city covers, asked 2026-10-14): in the panel when nothing is selected, show
   the map around the vehicle (a toggle, later an opacity slider) and pick one of the map's garages,
   its spawn point marked with a 3-axis cross, so the map shows as it will be around the vehicle
-  spawned there. Investigated 2026-10-14, nothing built yet: report `docs/city-cover-helper.md`,
+  spawned there. Investigated 2026-10-14, built 2026-10-15 as `features/map_in_editor` (a "Map"
+  section in the panel with a garage list, the "Pinned spawn point" setting and Show map, plus a
+  show map key; no opacity yet), tested in game alone; in multiplayer since 2026-10-15 (the editor
+  kept apart from the world while the map shows; the panel rows not tested yet): report
+  `docs/city-cover-helper.md`,
   findings `docs/re/map-in-editor.md`. In short: the editor is an actor in the map's world (100 m
   above its origin) that hides every other actor each frame; a garage places the vehicle's bounding
   box centre on its spawn point. Plan: move the editor to where the vehicle will spawn and take the

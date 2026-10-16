@@ -112,6 +112,29 @@ pub const MOVED: u32 = 0x1 | 0x4 | 0x10;
 
 type PostModifyFn = unsafe extern "C" fn(editor: *mut UObjectBase, operation: *const Operation);
 
+/// `PostModify` as hooked (or why not), see [`BrickEditor::after_modify`].
+static POST_MODIFY_HOOK: OnceLock<Result<usize, String>> = OnceLock::new();
+static ORIGINAL_POST_MODIFY: OnceLock<PostModifyFn> = OnceLock::new();
+static AFTER_MODIFY: Mutex<Vec<fn(u32)>> = Mutex::new(Vec::new());
+
+unsafe extern "C" fn post_modify_detour(editor: *mut UObjectBase, operation: *const Operation) {
+    let original = *ORIGINAL_POST_MODIFY
+        .get()
+        .expect("hook recorded before use");
+    // SAFETY: the game's operation, live for the call; its flags are what changed.
+    let flags = unsafe { (*operation).flags };
+    // SAFETY: the original function with its own arguments.
+    unsafe { original(editor, operation) };
+    // Copied out, so that a callback may ask for more without a deadlock.
+    let callbacks = AFTER_MODIFY
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .clone();
+    for callback in callbacks {
+        callback(flags);
+    }
+}
+
 /// The editor's operations and reflected parts (after engine init).
 pub struct BrickEditor {
     /// Offset of the editor's open operation.
@@ -204,6 +227,59 @@ impl BrickEditor {
                 let post_modify = vtable.add(self.post_modify).cast::<PostModifyFn>().read();
                 post_modify(editor, this);
             }
+        }
+    }
+
+    /// Runs `callback` (given what the operation changed, see [`MOVED`]) after every operation of
+    /// editors like `editor` ends (`PostModify`), from now on. The function is the one in `editor`'s vtable, hooked the first time; editors of
+    /// another class (with another `PostModify`) later are an error.
+    ///
+    /// # Safety
+    /// `editor` must be a live `ABrickEditor`. Game thread only.
+    pub unsafe fn after_modify(
+        &self,
+        editor: *mut UObjectBase,
+        callback: fn(u32),
+    ) -> Result<(), String> {
+        const NAME: &str = "ABrickEditor::PostModify";
+        // SAFETY: per the contract; the slot's offset comes from the game's own code.
+        let target = unsafe {
+            (*editor)
+                .vtable
+                .cast::<u8>()
+                .add(self.post_modify)
+                .cast::<*const u8>()
+                .read()
+        };
+        let hooked = POST_MODIFY_HOOK.get_or_init(|| {
+            if !crate::framework::sig::is_function_start(target) {
+                return Err(format!(
+                    "{NAME}: the editor's vtable slot isn't a game function"
+                ));
+            }
+            // SAFETY: `target` is the live editor's `PostModify`, and the detour has its signature.
+            unsafe {
+                hook::install_typed(
+                    NAME,
+                    target,
+                    post_modify_detour as PostModifyFn,
+                    &ORIGINAL_POST_MODIFY,
+                )
+            }
+            .map(|()| target as usize)
+        });
+        match hooked {
+            Ok(hooked) if *hooked == target as usize => {
+                AFTER_MODIFY
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .push(callback);
+                Ok(())
+            }
+            Ok(_) => Err(format!(
+                "{NAME}: this editor has another one than the one hooked"
+            )),
+            Err(reason) => Err(reason.clone()),
         }
     }
 

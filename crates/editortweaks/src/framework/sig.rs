@@ -232,29 +232,27 @@ impl CodeShape {
 /// inside other instructions, so check the targets (e.g. with a [`CodeShape`]).
 pub fn direct_calls(function: *const u8) -> Vec<*const u8> {
     let image = GameImage::get();
-    let Some(rva) = (function as usize)
-        .checked_sub(image.base as usize)
-        .and_then(|rva| u32::try_from(rva).ok())
-    else {
+    let Some(rva) = image.rva_in(function) else {
         return Vec::new();
     };
     let Ok(index) = image.functions.binary_search_by_key(&rva, |entry| entry[0]) else {
         return Vec::new();
     };
-    let length = image.functions[index][1].saturating_sub(rva) as usize;
-    let Some(code) = image.code_at(function, length) else {
+    image.calls_between(rva, image.functions[index][1])
+}
+
+/// Like [`direct_calls`], in every part of `function`: its main part and the parts the compiler
+/// split off it (chained unwind entries: the rest of a long function, or code it rarely runs),
+/// which can lie anywhere in the exe. Part by part, in the exe's order. E.g. to check that a
+/// function calls another, wherever in it the call is.
+pub fn direct_calls_in_all_parts(function: *const u8) -> Vec<*const u8> {
+    let image = GameImage::get();
+    let Some(rva) = image.rva_in(function) else {
         return Vec::new();
     };
-    code.windows(5)
-        .enumerate()
-        .filter(|(_, bytes)| bytes[0] == 0xE8)
-        .map(|(at, bytes)| {
-            let relative = i32::from_le_bytes([bytes[1], bytes[2], bytes[3], bytes[4]]);
-            function
-                .wrapping_add(at + 5)
-                .wrapping_offset(relative as isize)
-        })
-        .filter(|&target| is_code(target))
+    image
+        .parts_of(rva)
+        .flat_map(|(begin, end)| image.calls_between(begin, end))
         .collect()
 }
 
@@ -429,6 +427,33 @@ impl GameImage {
         (address as usize - self.base as usize) as u32
     }
 
+    /// The RVA of `address`, if it may lie inside the image (it is past its base).
+    fn rva_in(&self, address: *const u8) -> Option<u32> {
+        (address as usize)
+            .checked_sub(self.base as usize)
+            .and_then(|rva| u32::try_from(rva).ok())
+    }
+
+    /// The targets of the direct calls in the code from RVA `begin` to `end` that lead into code
+    /// (see [`direct_calls`]).
+    fn calls_between(&self, begin: u32, end: u32) -> Vec<*const u8> {
+        let start = self.base.wrapping_add(begin as usize);
+        let Some(code) = self.code_at(start, end.saturating_sub(begin) as usize) else {
+            return Vec::new();
+        };
+        code.windows(5)
+            .enumerate()
+            .filter(|(_, bytes)| bytes[0] == 0xE8)
+            .map(|(at, bytes)| {
+                let relative = i32::from_le_bytes([bytes[1], bytes[2], bytes[3], bytes[4]]);
+                start
+                    .wrapping_add(at + 5)
+                    .wrapping_offset(relative as isize)
+            })
+            .filter(|&target| self.code_at(target, 1).is_some())
+            .collect()
+    }
+
     /// Start RVA of the function containing `rva`, following chained entries (code the compiler
     /// split off into separate chunks) back to the primary function.
     fn function_containing(&self, rva: u32) -> Option<u32> {
@@ -436,10 +461,22 @@ impl GameImage {
             .functions
             .partition_point(|f| f[0] <= rva)
             .checked_sub(1)?;
-        let [begin, end, mut unwind] = self.functions[index];
-        if rva >= end {
-            return None;
-        }
+        let entry = self.functions[index];
+        (rva < entry[1]).then(|| self.primary_start(entry))
+    }
+
+    /// The (begin, end) RVAs of each part of the function starting at RVA `start`: its own unwind
+    /// table entry and the entries chained back to it, in the exe's order.
+    fn parts_of(&self, start: u32) -> impl Iterator<Item = (u32, u32)> + '_ {
+        self.functions
+            .iter()
+            .filter(move |&&entry| self.primary_start(entry) == start)
+            .map(|&[begin, end, _]| (begin, end))
+    }
+
+    /// Start RVA of the function an unwind table entry belongs to: the entry's own, or for a
+    /// chained entry (a part split off a function), the start of the entry it chains back to.
+    fn primary_start(&self, [begin, _, mut unwind]: [u32; 3]) -> u32 {
         let mut start = begin;
         for _ in 0..8 {
             // SAFETY: unwind info RVAs come from the exception directory of this image.
@@ -447,14 +484,14 @@ impl GameImage {
                 let info = self.base.add(unwind as usize);
                 const UNW_FLAG_CHAININFO: u8 = 0x4;
                 if (*info >> 3) & UNW_FLAG_CHAININFO == 0 {
-                    return Some(start);
+                    return start;
                 }
                 let code_count = *info.add(2) as usize;
                 let parent = info.add(4 + 2 * (code_count + (code_count & 1))) as *const [u32; 3];
                 [start, _, unwind] = parent.read_unaligned();
             }
         }
-        Some(start)
+        start
     }
 }
 

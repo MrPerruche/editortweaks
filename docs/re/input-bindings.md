@@ -157,9 +157,29 @@ categories made at run time leave nothing behind.
 
 The mod reads whether a bound key is held with `GetAsyncKeyState`, like it did before keys were
 rebindable: Unreal's own key state only changes with input that reaches the game viewport, which a
-dragged slider or a focused text box may keep. `FKey` names map back to virtual keys as UE 4.27's
-`FWindowsPlatformInput::GetKeyMap` maps them forward: named keys by virtual key code
-(`LeftAlt` = `VK_LMENU`, ...), printable ones by the character they type without modifiers in the
-current layout (`Zero`.. `Nine`, `Semicolon`, ..., and the AZERTY names `Ampersand`, `E_AccentAigu`,
-...; other characters are their own name), found with `VkKeyScanW`. Gamepad keys and the mouse
-wheel can't be held this way.
+dragged slider or a focused text box may keep. Polling alone ignores what the game does with the
+keys, so two gates apply (`platform::keyboard`, 2026-10-16; numpad keys as defaults typed into
+sliders and fired while the game was in the background):
+
+1. The game's window must be the foreground one (`GetForegroundWindow`'s process is ours).
+2. Keys that type text (everything but modifier keys and mouse buttons) must also have been
+   delivered to the viewport: the hooked `UPlayerInput::InputKey` (`click_swap` owns the hook, the
+   loader hooks a function once) records press/repeat/release per virtual key, and a key counts
+   while it's both physically down and last delivered as pressed. A release a text box took can't
+   leave it stuck (the physical state ends it), and a press typed into a text box never counts.
+   Modifiers and mouse buttons are exempt (dragged sliders, e.g. Alt scrubbing, keep them from the
+   viewport as well). If the hook isn't in place the gate is off.
+
+Assumption to verify in game: a key typed into a focused text box doesn't reach
+`APlayerController::InputKey`. (`UBrickTextBoxWidget::NativeOnKeyDown`, BRMK 0x43ED40, handles
+CapsLock/Accept/Back itself and passes the rest to `HandleKeyDown`; not read further.) If it does
+reach it, gate 2 needs `UBrickTextBoxWidget::IsTyping` instead.
+
+`FKey` names map back to virtual keys as UE 4.27's `FWindowsPlatformInput::GetKeyMap` maps them
+forward: named keys by virtual key code (`LeftAlt` = `VK_LMENU`, ...), printable ones by the
+character they type without modifiers in the current layout (`Zero`.. `Nine`, `Semicolon`, ...,
+and the AZERTY names `Ampersand`, `E_AccentAigu`, ...; other characters are their own name), found
+with `VkKeyScanW`. The top row's digits are the same virtual keys (`VK_0`..`VK_9`) on every layout,
+so `One` is the key typing `&` on AZERTY; letters are where the layout puts them, like the game's own
+bindings. Matching goes through the virtual key, so the delivered name (`One` or `Ampersand`) and
+the bound one agree either way. Gamepad keys and the mouse wheel can't be held this way.
