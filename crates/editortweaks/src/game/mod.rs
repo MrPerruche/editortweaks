@@ -5,6 +5,7 @@
 
 pub mod actor;
 pub mod actuator;
+pub mod assets;
 pub mod axle;
 pub mod brick_editor;
 pub mod brick_materials;
@@ -14,6 +15,7 @@ pub mod camera_manager;
 pub mod collision;
 pub mod component_collision;
 pub mod editor_camera;
+pub mod editor_file;
 pub mod editor_input;
 pub mod editor_mode;
 pub mod editor_object;
@@ -47,8 +49,10 @@ pub mod slider;
 pub mod slider_drag;
 pub mod slider_text;
 pub mod text;
+pub mod textures;
 pub mod ui_library;
 pub mod ui_style;
+pub mod vehicle_box;
 pub mod view_canvas;
 pub mod view_target;
 pub mod viewport;

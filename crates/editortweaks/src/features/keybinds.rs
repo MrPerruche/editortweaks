@@ -161,6 +161,15 @@ pub static SHOW_MAP: Keybind = Keybind::new(
     &["Zero"],
 );
 
+/// Shows or hides every reference image and model in the editor, like the "Show references" row of
+/// the editor's panel (`references`).
+pub static SHOW_REFERENCES: Keybind = Keybind::new(
+    "EditorTweaks_ShowReferences",
+    "Show references",
+    "Press in the editor to hide every reference image and model, and again to show them. Hidden this way, they come back as they were (unlike opacity 0).",
+    &["Two"],
+);
+
 /// Keeps a dragged slider's value changing while held (`slider_drag`).
 pub static KEEP_DRAGGING_SLIDERS: Keybind = Keybind::new(
     "EditorTweaks_KeepDraggingSliders",
@@ -170,7 +179,7 @@ pub static KEEP_DRAGGING_SLIDERS: Keybind = Keybind::new(
 );
 
 /// Every keybind, by section, in the order the settings list them.
-static SECTIONS: [Section; 7] = [
+static SECTIONS: [Section; 8] = [
     Section {
         name: "IC_EditorTweaks_Selection",
         title: "Selection",
@@ -205,6 +214,11 @@ static SECTIONS: [Section; 7] = [
         name: "IC_EditorTweaks_Map",
         title: "Map",
         keybinds: &[&SHOW_MAP],
+    },
+    Section {
+        name: "IC_EditorTweaks_References",
+        title: "References",
+        keybinds: &[&SHOW_REFERENCES],
     },
     Section {
         name: "IC_EditorTweaks_Sliders",

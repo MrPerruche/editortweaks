@@ -159,6 +159,37 @@ what `property_limits` matches its rules on.
 Upstream brickrust's `NUMERIC_BRICK_PROPERTY_FLOAT_VTABLE` pattern matches three numeric vtables
 (0x38DC498, 0x38DB968, 0x38DD5C8); they share everything but entries [6], [18] and [19].
 
+### Number rows of our own (2026-10-17, game build 25831956)
+
+`UNumericPropertyWidget::UpdateValue` (game 0xF03680) gets the row's property through a cast helper
+(0xEAD990: vtable [2], an `IsA(FName)`, with `"FNumericBrickProperty"`), reads the value (getter
+[18]; its `NumUsed` is the number of sliders), then the property's attributes, each a stored value
+with a "set" flag followed by a delegate (`TBaseDelegate`: data pointer, then its size; unbound when
+zero), read as "the delegate's result if bound, else the stored value if set, else a default":
+
+| Offset | Attribute | Default |
+|---|---|---|
+| +0x18 (set +0x19, delegate +0x20/+0x28) | value type (`ENumericValueType`), passed to the Blueprint event `UpdateNumericProperty(ValueType, NumSliders)` (0xFE5D60) | 2 |
+| +0x30 (set +0x50, delegate +0x58/+0x60) | value range (`GetValueRange`, vtable [20], game 0xCE8FF0) | 0..1 |
+| +0x68 (set +0x69, delegate +0x70/+0x78) | axis lock (`RemapAxisLockIndex`, 0xE3DF70) | none |
+| +0x80 (set +0x81, delegate +0x88/+0x90) | unknown byte, passed on to the sliders (0xEB27D0) | 0 |
+| +0x98 (set +0x99, delegate +0xA0/+0xA8) | don't clamp | false |
+
+So a numeric property is 0xB0 bytes before any subclass field. The typed setter (vtable [19], float
+0xD081E0) is `bool Set(this, const Container*, const FNumericBrickPropertyValue*)`: `ClampValue`,
+then the store. The vtable's other kept slots ([10]-[17]: text import/export and the like) reach
+the value only through [18]/[19].
+
+`FNumericBrickProperty` (21 slots) names 7 tables in the exe: 0x38D4D48 is another class (its [2]
+and [3] differ, its [18] isn't code), the 6 others typed variants differing in [4], [6], [18], [19].
+`game/property_reflection.rs` copies the float variant's (the one whose [18] is the float getter,
+0xCE8BE0, a `CodeShape`: 0x38DC498) and replaces [4], [6]-[9], [18]-[20] with functions reading and
+writing a value of ours (1 to 3 floats, a range, a unit), the value type stored at +0x18. The
+attributes stay zero (unset). The table is checked by its float getter, not by `GetValueRange`:
+`property_limits` hooks that one, so at run time its first bytes are the hook's jump (the first
+in-game try failed "slot 20 isn't FNumericBrickProperty range", and with it every reference row). `property_limits` and the other numeric hooks see our rows too: they
+read the `FProperty*` (+0x8), null for ours, and leave such rows alone.
+
 ## Typed text and display (BRMK 1.11.6 `UBrickSliderWidget`, game build 25831956)
 
 `OnTextChanged(const FText&, EValueChangedEventType)` (game 0xF30F70) is a reflected function

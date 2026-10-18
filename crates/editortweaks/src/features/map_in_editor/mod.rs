@@ -56,6 +56,7 @@ use crate::game::hidden_components;
 use crate::game::line_batcher::{self, Line, LineBatcher};
 use crate::game::net_mode::{self, NetMode, Role};
 use crate::game::reflection::{self, BoolField, Getter, NativeThunk, SingleCall};
+use crate::game::vehicle_box;
 use crate::game::weak_object::WeakObject;
 use crate::game::world;
 use crate::math::{self, Quat, Vec3};
@@ -766,40 +767,10 @@ unsafe fn work_out_landing(game: &Game, state: &mut State, garage: &Garage, log_
 /// # Safety
 /// `editor` must be the live editor. Game thread only.
 unsafe fn vehicle_box(game: &Game, editor: *mut UObjectBase) -> Option<VehicleBox> {
-    let mut found: Option<VehicleBox> = None;
-    // SAFETY: per the contract; the objects are the editor's live ones (null entries skipped).
-    unsafe {
-        for &object in game.bricks.editor_objects(editor) {
-            if object.is_null() {
-                continue;
-            }
-            let (Some(place), Some([low, high])) = (game.places.of(object), game.bounds.of(object))
-            else {
-                continue;
-            };
-            let rotation = Quat::from_rotator(math::widen(place.rotation));
-            let location = math::widen(place.location);
-            for corner in 0..8 {
-                let pick = |axis: usize| {
-                    if corner >> axis & 1 == 0 {
-                        f64::from(low[axis])
-                    } else {
-                        f64::from(high[axis])
-                    }
-                };
-                let point = math::add(location, rotation.rotate([pick(0), pick(1), pick(2)]));
-                let found = found.get_or_insert(VehicleBox {
-                    min: point,
-                    max: point,
-                });
-                for (axis, &value) in point.iter().enumerate() {
-                    found.min[axis] = found.min[axis].min(value);
-                    found.max[axis] = found.max[axis].max(value);
-                }
-            }
-        }
-    }
-    found
+    // SAFETY: per the contract.
+    let found =
+        unsafe { vehicle_box::vehicle_box(&game.bricks, &game.places, &game.bounds, editor) };
+    found.map(|[min, max]| VehicleBox { min, max })
 }
 
 /// Moves the editor to where the vehicle lands (when `show`), or back where it was. The camera

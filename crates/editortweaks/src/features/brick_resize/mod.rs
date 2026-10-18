@@ -287,6 +287,8 @@ fn on_button(press: &Press) -> bool {
             (Button::Select, Click::Pressed) => state.press(game),
             (Button::Select, Click::Released) => state.release(game),
             (Button::MoveCamera, click) => state.right_click(click),
+            // Shift + click and the keys.
+            _ => false,
         }
     }
 }

@@ -1,6 +1,7 @@
 //! The map's controls in the editor's side panel. With nothing selected, the panel lists the
 //! editor's settings (it asks the settings list for `Properties.Editor`, see
-//! `docs/re/map-in-editor.md`), then a "Map" section of ours:
+//! `docs/re/map-in-editor.md`), then a "References" section of ours, starting with the map's rows
+//! (the reference images and models' rows follow, from `features/references`):
 //!
 //! - **Show map:** whether the map shows around the vehicle, like the map key. With no garage
 //!   selected, showing it selects the one the editor was entered from, else the first. Listed only
@@ -25,13 +26,16 @@ use super::{GAME, Game, PINNED};
 use crate::features::settings_list;
 use crate::framework::settings::Setting;
 use crate::game::garage::Garage;
-use crate::game::kismet;
 use crate::game::property_reflection::{Check, List, MAX_ITEMS, Value};
 use crate::game::weak_object::WeakObject;
 use crate::prelude::*;
 
 /// What the editor's side panel asks the settings list for, with nothing selected.
-const EDITOR_SETTINGS: &str = "Properties.Editor";
+pub const EDITOR_SETTINGS: &str = "Properties.Editor";
+
+/// The section's title. The map is a reference too: the `references` feature lists its rows in the
+/// same section, after these (sections titled alike show as one, see `features/settings_list`).
+pub const SECTION: &str = "References";
 
 /// How many garages the list can hold: after "None", what's left of a list's items.
 const MAX_GARAGES: usize = MAX_ITEMS - 1;
@@ -113,10 +117,7 @@ pub(super) fn add(game: &Game) -> Result<(), String> {
         Value::List(&GARAGE_LIST),
     )?);
     rows.push(settings_list::setting_row(Setting::Toggle(&PINNED))?);
-    settings_list::add(
-        EDITOR_SETTINGS,
-        vec![(kismet::string_to_text("Map")?, rows)],
-    )
+    settings_list::add(EDITOR_SETTINGS, vec![(SECTION, rows)])
 }
 
 /// Has the editor's side panel list its rows again, ours with what they show now. Whether it was

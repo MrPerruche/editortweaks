@@ -220,11 +220,33 @@ unsafe fn set_handled(result: *mut c_void) {
 /// `bReleased` (our name) is the byte at +8 of `FBrActionParams`, after its reflected fields.
 pub const SELECT: &str = "Action_Select";
 
+/// `FBrActionResult Action_AddToSelection(const FBrActionParams&)` (`UBaseEditorInputComponent`,
+/// BRMK 0x2200B0): Shift + the left mouse button, pressed and released: `HandleSelect(Params, true)`,
+/// as [`SELECT`] with `bAdd` (`docs/re/selection.md`).
+pub const ADD_TO_SELECTION: &str = "Action_AddToSelection";
+
 /// `FBrActionResult Action_MoveCamera(const FBrActionParams&)` (`UEditorInputComponent`, BRMK
 /// 0x222710): the right mouse button in the editor, pressed and released. While it's held, bit 0
 /// of the component's camera flags is set (see [`CameraFlags`]), then `UpdateCameraMode`: the mouse
 /// turns the camera, WASD moves it, the cursor hides.
 pub const MOVE_CAMERA: &str = "Action_MoveCamera";
+
+/// `FBrActionResult Action_DeleteSelection(const FBrActionParams&)`: deletes the selected bricks
+/// (Delete; input row `DeleteSelectedBricks`). The name is in the game's function table (a string at
+/// game 0x39904F0).
+pub const DELETE_SELECTION: &str = "Action_DeleteSelection";
+
+/// `FBrActionResult Action_DuplicateSelection(const FBrActionParams&)`: duplicates the selected
+/// bricks onto the mouse (Ctrl + C; input row `DuplicateSelectedBricks`).
+pub const DUPLICATE_SELECTION: &str = "Action_DuplicateSelection";
+
+/// `FBrActionResult Action_HideSelection(const FBrActionParams&)` (`UBaseEditorInputComponent`, BRMK
+/// 0x222070): hides the selected bricks until `Action_UnhideAll` (H; input row `HideSelection`).
+pub const HIDE_SELECTION: &str = "Action_HideSelection";
+
+/// `FBrActionResult Action_UnhideAll(const FBrActionParams&)` (`UBaseEditorInputComponent`, BRMK
+/// 0x225340): shows every hidden brick again (Alt + H; input row `UnhideAll`).
+pub const UNHIDE_ALL: &str = "Action_UnhideAll";
 
 /// The handler of a button's action, e.g. [`SELECT`] or [`MOVE_CAMERA`]: called when the button is
 /// pressed and when it's released (`FBrActionParams` byte +8, see [`SELECT`]).

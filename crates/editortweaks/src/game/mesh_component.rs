@@ -52,6 +52,11 @@ pub struct MeshComponents {
     attach: SingleCall,
     /// `USceneComponent::SetRelativeScale3D(FVector NewScale3D)`.
     set_scale: SingleCall,
+    /// `USceneComponent::K2_SetRelativeTransform(const FTransform& NewTransform, bool bSweep,
+    /// FHitResult& SweepHitResult, bool bTeleport)`: the others stay zero (no sweep).
+    set_transform: SingleCall,
+    /// `USceneComponent::SetVisibility(bool bNewVisibility, bool bPropagateToChildren)`.
+    set_visible: SingleCall,
     /// `bool UStaticMeshComponent::SetStaticMesh(UStaticMesh* NewMesh)`.
     set_mesh: SingleCall,
     /// `UPrimitiveComponent::SetCollisionEnabled(ECollisionEnabled::Type NewType)`.
@@ -78,6 +83,44 @@ pub struct MeshComponents {
     /// `SetRenderCustomDepth(bool bValue)`, `SetCustomDepthStencilValue(int32 Value)`.
     set_custom_depth: SingleCall,
     set_stencil: SingleCall,
+    /// For components drawing only an outline ([`Self::outline_only`]); `None` if something it
+    /// needs isn't found.
+    outline_only: Option<OutlineOnly>,
+}
+
+/// What turns a component into one drawing nothing but its custom depth.
+struct OutlineOnly {
+    /// `UPrimitiveComponent::SetRenderInMainPass(bool bValue)`.
+    main_pass: SingleCall,
+    /// `UPrimitiveComponent::bRenderInDepthPass` (no setter in 4.27). Left on, a component out of
+    /// the main pass still draws into the depth prepass: what's behind it then fails the depth test
+    /// where the reference's own pieces let it through (dithered or translucent), and those pixels
+    /// keep stale colors that anti-aliasing smears.
+    depth_pass: BoolField,
+    /// `UPrimitiveComponent::SetCastShadow(bool NewCastShadow)`.
+    shadow: SingleCall,
+}
+
+impl OutlineOnly {
+    fn find(primitive: *const UClass) -> Result<Self, String> {
+        Ok(Self {
+            main_pass: SingleCall::find(
+                primitive,
+                "SetRenderInMainPass",
+                "bValue",
+                "BoolProperty",
+                1,
+            )?,
+            depth_pass: reflection::bool_field(primitive.cast(), "bRenderInDepthPass")?,
+            shadow: SingleCall::find(
+                primitive,
+                "SetCastShadow",
+                "NewCastShadow",
+                "BoolProperty",
+                1,
+            )?,
+        })
+    }
 }
 
 // SAFETY: reflection records living as long as the game; only used on the game thread.
@@ -155,6 +198,20 @@ impl MeshComponents {
                 "StructProperty",
                 12,
             )?,
+            set_transform: SingleCall::find(
+                scene,
+                "K2_SetRelativeTransform",
+                "NewTransform",
+                "StructProperty",
+                size_of::<Transform>() as i32,
+            )?,
+            set_visible: SingleCall::find(
+                scene,
+                "SetVisibility",
+                "bNewVisibility",
+                "BoolProperty",
+                1,
+            )?,
             set_mesh: SingleCall::find(mesh, "SetStaticMesh", "NewMesh", "ObjectProperty", 8)?,
             set_collision,
             destroy: SingleCall::find(
@@ -209,7 +266,35 @@ impl MeshComponents {
                 "IntProperty",
                 4,
             )?,
+            outline_only: OutlineOnly::find(primitive)
+                .map_err(|reason| log!("no outline-only components: {reason}"))
+                .ok(),
         })
+    }
+
+    /// Whether [`Self::outline_only`] can be done.
+    pub fn can_outline_only(&self) -> bool {
+        self.outline_only.is_some()
+    }
+
+    /// Makes `component` draw nothing but its custom depth, which the editor's outlines come from:
+    /// not in the view's main pass nor its depth prepass, no shadow. Whether it could.
+    ///
+    /// # Safety
+    /// `component` must be a live primitive component, still in the main pass. Game thread only.
+    pub unsafe fn outline_only(&self, component: *mut UObjectBase) -> bool {
+        let Some(outline_only) = &self.outline_only else {
+            return false;
+        };
+        // SAFETY: per the contract; the field's offset comes from reflection. The depth pass is
+        // left first: leaving the main pass then rebuilds the component's render state, which
+        // reads both.
+        unsafe {
+            outline_only.depth_pass.set(component.cast(), false);
+            outline_only.main_pass.call(component, false);
+            outline_only.shadow.call(component, false);
+        }
+        true
     }
 
     /// A new mesh component showing `mesh`, attached to `parent` (a scene component) without
@@ -275,6 +360,24 @@ impl MeshComponents {
     pub unsafe fn set_scale(&self, component: *mut UObjectBase, scale: Vector) {
         // SAFETY: per the contract; the parameter is an `FVector`.
         unsafe { self.set_scale.call(component, scale) };
+    }
+
+    /// Sets where `component` is relative to what it's attached to.
+    ///
+    /// # Safety
+    /// `component` must be a live scene component. Game thread only.
+    pub unsafe fn set_transform(&self, component: *mut UObjectBase, transform: Transform) {
+        // SAFETY: per the contract; the parameter is an `FTransform`.
+        unsafe { self.set_transform.call(component, transform) };
+    }
+
+    /// Shows or hides `component`.
+    ///
+    /// # Safety
+    /// `component` must be a live scene component. Game thread only.
+    pub unsafe fn set_visible(&self, component: *mut UObjectBase, visible: bool) {
+        // SAFETY: per the contract.
+        unsafe { self.set_visible.call(component, visible) };
     }
 
     /// Destroys `component` (one this made).
@@ -438,7 +541,7 @@ impl MeshComponents {
     ///
     /// # Safety
     /// `component` must be a live primitive component. Game thread only.
-    unsafe fn set_custom_values(&self, component: *mut UObjectBase, values: &[f32]) {
+    pub unsafe fn set_custom_values(&self, component: *mut UObjectBase, values: &[f32]) {
         let call = &self.set_data;
         for (chunk, values) in values.chunks(4).enumerate() {
             let mut value = [0.0f32; 4];

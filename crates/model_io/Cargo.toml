@@ -1,0 +1,21 @@
+[package]
+name = "model_io"
+description = "Reading reference images and 3D models, and the per-vehicle references file (no game code)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+# Pure Rust and free of game code, so `cargo test -p model_io` runs anywhere (the mod crate's own
+# test binary needs the game's loader DLL). Every dependency is MIT or Apache-2.0.
+[dependencies]
+# PNG decode and encode: the format reference images, model textures and the engine's texture
+# import all use. Only what the `png` crate needs by default (deflate in pure Rust).
+png = "0.18"
+# JPEG decode only.
+zune-jpeg = "0.5"
+# glTF's JSON; the glTF container and accessors are read by our own `readers/gltf.rs`.
+serde_json = "1"
+serde = { version = "1", features = ["derive"] }
+tobj = { version = "4", default-features = false }
+toml = "1"

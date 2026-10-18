@@ -170,6 +170,15 @@ settings (saved when changed), or a feature's own value (the map's garage, Show 
 items are made each time the game asks for them (slot 20), their names as new texts released once
 copied into the items; at most 256, since slots 19 and 21 take the index as a byte.
 
+Sections of the same title merge only if the title is the very same text: `AddCategory` (game
+0xCCD8B0) looks for an existing category with game 0x10A18B0, `FText::IdenticalTo` (same text data,
+or same display string pointer), not an equal string. Two texts made from "References" (the map's
+and the references') gave two sections; `settings_list` now makes one text per title (2026-10-17).
+A listing can also *replace* the panel's rows (`settings_list::replace`): while its condition holds,
+a panel asking for its tag gets only its sections, without the game's user settings or the other
+listings (the references' rows while references are selected). The game's function isn't called
+then, which is safe only because a reflection that saves or loads (`is_serializing`) shows no tag.
+
 Enum items: `FEnumPropertyItem` (game 0xA8 bytes): value `int32` +0, `FDisplayInfo` +8 (name
 `FText`, then the icon's `TSoftObjectPtr` with its weak object index -1 at +0x20), three texts
 +0x48, +0x60, +0x78 (empty in the game's lists), a pointer +0x90 (null), two flags +0x98, +0x99

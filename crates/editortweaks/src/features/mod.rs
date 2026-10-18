@@ -25,6 +25,7 @@ mod ortho_view;
 mod precise_moves;
 mod precise_sliders;
 mod property_limits;
+mod references;
 /// Shared hook of the game's settings list, where features add rows (not a feature).
 mod settings_list;
 mod settings_menu;
@@ -54,6 +55,7 @@ pub static ALL: &[&dyn Feature] = &[
     &actuator_arrows::ActuatorArrows,
     &suspension_arrows::SuspensionArrows,
     &map_in_editor::MapInEditor,
+    &references::References,
     &settings_menu::SettingsMenu,
 ];
 
@@ -62,6 +64,7 @@ pub static SETTINGS: &[&[Section]] = &[
     &SELECTION,
     &brick_resize::SETTINGS,
     &map_in_editor::SETTINGS,
+    &references::SETTINGS,
     &slider_drag::SETTINGS,
 ];
 

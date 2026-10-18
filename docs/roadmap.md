@@ -189,34 +189,47 @@ likely approach are first guesses, to be revised as the editor gets reverse engi
     bricks' models replace their boxes: the mouse points at, drags and snaps to their faces, edges
     and vertices (a ramp's slope, a cylinder's rim). Models come from the meshes' complex collision
     (see `docs/re/brick-models.md`). Untested in game yet. Later: the same for moving bricks.
-- **Reference images and models** (asked 2026-10-16, planned in `docs/model-io.md`, not started):
-  load images (PNG, JPG) and 3D models (OBJ, glTF/GLB, STL) from files and show them in the editor
-  as non-brick previews, as components of the editor's own actor (the editor hides every other
-  actor's components, `docs/re/map-in-editor.md`) without collision.
-  - Images: a plane in the 3D view (front/side/top presets, size, opacity, flip), to trace over,
-    best with the orthographic view. Texture through the engine's own decoder
-    (`UKismetRenderingLibrary::ImportFileAsTexture2D`/`ImportBufferAsTexture2D`, to verify) or ours
-    (`png`/JPEG crates + `UTexture2D::CreateTransient`). Needs an existing game or engine material
-    with a texture parameter (a material can't be made at run time): probe first; a UMG widget
-    component is the fallback.
-  - Models: parsed in Rust into a neutral `ModelData`, built with the existing `mesh_builder`
-    (UVs, a material slot per imported material, hard/soft edges kept by splitting vertices where
-    imported normals differ), converted from the file's units and axes (setting for OBJ/STL);
-    placement (position, rotation, scale), opacity setting.
+- **Reference images and models** (asked 2026-10-16, planned in `docs/model-io.md`; started
+  2026-10-16: the `model_io` crate and an in-game prototype answering the probes; images first,
+  then models): load PNG/JPG images and 3D models
+  (glTF/GLB, OBJ, STL) from files and show them in the editor as non-brick previews that behave
+  like bricks: moved, rotated, scaled, mirrored per axis, with an opacity, and a "selectable"
+  switch in the side panel (refinement). Not editor objects (those are counted in mass, price and
+  bounds and saved with the vehicle): components of the editor's own actor (the editor hides every
+  other actor's, `docs/re/map-in-editor.md`), our own picking, the game's own selection outline
+  (custom depth stencil), numbers in a "References" panel section first and an own gizmo later.
+  - Remembered per vehicle in `<vehicle folder>/editortweaks.toml` (TOML, versioned, every field
+    optional), each reference either a path (link) or a copy in `<vehicle folder>/editortweaks/`
+    (a setting and a per-reference switch). The game ignores foreign files; Steam Cloud and the
+    Workshop (only `Vehicle.brv` is in subscribed items) don't carry them, so they stay on this PC.
+    The vehicle's folder comes from the editor's `FUGCFileInfo` (`game/editor_file.rs`), polled,
+    not hooked.
+  - Images: a plane (front/side/top presets, size, flip, opacity, draw order), best with the
+    orthographic view. Texture through the engine's decoder (`ImportFileAsTexture2D`, works) on
+    the engine's widget materials (`docs/re/references.md`).
+  - Models: parsed on a worker thread into a neutral `ModelData`, built by `mesh_builder` in
+    slices over frames (no hitch), with import settings for formats without fixed axes or units
+    (up, forward, units, pivot). Rust crates (`gltf`, `tobj`, `stl_io`) rather than Assimp: no
+    bloat, and no C++ parser reading downloaded files inside the game; Assimp stays an optional
+    cargo feature if more formats are ever wanted.
+  - FBX is not planned (decision 2026-10-16). Decided 2026-10-16: new references are links by
+    default, references and bricks are never selected together, undo comes after the first
+    prototype, and the map, images and models share one "References" panel section (the map
+    is a reference too).
   - View mode showing the distance between the model and the bricks (through `game/editor_view`).
-  - FBX is not planned (decision 2026-10-16: closed format, parser effort for little gain; glTF
-    through Blender instead).
-  - Open: whether references are remembered per vehicle, and how a file is chosen (a drop-in
-    folder listed in the panel first, a Windows file dialog later).
-- **Vehicle export as a 3D model** (asked 2026-10-16, planned in `docs/model-io.md`, not started):
-  write the vehicle (or the selection) as GLB, also OBJ and STL. Geometry from the bricks' models
-  that `game/brick_model` already reads (the complex collision's triangles: positions only, no UVs
-  or normals), one glTF mesh per brick type with a TRS node per brick, a material per brick color.
-  Known gaps to check: bricks with no readable model (spinners, wheels, flaps), the collision LOD
-  against the render mesh. First deliverable of the group (lowest risk, checkable in Blender).
-- **Reference and export plumbing**: a pure-Rust `model_io` module (data, readers, writers, UE <->
-  glTF axes, units and winding), unit tested without the game; built first, shared by the three
-  features above. Order of work and the probes to run in game first: `docs/model-io.md`.
+  - Later: own undo (wanted), mirror across the editor's mirror plane, live reload on file change, a
+    Windows file dialog (a drop-in folder listed in the panel first).
+- **Vehicle export as a 3D model** (asked 2026-10-16, deferred by the user until they have gathered
+  more information; notes at the end of `docs/model-io.md`): write the vehicle (or the selection)
+  as GLB, also OBJ and STL, from the bricks' models `game/brick_model` already reads (complex
+  collision triangles: no UVs or normals). Known gaps: bricks with no readable model (spinners,
+  wheels, flaps), the collision LOD against the render mesh.
+- **Reference plumbing** (first step of the above, built 2026-10-16): the `crates/model_io` crate
+  (data, readers, Unreal axes/units/winding, the image plane, the TOML sidecar; `cargo test -p
+  model_io`); probes answered in game (`docs/re/references.md`). The framework's first part
+  (2026-10-16): the open vehicle's `editortweaks.toml` read and shown, live as it or the files
+  change (edited by hand for now). Next: writing it, the panel section with the map's rows,
+  picking and the outline, numeric rows.
 - **Map in the editor** (city covers, asked 2026-10-14): in the panel when nothing is selected, show
   the map around the vehicle (a toggle, later an opacity slider) and pick one of the map's garages,
   its spawn point marked with a 3-axis cross, so the map shows as it will be around the vehicle

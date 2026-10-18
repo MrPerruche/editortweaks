@@ -29,7 +29,7 @@ use std::sync::{Arc, Mutex, Once, OnceLock, PoisonError, TryLockError};
 
 use brickrust::ue::coreuobject::UObjectBase;
 
-use super::editor_buttons::{self, Click, Press};
+use super::editor_buttons::{self, Button, Click, Press};
 use super::keybinds;
 use super::mouse_moves::{self, Handling, Movement, Pointer};
 use crate::framework::settings::{Alternative, Choice};
@@ -210,6 +210,9 @@ fn on_button(press: &Press) -> bool {
     let Some(game) = GAME.get() else {
         return false;
     };
+    if press.button == Button::AddToSelection || press.button.is_key() {
+        return false;
+    }
     let mut state = STATE.lock().unwrap_or_else(PoisonError::into_inner);
     // SAFETY: an input handler's call, on the game thread; its input component is live.
     unsafe {

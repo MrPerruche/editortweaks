@@ -48,6 +48,11 @@ TArray<UBrickEditorObject*> Objects; if (Object) Objects.Add(Object);
 this->SelectObjects(Objects, bAdd, true);     // vtable game +0x2F0, BRMK +0x3B0
 ```
 
+`features/editor_buttons` hooks both thunks (`Action_AddToSelection` since 2026-10-17, for the
+references' Shift + click). Assumed, not checked in game: a Shift click calls only
+`Action_AddToSelection`, not `Action_Select` too (the game's own Shift click would otherwise
+replace the selection on the `Select` release).
+
 A click on no brick selects nothing (an empty array): it unselects everything. Mode vtables in the
 game, found through the pointers to that release at +0x2E8: 0x38D7DE0 (`UBrickEditorMode`, its
 `SelectObjects` an empty stub), 0x38D95C0 (the default mode, `SelectObjects` 0xD05220), 0x3962AA0,

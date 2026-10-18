@@ -4,11 +4,13 @@
 //! `FBrickPropertyReflection` ([`Reflection`]) under a category (a titled section), with its display
 //! name ([`ADD_PROPERTY`]). Brick properties are small C++ objects (`{vtable, FProperty*, FName}`,
 //! shared through `TSharedRef`s) whose virtual functions read and write the value in the reflected
-//! object through the `FProperty`. Ours ([`Row`]) copy the game's tables for a bool (a check box)
-//! and an enum (a list, its items side by side or a dropdown) but replace every function touching a
-//! value with ours, which read and write a [`Value`] of ours instead: no game field is involved.
+//! object through the `FProperty`. Ours ([`Row`]) copy the game's tables for a bool (a check box),
+//! an enum (a list, its items side by side or a dropdown) and a number (one to three sliders that
+//! also take typed values) but replace every function touching a value with ours, which read and
+//! write a [`Value`] of ours instead: no game field is involved.
 //!
-//! Found in game 1.11.7 (build 25831956); see `docs/re/settings-menu.md`.
+//! Found in game 1.11.7 (build 25831956); see `docs/re/settings-menu.md` and, for numbers,
+//! `docs/re/property-panel.md`.
 
 use core::ffi::c_void;
 use std::sync::{Once, OnceLock};
@@ -31,7 +33,39 @@ pub enum Value {
     Check(&'static dyn Check),
     /// A list to choose an item from.
     List(&'static dyn List),
+    /// Numbers, each a slider taking typed values too.
+    Number(&'static dyn Number),
 }
+
+/// One to three numbers shown as sliders side by side, like a brick's position. Its functions run
+/// on the game thread, whenever a panel lists the row or changes it: while a slider is dragged,
+/// every frame.
+pub trait Number: Sync {
+    /// The values shown, one per slider (1 to 3; more are left out).
+    fn values(&self) -> Vec<f32>;
+    /// Sets the values (as many as [`Self::values`] gives), within [`Self::range`].
+    fn set_values(&self, values: &[f32]);
+    /// The smallest and largest values, the sliders' ends.
+    fn range(&self) -> (f32, f32);
+    /// How the values are shown.
+    fn unit(&self) -> Unit;
+}
+
+/// How a number row shows its values: the game's `ENumericValueType`s.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub enum Unit {
+    /// A fraction shown as a percentage (0.5 is 50 %).
+    Percent = 2,
+    /// Degrees.
+    Angle = 3,
+    /// A distance in cm, shown in the user's units (`DistanceAutoOrBrickUnits`, like bricks'
+    /// positions).
+    Distance = 18,
+}
+
+/// How many sliders a number row can have (`FNumericBrickPropertyValue` holds three).
+const MAX_COMPONENTS: usize = 3;
 
 /// A value shown as a check box. Its functions run on the game thread, whenever a panel lists the
 /// row or changes it.
@@ -92,6 +126,21 @@ impl List for Choice {
             _ => false,
         }
     }
+}
+
+/// `FNumericBrickPropertyValue`: up to three components, `count` of them used.
+#[repr(C)]
+#[derive(Clone, Copy, PartialEq)]
+struct Numbers {
+    data: [f32; MAX_COMPONENTS],
+    count: u8,
+}
+
+/// `FNumericBrickPropertyRange`: the smallest and largest value of each component.
+#[repr(C)]
+struct NumbersRange {
+    min: Numbers,
+    max: Numbers,
 }
 
 impl From<Setting> for Value {
@@ -164,6 +213,13 @@ const ENUM_PROPERTY: VtableSig = VtableSig {
     type_name: "FEnumBrickProperty",
     length: 22,
 };
+/// The typed variants (float, vector, rotator, ...) keep the base's name and differ only in the
+/// slots we replace (compare, get, set), so any copy does.
+const NUMERIC_PROPERTY: VtableSig = VtableSig {
+    name: "FNumericBrickProperty vtable",
+    type_name: "FNumericBrickProperty",
+    length: 21,
+};
 
 /// The slots of a brick property's table we replace (brickrust's `FBrickPropertyVTable`, then the
 /// typed functions).
@@ -186,7 +242,25 @@ mod slot {
     pub const ITEMS: usize = 20;
     /// Enums: `(this, container, uint8 value) -> bool`, whether a value may be set.
     pub const ALLOWED: usize = 21;
+    /// Numbers: `(this, FNumericBrickPropertyRange* out, container) -> out`, the sliders' ends.
+    pub const RANGE: usize = 20;
 }
+
+/// The float variant's getter (game 0xCE8BE0) as it is in [`slot::GET`]: one float from the
+/// container's last object (or its root) at the `FProperty`'s offset, the other components zeroed,
+/// one component used. The other variants' tables (vector, rotator, ...) are left out.
+const FLOAT_GET: CodeShape = CodeShape {
+    name: "FNumericBrickProperty float get",
+    shape: "83 7a 10 00 4c 8b 49 08 74 10 48 63 4a 10 48 8b 42 08 48 8d 51 ff 48 8d 14 d0 49 63 49 4c 48 8b 12 48 03 d1 74 17 f3 0f 10 02 33 c0 49 89 40 04 b0 01 f3 41 0f 11 00 41 c6 40 0c 01 c3",
+};
+
+/// Where a numeric property keeps its value type (`ENumericValueType`), an attribute like its
+/// others: the stored value, a flag saying it's set, then a delegate (unbound when zero).
+/// `UNumericPropertyWidget::UpdateValue` (game 0xF03680) reads it (the delegate's result if bound,
+/// else the stored value if set, else 2) and hands it to the row's Blueprint
+/// (`UpdateNumericProperty`). Offsets from the start of [`Property::fields`].
+const NUMBER_UNIT: usize = 0x18 - FIELDS;
+const NUMBER_UNIT_SET: usize = 0x19 - FIELDS;
 
 /// The bool getter (game 0xCE8D20) as it should be in [`slot::GET`]: from the container's last
 /// object (or its root), at the `FProperty`'s offset (+0x4C).
@@ -261,6 +335,8 @@ pub struct Rows {
     add_property: AddPropertyFn,
     bool_table: &'static [*const c_void],
     enum_table: &'static [*const c_void],
+    /// `None` if not found (logged).
+    number_table: Option<&'static [*const c_void]>,
 }
 
 // SAFETY: code pointers and tables that live for the whole game; only used on the game thread.
@@ -281,6 +357,7 @@ impl Rows {
         ];
         let bool_table = table(
             &BOOL_PROPERTY,
+            None,
             (slot::GET, &BOOL_GET),
             &[
                 (slot::GET, get_bool as *const c_void),
@@ -290,6 +367,7 @@ impl Rows {
         )?;
         let enum_table = table(
             &ENUM_PROPERTY,
+            None,
             (slot::ITEMS, &ENUM_ITEMS),
             &[
                 (slot::GET, get_choice as *const c_void),
@@ -299,6 +377,22 @@ impl Rows {
             ],
             &shared,
         )?;
+        // Without it, only number rows are missing.
+        let number_table = table(
+            &NUMERIC_PROPERTY,
+            Some((slot::GET, &FLOAT_GET)),
+            // Not the range function: `property_limits` hooks it, which changes its first bytes.
+            (slot::GET, &FLOAT_GET),
+            &[
+                (slot::COMPARE_VALUES, compare_numbers as *const c_void),
+                (slot::GET, get_numbers as *const c_void),
+                (slot::SET, set_numbers as *const c_void),
+                (slot::RANGE, numbers_range as *const c_void),
+            ],
+            &shared,
+        )
+        .map_err(|reason| log!("no number rows: {reason}"))
+        .ok();
         // SAFETY: the functions found have these signatures (see their declarations).
         unsafe {
             Ok(Self {
@@ -306,6 +400,7 @@ impl Rows {
                 add_property: core::mem::transmute::<*const u8, AddPropertyFn>(add_property),
                 bool_table,
                 enum_table,
+                number_table,
             })
         }
     }
@@ -337,7 +432,13 @@ impl Rows {
         let table = match value {
             Value::Check(_) => self.bool_table,
             Value::List(_) => self.enum_table,
+            Value::Number(_) => self.number_table.ok_or("number rows aren't available")?,
         };
+        let mut fields = [0; FIELDS_SIZE];
+        if let Value::Number(number) = value {
+            fields[NUMBER_UNIT] = number.unit() as u8;
+            fields[NUMBER_UNIT_SET] = 1;
+        }
         let key = format!("EditorTweaks_{key}");
         let shared = Box::into_raw(Box::new(Shared {
             controller: Controller {
@@ -350,7 +451,7 @@ impl Rows {
                 vtable: table.as_ptr(),
                 field: core::ptr::null(),
                 name: kismet::string_to_name(&key)?,
-                functions: [0; 4],
+                fields: Fields(fields),
                 value,
                 changed,
                 texts,
@@ -363,6 +464,7 @@ impl Rows {
             key: OwnedFString::new(&key),
             name: texts.text(name),
             description: texts.text(description),
+            when: None,
         })
     }
 
@@ -427,14 +529,16 @@ unsafe fn show_as_dropdown(info: *mut u8) {
 
 /// Copies the game's table for `sig` with `overrides` and `shared` (ours) in place of the game's
 /// functions, after checking that the slot `check` holds what we expect (so the slots haven't
-/// moved). Identical copies of the table may be found: they must agree on every slot we keep.
+/// moved). With a `variant` (a slot and its shape), only the tables holding that shape there count
+/// (the typed variants of a class share its name). Identical copies of the table may be found:
+/// they must agree on every slot we keep.
 fn table(
     sig: &VtableSig,
+    variant: Option<(usize, &CodeShape)>,
     (checked, shape): (usize, &CodeShape),
     overrides: &[(usize, *const c_void)],
     shared: &[(usize, *const c_void)],
 ) -> Result<&'static [*const c_void], String> {
-    let found = sig.resolve()?;
     let ours = |index: usize| {
         overrides
             .iter()
@@ -444,7 +548,15 @@ fn table(
     };
     // SAFETY: each table found has `length` code pointers.
     let read = |table: *const *const u8| unsafe { core::slice::from_raw_parts(table, sig.length) };
-    let first = read(found[0]);
+    let found: Vec<_> = sig
+        .resolve()?
+        .into_iter()
+        .filter(|&table| variant.is_none_or(|(slot, shape)| shape.matches(read(table)[slot])))
+        .collect();
+    let Some(&first) = found.first() else {
+        return Err(format!("{}: no table of the variant wanted", sig.name));
+    };
+    let first = read(first);
     if !shape.matches(first[checked]) {
         return Err(format!("{}: slot {checked} isn't {}", sig.name, shape.name));
     }
@@ -468,6 +580,24 @@ pub struct Row {
     key: OwnedFString,
     name: Text,
     description: Text,
+    /// Whether the row is listed now (always without).
+    when: Option<fn() -> bool>,
+}
+
+impl Row {
+    /// The row, listed only while `when` says so (asked each time a panel lists its rows, on the
+    /// game thread).
+    pub fn when(self, when: fn() -> bool) -> Self {
+        Self {
+            when: Some(when),
+            ..self
+        }
+    }
+
+    /// Whether a panel listing its rows now lists this one.
+    pub fn is_listed(&self) -> bool {
+        self.when.is_none_or(|when| when())
+    }
 }
 
 // SAFETY: the row's game objects (the property, texts) are only used on the game thread.
@@ -524,17 +654,27 @@ fn texts() -> Result<&'static Texts, String> {
     Ok(TEXTS.get_or_init(|| found))
 }
 
+/// Where [`Property::fields`] starts, and its size: up to the end of a numeric property's
+/// attributes (value type +0x18, range +0x30, axis lock +0x68, another +0x80, "don't clamp"
+/// +0x98, each with its delegate; the last ends at +0xB0).
+const FIELDS: usize = 0x18;
+const FIELDS_SIZE: usize = 0xB0 - FIELDS;
+
+/// [`Property::fields`], aligned like the pointers in it.
+#[repr(C, align(8))]
+struct Fields([u8; FIELDS_SIZE]);
+
 /// A brick property of ours: the game's layout (its table, the `FProperty` it would edit, its name,
-/// and for an enum the functions giving its items and checking values), then what our functions
-/// need.
+/// and its type's own fields), then what our functions need.
 #[repr(C)]
 struct Property {
     vtable: *const *const c_void,
     /// None: our functions never touch a game field.
     field: *const c_void,
     name: FName,
-    /// An enum's `TFunction`s, empty: we replaced the functions calling them.
-    functions: [usize; 4],
+    /// The type's own fields, zeros (empty, unset) but for a number's value type: an enum's
+    /// `TFunction`s (we replaced the functions calling them), a number's attributes.
+    fields: Fields,
     value: Value,
     changed: fn(),
     /// For a list's items' names, made each time it's listed.
@@ -542,6 +682,8 @@ struct Property {
     /// An empty text, for the list items' other texts.
     empty: &'static Text,
 }
+
+const _: () = assert!(core::mem::offset_of!(Property, fields) == FIELDS);
 
 unsafe extern "C" fn destroy(this: *mut Property, _flags: u32) -> *mut Property {
     this
@@ -679,6 +821,88 @@ unsafe extern "C" fn choice_items(
             name.release();
         }
     }
+}
+
+unsafe extern "C" fn compare_numbers(
+    _this: *const Property,
+    a: *const Numbers,
+    b: *const Numbers,
+) -> bool {
+    // SAFETY: the game passes two values of the property's type.
+    unsafe { *a == *b }
+}
+
+unsafe extern "C" fn get_numbers(
+    this: *const Property,
+    _container: *const c_void,
+    out: *mut Numbers,
+) -> bool {
+    // SAFETY: `this` is one of our properties, `out` room for a value.
+    unsafe {
+        let Value::Number(number) = (*this).value else {
+            return false;
+        };
+        let values = number.values();
+        let mut numbers = Numbers {
+            data: [0.0; MAX_COMPONENTS],
+            count: values.len().min(MAX_COMPONENTS) as u8,
+        };
+        for (slot, value) in numbers.data.iter_mut().zip(&values) {
+            *slot = *value;
+        }
+        out.write(numbers);
+    }
+    true
+}
+
+unsafe extern "C" fn set_numbers(
+    this: *const Property,
+    _container: *const c_void,
+    value: *const Numbers,
+) -> bool {
+    // SAFETY: `this` is one of our properties, `value` a value of its type.
+    let (property, value) = unsafe { (&*this, *value) };
+    let Value::Number(number) = property.value else {
+        return false;
+    };
+    let (min, max) = number.range();
+    let count = usize::from(value.count).min(MAX_COMPONENTS);
+    let values: Vec<f32> = value.data[..count]
+        .iter()
+        .map(|value| {
+            if value.is_nan() {
+                min
+            } else {
+                value.clamp(min, max)
+            }
+        })
+        .collect();
+    number.set_values(&values);
+    (property.changed)();
+    true
+}
+
+unsafe extern "C" fn numbers_range(
+    this: *const Property,
+    out: *mut NumbersRange,
+    _container: *const c_void,
+) -> *mut NumbersRange {
+    // SAFETY: `this` is one of our properties, `out` room for a range.
+    unsafe {
+        let (min, max) = match (*this).value {
+            Value::Number(number) => number.range(),
+            _ => (0.0, 1.0),
+        };
+        let ends = |value| Numbers {
+            data: [value; MAX_COMPONENTS],
+            count: MAX_COMPONENTS as u8,
+        };
+        out.write(NumbersRange {
+            min: ends(min),
+            max: ends(max),
+        });
+    }
+    out
 }
 
 /// Appends an item `value` named `name` to `items`, like the game's lists do (`TransmissionMode`'s,

@@ -124,7 +124,7 @@ fn start() -> Result<(), String> {
             .iter()
             .map(|&setting| settings_list::setting_row(setting))
             .collect::<Result<Vec<_>, _>>()?;
-        sections.push((kismet::string_to_text(section.title)?, rows));
+        sections.push((section.title, rows));
     }
     settings_list::add(CATEGORY, sections)?;
     let _ = OURS.set(Ours {
