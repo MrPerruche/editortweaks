@@ -11,13 +11,14 @@
 //! (`game::brick_materials`). The meshes are built at run time (`game::mesh_builder`), one per
 //! brick type and, for round shapes, scale. The brick itself shows the game's hidden
 //! material (dithered, as hidden bricks look): where it sticks out of its shapes, it doesn't
-//! collide, and a brick showing only that has no collision at all.
+//! collide, and a brick showing only that has no collision at all. The shapes are drawn 1 mm
+//! outward (`mesh::OUTSET`) so that faces on the brick's surface don't z-fight with it.
 //!
 //! Driven by `view_modes`' hooks: [`show`] after the game updates a brick in this view mode
 //! (switching to it, edits, moves), [`remove`] after it updates one in any other, [`keep_only`]
 //! after every change of the editor (deleted bricks), and [`after_tick`] every frame.
 
-mod mesh;
+pub(super) mod mesh;
 
 use std::collections::hash_map::DefaultHasher;
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -378,7 +379,7 @@ impl Code {
         if cached.is_some() {
             return cached;
         }
-        let built = mesh::triangles(shapes, mesh_scale);
+        let built = mesh::drawn(shapes, mesh_scale);
         log_type(static_mesh, "shapes", || {
             describe(shapes, scale, built.flat_hulls)
         });

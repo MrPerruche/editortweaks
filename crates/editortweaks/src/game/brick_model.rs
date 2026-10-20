@@ -177,15 +177,30 @@ impl BrickModels {
     /// `mesh` must be a live static mesh. Game thread only (PhysX meshes are made and released
     /// there).
     pub unsafe fn triangles(&self, mesh: *mut UObjectBase) -> Result<Triangles, String> {
-        // SAFETY: per the contract; offsets come from reflection (checked above), and the body
+        // SAFETY: per the contract; the offset comes from reflection (checked above), and the body
         // setup is live if not null.
-        let meshes = unsafe {
-            let body_setup = read::<*const u8>(mesh.cast(), self.body_setup);
+        unsafe {
+            let body_setup = read::<*mut UObjectBase>(mesh.cast(), self.body_setup);
             if body_setup.is_null() {
                 return Err("no body setup".into());
             }
-            read::<TArray<*const c_void>>(body_setup, self.tri_meshes)
-        };
+            self.triangles_of_body_setup(body_setup)
+        }
+    }
+
+    /// The triangles of `body_setup`'s complex collision, or why there are none. Bricks whose mesh
+    /// is made at run time (spinners) have a body setup of their own rather than their mesh's
+    /// (`Collision::body_setup_of`).
+    ///
+    /// # Safety
+    /// `body_setup` must be a live body setup. Game thread only (PhysX meshes are made and
+    /// released there).
+    pub unsafe fn triangles_of_body_setup(
+        &self,
+        body_setup: *mut UObjectBase,
+    ) -> Result<Triangles, String> {
+        // SAFETY: per the contract; the offset comes from reflection (checked in `find`).
+        let meshes = unsafe { read::<TArray<*const c_void>>(body_setup.cast(), self.tri_meshes) };
         if meshes.num <= 0 {
             return Err("no complex collision".into());
         }

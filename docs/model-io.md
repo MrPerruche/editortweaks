@@ -81,6 +81,7 @@ So references are a layer of our own, using the game's pieces where they are fre
 
 | Need | Plan |
 |---|---|
+| Reference fit | `fit`: distance from bricks to the reference models (a BVH), shown through a gradient texture read by U, subdivided where needed (conforming, with vertex normals), V scattered so the material's roughness texture reads as one value; `loft`: a spinner's surface, the visible cross-section swept along the arc found from its collision pieces (or those pieces joined up). See `docs/re/editor-view-modes.md`. |
 | See-through look | Models dithered (lit, textured, masked: no smearing) or smooth (translucent), a setting; images smooth. See `docs/re/references.md`. |
 | OBJ quirks | Blender 5 writes `usemtl` without a name for objects without a material; tobj rejects the whole file over it, so those lines are renamed to an unknown material first (`readers/obj.rs`). |
 | Showing | Components added to the **editor's own actor** (`AddComponentByClass`, as `game/mesh_component.rs` does): the editor hides every other actor's components each frame (`docs/re/map-in-editor.md`). No collision. |

@@ -70,6 +70,23 @@ see `editor-view-modes.md`) with the temporary move transform: while dragging, b
 their material moves them from the custom primitive data. A mesh with the brick's material and a
 copy of its custom primitive data moves along.
 
+The function's arguments (found 2026-10-19, BRMK 1.11.6 and game 1.11.7, its only two callers):
+`(UBrick* this, const TWeakObjectPtr<UBrickStaticMeshComponent>& Mesh, const FTransform& Place,
+const FTransform& Relative)`. `OnEditorMoveUpdate(const FTransform& Move)` passes `Move` as `Place`
+(game: the call at 0xCEFFD1); `UpdateBrickMaterial` passes the spawn place (`FRotator::Quaternion`
+of the spawn rotation, the spawn location, scale 1; game 0xD0F27B), so the hook always learns where
+the brick is drawn, in the editor root's space. `Relative` is `FTransform::Identity` from both.
+
+Correction (2026-10-19): in the shipping game the mesh component does move during a drag.
+`UBrickEditorMoveMode::TickMode` with flag 0x08 (game 0xD0D41B) gets the object's mesh (the shared
+weak pointer at +0x78), calls `SetRelativeLocationAndRotation` on it with the sanitized move place
+(0xD0D4C9), then the object's `OnEditorMoveUpdate` (vtable +0x300, `UBrick`'s at 0xCEFF80 for every
+brick class) with the same place. So components attached to the brick follow the drag by
+themselves; the material's move transform only matters for what the component doesn't show. The
+log of a drag (2026-10-19) also showed the primitive data function called a second time each
+frame, with the spawn place as `Place`, while the component stays at the move's place: during a
+drag, the component's own relative place is where the brick is, the `Place` argument isn't.
+
 ## Reading the shapes by reflection
 
 `UBodySetup::AggGeom` (`FKAggregateGeom`) and its element structs are reflected in the shipping
@@ -114,6 +131,20 @@ data (BRMK's ProceduralMeshComponent module imports
 `?Set@FDynamicPrimitiveUniformBuffer@@QEAAXAEBUFMatrix@@0AEBUFBoxSphereBounds@@1_N222@Z`): the
 material reads zeros, where brick materials expect the color, pattern and transform data.
 Static meshes are drawn from their scene proxy's own uniform buffer, which has it.
+
+They're still the cheap choice for materials that don't read custom primitive data: the Reference
+fit view mode's gradient material reads only UVs, so its meshes are procedural
+(`game/procedural_mesh.rs`, 2026-10-18). One reflected call fills a section from whole arrays:
+`UProceduralMeshComponent::CreateMeshSection_LinearColor(int32 SectionIndex, const
+TArray<FVector>& Vertices, const TArray<int32>& Triangles, const TArray<FVector>& Normals, const
+TArray<FVector2D>& UV0, ..., const TArray<FLinearColor>& VertexColors, const
+TArray<FProcMeshTangent>& Tangents, bool bCreateCollision)`, parameters found by name, the arrays
+borrowed (const references, only read), the ones not given left empty (no vertex colors, default
+tangents), no collision. Triangles in the same winding as static meshes (clockwise from the front);
+normals are ours (`model_io::fit`). The component is made like the static ones
+(`MeshComponents::create_of` with the `ProceduralMeshComponent` class). A static mesh built at run
+time costs about four reflected calls per vertex and one per triangle, then the build: on a
+1282-brick vehicle, seconds of game-thread time for the view mode.
 
 ### Static meshes built at run time
 
@@ -232,3 +263,10 @@ Pitfall (2026-10-12): `UPrimitiveComponent::CreateDynamicMaterialInstance(Index,
 instance. Given a brick's instance, it made nothing and handed back the game's cached instance,
 which every brick of that material and pattern shares: the first plain-look version copied the
 wheel's and spinner's parameters into it.
+
+### Z-fighting with the hidden brick (2026-10-19)
+
+The brick under the shapes shows the hidden material (dithered, opaque pixels write depth), so a
+shape face lying on the brick's surface z-fought with it. The shapes are now built 1 mm outward
+along every vertex normal (`collision/mesh.rs` `OUTSET`; the exact `triangles` stays for
+measuring). Not seen in game yet.

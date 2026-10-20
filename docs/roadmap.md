@@ -216,7 +216,14 @@ likely approach are first guesses, to be revised as the editor gets reverse engi
     default, references and bricks are never selected together, undo comes after the first
     prototype, and the map, images and models share one "References" panel section (the map
     is a reference too).
-  - View mode showing the distance between the model and the bricks (through `game/editor_view`).
+  - View mode showing the distance between the model and the bricks: built 2026-10-18 as the
+    "Reference fit" view mode (`features/view_modes/fit`, see `docs/re/editor-view-modes.md`):
+    smooth colors on a log scale, teal (0.01 cm) to dark red (1 km), no settings. Second round
+    (2026-10-18): faster (threads, procedural meshes), no seams, spinners. Ideas for later if it
+    reads badly: topographic lines (dark lines drawn into the gradient texture at each power of
+    ten), and crisp lines where a brick crosses the model (needs a signed distance to cut
+    triangles along the zero line). Drawing over the screen per pixel (the user's first idea)
+    needs a shader comparing two depths: not possible without a cooked pak.
   - Later: own undo (wanted), mirror across the editor's mirror plane, live reload on file change, a
     Windows file dialog (a drop-in folder listed in the panel first).
 - **Vehicle export as a 3D model** (asked 2026-10-16, deferred by the user until they have gathered

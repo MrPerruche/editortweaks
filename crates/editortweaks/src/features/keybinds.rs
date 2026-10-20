@@ -178,52 +178,41 @@ pub static KEEP_DRAGGING_SLIDERS: Keybind = Keybind::new(
     &["LeftAlt", "RightAlt"],
 );
 
-/// Every keybind, by section, in the order the settings list them.
-static SECTIONS: [Section; 8] = [
+/// Every keybind, by section, in the order the settings list them. The sections are the
+/// changelog's headers (those having keys).
+static SECTIONS: [Section; 5] = [
+    Section {
+        name: "IC_EditorTweaks_FastEditing",
+        title: "Fast editing",
+        keybinds: &[
+            &RESIZE_BRICKS,
+            &SNAP_RESIZE,
+            &MODEL_EDITING,
+            &LINE_POINT,
+            &NEXT_ORIENTATION,
+            &SLIDE_ALONG_LINE,
+            &CLEAR_LINE,
+        ],
+    },
+    Section {
+        name: "IC_EditorTweaks_UserInterface",
+        title: "User interface",
+        keybinds: &[&KEEP_DRAGGING_SLIDERS],
+    },
+    Section {
+        name: "IC_EditorTweaks_Building",
+        title: "Classic building & movement",
+        keybinds: &[&SLOW_MOVES, &SLOW_GIZMO_MOVES, &ORTHO_VIEW, &PAN_VIEW],
+    },
     Section {
         name: "IC_EditorTweaks_Selection",
         title: "Selection",
         keybinds: &[&DRAG_SELECT, &ADD_TO_DRAG_SELECTION],
     },
     Section {
-        name: "IC_EditorTweaks_FastEditing",
-        title: "Fast editing",
-        keybinds: &[
-            &RESIZE_BRICKS,
-            &MODEL_EDITING,
-            &SNAP_RESIZE,
-            &NEXT_ORIENTATION,
-        ],
-    },
-    Section {
-        name: "IC_EditorTweaks_Lines",
-        title: "Fast editing: lines",
-        keybinds: &[&LINE_POINT, &SLIDE_ALONG_LINE, &CLEAR_LINE],
-    },
-    Section {
-        name: "IC_EditorTweaks_SlowMovement",
-        title: "Slow movement",
-        keybinds: &[&SLOW_MOVES, &SLOW_GIZMO_MOVES],
-    },
-    Section {
-        name: "IC_EditorTweaks_View",
-        title: "View",
-        keybinds: &[&ORTHO_VIEW, &PAN_VIEW],
-    },
-    Section {
-        name: "IC_EditorTweaks_Map",
-        title: "Map",
-        keybinds: &[&SHOW_MAP],
-    },
-    Section {
         name: "IC_EditorTweaks_References",
         title: "References",
-        keybinds: &[&SHOW_REFERENCES],
-    },
-    Section {
-        name: "IC_EditorTweaks_Sliders",
-        title: "Sliders",
-        keybinds: &[&KEEP_DRAGGING_SLIDERS],
+        keybinds: &[&SHOW_MAP, &SHOW_REFERENCES],
     },
 ];
 

@@ -225,3 +225,87 @@ bricks sharing a type, place and rotation with another.
   (after every change, mirror mode on or off); anything else (selection, camera) needs its own
   trigger. Painting costs three reflected calls per brick; a view mode works out every brick's
   colors once per change (a few reflected calls per brick).
+
+## Reference fit: smooth colors without a shader (2026-10-18)
+
+The "Reference fit" view mode (`features/view_modes/fit`) colors bricks by their distance to the
+reference models, smoothly across each face. With no shaders of our own and no vertex colors in
+the materials we can use, the color goes through the texture coordinate: each vertex of a mesh of
+ours gets U = its distance on a log scale (`model_io::fit::scale_u`), and the mesh shows the
+references' lit textured material (the Bricksville sign's, `references::looks::textured`) with a
+4096 x 1 gradient texture generated at run time (`model_io::fit::gradient`, imported like any PNG).
+The GPU interpolates U across each triangle. U is kept on texel centers inside the scale (the gray
+texels at the end are for "no reference").
+
+Stripes (2026-10-18): the first versions showed nested dark, shiny, wavy bands along the lines of
+equal distance. Widening the gradient from 256 to 4096 texels (thinking it was point-sampled) didn't
+change them. The cause is the material: `M_LegacyProp_Master` takes its roughness from a fixed,
+non-parameter texture (`/Game/ThirdParty/Textures/Plastic_SmoothWorn_512_roughness`) read with the
+same UVs, and the sign's instance leaves the `bOverrideRoughness` static switch off (see
+`references.md`). With U following the distance, the worn-plastic smudges were stretched along the
+distance's contour lines. Fix without another material: the gradient is 1 texel tall and has no
+mips (`ImportBufferAsTexture2D` makes one), so V doesn't change its color; each vertex gets a V far
+from its neighbors' (`model_io::fit::scattered_v`, whole numbers up to 65472), which makes the GPU
+read the roughness texture from its smallest mip, one average value. Not seen in game yet.
+
+The mesh is subdivided where linear interpolation of U would be off by more than about a sixth of a
+power of ten (`model_io::fit::sample`, cells down to 0.5 cm, about 3000 triangles per brick at
+most), then made conforming (a triangle with a neighbor's midpoints on its edges becomes a fan from
+its center), so there are no color seams between patches split to different depths. Triangles whose
+corners' distances already bound what's inside (a distance changes by at most the way travelled)
+aren't measured inside at all, and each new vertex's search starts from its neighbors' distances.
+Measuring runs on threads of ours (the cores but two), only when a brick's place, surface or scale
+changes, or the references do.
+
+Like the Collision view mode, each brick gets a component attached to its own mesh component with
+the body setup scale (`Collision::scale_of`), and the brick shows its `HiddenMaterial` (returned by
+our `GetEditorMaterialOverride` hook for this mode). The component is a procedural mesh
+(`game/procedural_mesh.rs`, one reflected call per brick; see `collision-shapes.md`): the first
+version built static meshes, about half of 6 s on a 1282-brick vehicle. The surface is the brick's
+body setup (`Collision::body_setup_of`: its mesh's, or a spinner's own, made at run time with its
+mesh) read as complex collision (`game/brick_model.rs`), wound counterclockwise from outside, so
+reversed for the engine (told by its enclosed volume); without complex collision, its simple shapes;
+else its local box. Each fallback is logged once per mesh name. Spinners' simple shapes are convex
+pieces along the arc (`selection.md`); drawn as hulls they showed as overlapping blocks, not the
+smooth arc the spinner draws. When a body setup has only convex pieces that chain (each piece the
+cross-section at one step and at the next, point by point, the next piece starting where this one
+ends), the surface is swept through those sections instead (`model_io::loft::chained`), ends
+closed with a fan. Seen in game 2026-10-18: still looked like the collision, because the collision
+uses a coarser level of the shape's profile than the visible mesh. So now (`game/spinner_profiles.rs`)
+the mod asks the game's profile table for the spinner's shape (`SpinnerShape`, reflected), finds
+the arc from the collision pieces and the collision level's profile (each section is linear in the
+profile's radial coordinate: the slope gives its angle and the size, the offset the radii; the arc
+found must reproduce every collision point), and sweeps the visible level's profile along it, at
+64 steps a turn (`model_io::loft::reswept`). If the table or the fit fails, the joined collision
+sections stay (logged once per mesh). Not seen in game yet. Bricks are placed by their spawn location and rotation
+(`Places`), which are relative to the editor's root, the space references are placed in. Seen in
+game: works, wheels fit. Possible misfits: mirrored bricks (negative sizes; the scale is clamped
+positive).
+
+Moves update live (2026-10-19): while bricks are dragged, the game moves their mesh components
+(`collision-shapes.md`, "Moves are drawn by the material", correction), so our components, attached
+to them, follow by themselves. A brick's place for measuring is its mesh component's reflected
+`RelativeLocation`/`RelativeRotation` (relative to the editor's root, like the spawn place, which it
+equals at rest). The hook runs every frame of a drag, and the brick is measured again there. Its
+mesh keeps its colors until a newer measure is done, and every measure newer than the one shown is
+used, not only the latest (by the time one is done the brick has moved on): colors catch up with the
+drag, and nothing blinks. The worker measures only the latest place of each brick waiting.
+
+The first try took the place from the primitive data function's `Place` argument instead. The log
+of a drag (2026-10-19) showed the function called twice per frame for a dragged brick: with the
+move's place, then with the spawn place (the component staying at the move's place). Each frame's
+last job was then at the spawn place, so colors never changed, and placing our component at the
+argument's place pulled it back to the spawn place.
+
+Drawing over the screen instead (comparing, per pixel, where the bricks and the model are hit)
+would need a shader comparing two depths; without one it means ray tracing the screen on the CPU at
+a low resolution, redone whenever the camera moves, with a number that depends on the view angle.
+
+Same z-fight in Reference fit (2026-10-19): our mesh *is* the brick's surface, so once built, the
+brick's own mesh leaves the main and depth passes (`MeshComponents::set_drawn`, the reflected
+`SetRenderInMainPass` + `bRenderInDepthPass` of `docs/re/references.md`), restored when the brick
+leaves the view mode. Custom depth is untouched (the outline is copied to our component anyway),
+and bricks measured as their box only keep the dithered mesh. Seen in game 2026-10-19: spinners
+looked completely wrong, since with their own mesh gone only our swept stand-in showed. Now only
+bricks measured as their complex collision (exact) lose their mesh; spinners, simple shapes and
+boxes keep the dithered one. Why the spinners' swept surface looks wrong is still open.

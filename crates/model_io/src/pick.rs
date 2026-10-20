@@ -48,6 +48,17 @@ impl Shape {
         self.corners.is_empty()
     }
 
+    pub fn triangle_count(&self) -> usize {
+        self.corners.len()
+    }
+
+    /// Its triangles' corners.
+    pub fn triangles(&self) -> impl Iterator<Item = [[f32; 3]; 3]> + '_ {
+        self.corners
+            .iter()
+            .map(|triangle| triangle.map(|i| self.positions[i as usize]))
+    }
+
     /// The smallest box around the triangles, if any: `[min, max]`.
     pub fn bounds(&self) -> Option<[[f32; 3]; 2]> {
         self.bounds

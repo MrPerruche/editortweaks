@@ -7,7 +7,9 @@
 //! [`ImportSettings`].
 
 pub mod companions;
+pub mod fit;
 pub mod image;
+pub mod loft;
 pub mod model;
 pub mod pick;
 pub mod plane;

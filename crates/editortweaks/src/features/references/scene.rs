@@ -14,8 +14,13 @@
 //! custom depth the outline comes from (translucent ones), or draw a dotted one (dithered ones), so a
 //! selected see-through reference gets a copy of each of its meshes drawing nothing but that
 //! ([`Shown::update_outline`]), and its pieces are outlined only while opaque.
+//!
+//! The models' triangles, placed, are also what the "Reference fit" view mode measures bricks
+//! against ([`Scene::fit_triangles`]).
 
 use std::collections::VecDeque;
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
 use std::sync::mpsc::Sender;
 use std::time::{Duration, Instant};
@@ -154,6 +159,8 @@ struct Shown {
     opacity: f32,
     /// Hidden by the Hide key ([`Wanted::hidden`]).
     hidden: bool,
+    /// Shown by its own settings, whatever the Show references key says.
+    own_visible: bool,
     /// An image's width when built: its size scales from it.
     built_width: f64,
     pieces: Vec<Piece>,
@@ -226,7 +233,7 @@ impl Scene {
         Self {
             shown: Vec::new(),
             builds: VecDeque::new(),
-            see_through_look: looks::SeeThroughLook::Dithered,
+            see_through_look: looks::SeeThroughLook::Smooth,
         }
     }
 
@@ -301,6 +308,7 @@ impl Scene {
                     // SAFETY: per the contract.
                     unsafe { shown.update_materials(code, looks, editor) };
                 }
+                shown.own_visible = wanted.reference.visible;
                 continue;
             }
             let mut shown = Shown {
@@ -311,6 +319,7 @@ impl Scene {
                 placement: wanted.placement(0.0),
                 opacity: wanted.opacity(),
                 hidden: wanted.hidden,
+                own_visible: wanted.reference.visible,
                 built_width: 0.0,
                 pieces: Vec::new(),
                 materials: Vec::new(),
@@ -434,6 +443,45 @@ impl Scene {
 
     /// The shown reference `ray` (in the space of the editor's root) meets first, and how far along
     /// it (in units of its direction's length). Hidden references are left out.
+    /// A number that changes whenever [`Self::fit_triangles`] would.
+    pub fn fit_key(&self) -> u64 {
+        let mut hasher = DefaultHasher::new();
+        for shown in self.shown.iter().filter(|shown| shown.counts_for_fit()) {
+            shown.id.hash(&mut hasher);
+            shown.key.hash(&mut hasher);
+            shown.shape.triangle_count().hash(&mut hasher);
+            let placement = &shown.placement;
+            for value in placement
+                .position
+                .iter()
+                .chain(&placement.rotation)
+                .chain(&placement.full_scale())
+            {
+                value.to_bits().hash(&mut hasher);
+            }
+        }
+        hasher.finish()
+    }
+
+    /// The triangles of the models the "Reference fit" view mode measures bricks against
+    /// ([`Shown::counts_for_fit`]), where they're shown: in the editor root's space.
+    pub fn fit_triangles(&self) -> Vec<[[f32; 3]; 3]> {
+        let mut triangles = Vec::new();
+        for shown in self.shown.iter().filter(|shown| shown.counts_for_fit()) {
+            let placement = &shown.placement;
+            let rotation = Quat::from_rotator(placement.rotation);
+            let scale = placement.full_scale();
+            // As the engine places the components: `parent = Rotate(scale * local) + position`.
+            let place = |point: [f32; 3]| {
+                let scaled = core::array::from_fn(|axis| f64::from(point[axis]) * scale[axis]);
+                let turned = rotation.rotate(scaled);
+                core::array::from_fn(|axis| (turned[axis] + placement.position[axis]) as f32)
+            };
+            triangles.extend(shown.shape.triangles().map(|triangle| triangle.map(place)));
+        }
+        triangles
+    }
+
     pub fn pick(&self, ray: &Ray) -> Option<(&str, f64)> {
         self.shown
             .iter()
@@ -737,6 +785,17 @@ impl Shown {
                 }
             }
         }
+    }
+
+    /// Whether the "Reference fit" view mode measures against it: a model, fully built, shown by
+    /// its own settings (whatever the Show references key says) and not hidden by the Hide key.
+    fn counts_for_fit(&self) -> bool {
+        matches!(self.kind, Kind::Model)
+            && self.own_visible
+            && self.opacity > 0.0
+            && !self.hidden
+            && self.building.is_none()
+            && !self.shape.is_empty()
     }
 
     /// Whether the pieces themselves are outlined: while selected and opaque (see the module's

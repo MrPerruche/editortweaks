@@ -37,7 +37,13 @@ static switch on `HasBaseColorMap`, then tints by `Mask` channels behind the `Ha
 `HasBMask` switches (off by default). Static switches can't change in dynamic instances, so the
 instance used is the Bricksville sign's, which has `HasBaseColorMap` on: `BaseColor` set to the
 part's texture, `Normal` to `/Engine/EngineMaterials/DefaultNormal` (the sign's own normal map
-otherwise), `Metallic` 0; roughness comes from the master's default roughness texture. Only City2
+otherwise), `Metallic` 0; roughness comes from the master's roughness texture: a plain
+`TextureSample` (not a parameter) of `/Game/ThirdParty/Textures/Plastic_SmoothWorn_512_roughness`
+on the mesh's UVs, used while the `bOverrideRoughness` static switch is off, as on the sign (its
+static switches: only `HasBaseColorMap` on; `HasAOMap` and the mask ones off; checked 2026-10-18
+with UAssetGUI on BRMK's `M_LegacyProp_Master` and `M_Bricksville_Sign`). No other instance of the
+master overrides roughness. So textured parts get faint worn-plastic smudges on their UVs, and the
+Reference fit view mode works around it (`editor-view-modes.md`). Only City2
 loads the sign, so both are loaded by path (`game/assets.rs`, brickrust's `StaticLoadObject`) when
 a textured part first needs them. Texture alpha (cut-outs) is lost on these parts.
 
@@ -168,7 +174,17 @@ So references use an instance of `M_Character_Editor` with `Mask` and `Mask2` a 
 (imported at run time: the shirt everywhere, no face, no eyes), `Shirt_Texture` the part's texture
 (left at its default `WhiteSquareTexture` without one), `Shirt_Color` the part's color with alpha 1,
 `Normal` the flat `DefaultNormal`, metallic 0, roughness 0.6, `Opacity` the reference's (setting
-"See-through models", default Dithered; Smooth keeps the glass material). Not seen in game yet.
+"See-through models"; Smooth keeps the glass material).
+
+Seen in game 2026-10-19: dithered references looked covered in a stone/brick texture, not plain.
+That's the dither: `T_OpacityMask` (16 x 16, read from BRMK's source PNG) is a 4 x 4 ordered
+(Bayer) matrix of 4 x 4-pixel blocks, sampled 1:1 with screen pixels, so at partial opacity it
+draws a fixed grid of square tiles. `MF_OpacityMask` samples it with a plain `TextureSample` (no
+parameter, so instances can't swap it), and the six materials using the function (hidden objects,
+light frustums, characters, shockwaves, projectiles) all share it; nothing in the game's content
+uses the engine's `DitherTemporalAA`. So Smooth became the default and Dithered stays an option.
+The Smooth layer's own textures are plain (`Diffuse` and `Pattern` `WhiteSquareTexture`, `MRAO` and
+`Emissive` `T_WhiteMask`, `Normal` `BaseFlattenNormalMap`).
 Pieces are then outlined only while opaque: a dithered piece would draw a dotted custom depth,
 so the outline-only copies do it while see-through. The masks' sampler type is `Masks` (linear)
 and the imported texture is sRGB; 0 and 1 are the same either way, and shipping builds don't check

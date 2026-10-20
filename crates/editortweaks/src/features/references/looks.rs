@@ -12,12 +12,13 @@
 //!   No map needs to have loaded the sign: it's loaded when a textured part first needs it. If it
 //!   can't be, textured parts show unlit with the masked image material (no shading, no shadows).
 //! - See-through models, by the setting [`SEE_THROUGH_LOOK`]:
-//!   - Dithered (the default): the editor's see-through character material (`M_Character_Editor`,
-//!     lit, masked, its `Opacity` a screen-space dither). Its color is a shirt texture and color,
-//!     picked by two mask textures: a red one for both shows the shirt everywhere, so the part's
-//!     texture and color go there. Masked materials draw depth and motion like opaque ones, so
-//!     the engine's temporal anti-aliasing doesn't smear them as it does translucent ones.
-//!   - Smooth: the glass bricks' base material (`M_Brick_Translucent`, lit and translucent) with
+//!   - Dithered: the editor's see-through character material (`M_Character_Editor`, lit, masked,
+//!     its `Opacity` a screen-space dither). Its color is a shirt texture and color, picked by two
+//!     mask textures: a red one for both shows the shirt everywhere, so the part's texture and
+//!     color go there. Masked materials draw depth and motion like opaque ones, so the engine's
+//!     temporal anti-aliasing doesn't smear them as it does translucent ones. But the game's dither
+//!     is coarse (a 4 x 4 grid of 4 x 4-pixel blocks): the part looks covered in square tiles.
+//!   - Smooth (the default): the glass bricks' base material (`M_Brick_Translucent`, lit and translucent) with
 //!     its `Opacity` and `EdgeOpacity` set to the reference's opacity. It's a layered material: those
 //!     are parameters of its one layer, set as such ([`SEE_THROUGH_LAYER`]). It takes its color
 //!     from the component's custom primitive data, as bricks do ([`see_through_data`]), and projects
@@ -42,7 +43,7 @@ use crate::prelude::*;
 pub static SEE_THROUGH_LOOK: Choice = Choice::new(
     "ReferencesSeeThroughLook",
     "See-through models",
-    "How a reference model looks while see-through (opacity below 100%). Dithered: a pattern of dots, lit, with its textures, and steady while the camera moves (like hidden bricks). Smooth: really see-through, but the image smears while the camera moves; lit with each texture shown as its average color, or with its textures unlit (no shading). Images are always smooth.",
+    "How a reference model looks while see-through (opacity below 100%). Smooth: really see-through, but the image smears while the camera moves; lit with each texture shown as its average color, or with its textures unlit (no shading). Dithered: a coarse checker of square blocks (like hidden bricks), lit, with its textures, and steady while the camera moves. Images are always smooth.",
     &[
         Alternative {
             key: "Dithered",
@@ -57,7 +58,7 @@ pub static SEE_THROUGH_LOOK: Choice = Choice::new(
             name: "Smooth, textures unlit",
         },
     ],
-    0,
+    1,
 );
 
 /// The alternatives of [`SEE_THROUGH_LOOK`].
@@ -72,8 +73,9 @@ pub enum SeeThroughLook {
 pub fn see_through_look() -> SeeThroughLook {
     match SEE_THROUGH_LOOK.get() {
         1 => SeeThroughLook::Smooth,
+        0 => SeeThroughLook::Dithered,
         2 => SeeThroughLook::SmoothUnlit,
-        _ => SeeThroughLook::Dithered,
+        _ => SeeThroughLook::Smooth,
     }
 }
 

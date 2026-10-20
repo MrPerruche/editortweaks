@@ -3,8 +3,9 @@
 //! With nothing selected, in the References section after the map's rows
 //! (`features/map_in_editor/panel.rs`):
 //!
-//! - **Add image**, **Add model**: Link or Copy, each opening the Windows file dialog; the new
-//!   reference links to its file where it is, or copies it next to the vehicle.
+//! - **Add reference**: Image... or Model..., opening the Windows file dialog; the new reference
+//!   links to its file where it is, or copies it next to the vehicle, as the setting [`ADD_AS`]
+//!   says (the File row changes it afterwards).
 //! - **Select references** (the setting [`select::SELECTABLE`]), **Show references** (also a key,
 //!   `keybinds::SHOW_REFERENCES`) to hide them all for now, and **Hidden references** to show again
 //!   those made invisible (opacity 0, or hidden in the sidecar), which can't be clicked.
@@ -30,7 +31,7 @@ use model_io::space::{Axis, Pivot, Units};
 
 use super::{CODE, State, edit, files, select, state};
 use crate::features::settings_list;
-use crate::framework::settings::Setting;
+use crate::framework::settings::{Alternative, Choice, Setting};
 use crate::game::property_reflection::{Check, List, Number, Row, Unit, Value};
 use crate::prelude::*;
 
@@ -59,20 +60,31 @@ type RowSpec = (
     fn() -> bool,
 );
 
+/// Whether new references link to their file or copy it, a setting.
+pub static ADD_AS: Choice = Choice::new(
+    "ReferencesAddAs",
+    "New references",
+    "Whether a reference you add links to its file where it is, or copies it into the vehicle's folder, so moving or deleting the original doesn't lose it (on this PC only: copies aren't uploaded with the vehicle). The File row of a selected reference changes it afterwards.",
+    &[
+        Alternative {
+            key: "Link",
+            name: "Link to the file",
+        },
+        Alternative {
+            key: "Copy",
+            name: "Copy the file",
+        },
+    ],
+    0,
+);
+
 /// The rows with nothing selected, after the map's.
-const GENERAL: [RowSpec; 4] = [
+const GENERAL: [RowSpec; 3] = [
     (
-        "ReferencesAddImage",
-        "Add image",
-        ADD_IMAGE_DESCRIPTION,
-        Value::List(&ADD_IMAGE),
-        always,
-    ),
-    (
-        "ReferencesAddModel",
-        "Add model",
-        ADD_MODEL_DESCRIPTION,
-        Value::List(&ADD_MODEL),
+        "ReferencesAdd",
+        "Add reference",
+        ADD_DESCRIPTION,
+        Value::List(&ADD),
         always,
     ),
     (
@@ -91,11 +103,11 @@ const GENERAL: [RowSpec; 4] = [
     ),
 ];
 
-/// Where the setting [`select::SELECTABLE`] goes among [`GENERAL`]: after the Add rows.
-const SELECTABLE_AT: usize = 2;
+/// Where the setting [`select::SELECTABLE`] goes among [`GENERAL`]: after the Add row.
+const SELECTABLE_AT: usize = 1;
 
 /// The sections with references selected: their titles and rows.
-const SELECTED: [(&str, &[RowSpec]); 3] = [
+const SELECTED: [(&str, &[RowSpec]); 2] = [
     (
         "Reference",
         &[
@@ -113,11 +125,6 @@ const SELECTED: [(&str, &[RowSpec]); 3] = [
                 Value::List(&FILE),
                 always,
             ),
-        ],
-    ),
-    (
-        "Placement",
-        &[
             (
                 "ReferencePosition",
                 "Position",
@@ -223,8 +230,7 @@ fn always() -> bool {
     true
 }
 
-const ADD_IMAGE_DESCRIPTION: &str = "Add a picture (PNG or JPEG) to build after, such as a blueprint. Link: it shows the file where it is. Copy: the file is copied into the vehicle's folder, so moving or deleting the original doesn't lose it. It's placed behind the vehicle as seen from the front. Only you see it; the vehicle doesn't change.";
-const ADD_MODEL_DESCRIPTION: &str = "Add a 3D model (glTF, GLB, OBJ or STL) to build after. Link: it shows the file where it is. Copy: the file is copied into the vehicle's folder, so moving or deleting the original doesn't lose it. Only you see it; the vehicle doesn't change.";
+const ADD_DESCRIPTION: &str = "Add a picture (PNG or JPEG, such as a blueprint, placed behind the vehicle as seen from the front) or a 3D model (glTF, GLB, OBJ or STL) to build after. Whether it links to the file or copies it is the New references setting (Editor tweaks options). Only you see it; the vehicle doesn't change.";
 const HIDDEN_DESCRIPTION: &str =
     "Some references are invisible (opacity 0), so they can't be clicked: show them again.";
 const SHOWN_DESCRIPTION: &str = "Uncheck to make every reference invisible for now (also the Show references key, 2 by default); they come back as they were. Hide (H) hides the selected ones only, like bricks, until Unhide all (Alt + H).";
@@ -413,28 +419,27 @@ impl List for Buttons {
     }
 }
 
-/// Link or Copy, as the Add rows offer them.
-const ADD_LABELS: &[&str] = &["Link...", "Copy..."];
+/// The kinds the Add row offers, in order.
+const ADD_KINDS: [Kind; 2] = [Kind::Image, Kind::Model];
 
-static ADD_IMAGE: Buttons = Buttons {
-    labels: ADD_LABELS,
-    click: |index| browse(Kind::Image, index),
+static ADD: Buttons = Buttons {
+    labels: &["Image...", "Model..."],
+    click: |index| {
+        if let Some(&kind) = ADD_KINDS.get(index) {
+            browse(kind);
+        }
+    },
 };
 
-static ADD_MODEL: Buttons = Buttons {
-    labels: ADD_LABELS,
-    click: |index| browse(Kind::Model, index),
-};
-
-/// Opens the file dialog for a reference of `kind`, linked (`index` 0) or copied (1).
-fn browse(kind: Kind, index: usize) {
+/// Opens the file dialog for a reference of `kind`, linked or copied as [`ADD_AS`] says.
+fn browse(kind: Kind) {
     let Some(mut state) = state() else {
         return;
     };
     if state.browsing.is_some() {
         return;
     }
-    let mode = if index == 1 {
+    let mode = if ADD_AS.get() == 1 {
         SourceMode::Copy
     } else {
         SourceMode::Link

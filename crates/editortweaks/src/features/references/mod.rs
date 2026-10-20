@@ -15,11 +15,14 @@
 //! ([`keybinds::SHOW_REFERENCES`]). Neither is saved. An
 //! unsaved vehicle keeps its references in memory until its first save, and a Save As carries them
 //! over to the new folder ([`carry_over`]).
+//!
+//! The "Reference fit" view mode (`view_modes`) measures bricks against the model references
+//! ([`fit_key`], [`fit_triangles`]), and makes its material with [`looks`].
 
 mod edit;
 mod files;
 mod loading;
-mod looks;
+pub(crate) mod looks;
 mod panel;
 mod scene;
 mod select;
@@ -64,6 +67,7 @@ pub struct References;
 pub static SETTINGS: [Section; 1] = [Section {
     title: "References",
     settings: &[
+        crate::framework::settings::Setting::Choice(&panel::ADD_AS),
         crate::framework::settings::Setting::Toggle(&select::SELECTABLE),
         crate::framework::settings::Setting::Choice(&looks::SEE_THROUGH_LOOK),
     ],
@@ -279,6 +283,21 @@ fn state() -> Option<MutexGuard<'static, State>> {
             None
         }
     }
+}
+
+/// A number that changes whenever [`fit_triangles`] would; `None` while the references are busy
+/// (in one of our ticks). Game thread only.
+pub fn fit_key() -> Option<u64> {
+    let state = STATE.try_lock().ok()?;
+    Some(state.scene.fit_key())
+}
+
+/// The triangles of the model references that bricks are measured against in the "Reference fit"
+/// view mode, in the editor root's space: those shown by their own settings and not hidden by the
+/// Hide key. `None` while the references are busy. Game thread only.
+pub fn fit_triangles() -> Option<Vec<[[f32; 3]; 3]>> {
+    let state = STATE.try_lock().ok()?;
+    Some(state.scene.fit_triangles())
 }
 
 impl Feature for References {

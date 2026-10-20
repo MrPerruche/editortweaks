@@ -71,8 +71,13 @@ pub const PRIMITIVE_DATA: FunctionSig = FunctionSig {
     pattern: "0f b6 41 ?? 49 8b f1 24 18 4d 8b f0 48 8b fa 48 8b d9 3c 08 0f 85 ?? ?? ?? ?? e8 ?? ?? ?? ?? 3c 02 0f 85",
 };
 
-/// `component` points to the brick's shared weak pointer to its mesh; the two transforms are passed
-/// through untouched.
+/// `component` points to the brick's shared weak pointer to its mesh. `transform` is an
+/// `FTransform` (`editor_object::Transform`): where the brick is drawn, in the editor root's space.
+/// It's the brick's spawn place from `UBrick::UpdateBrickMaterial` (with scale 1), the move's place
+/// from `UBrick::OnEditorMoveUpdate` while a move is dragged (after the move mode moved the brick's
+/// mesh component there). During a drag it's also called with the spawn place each frame, so the
+/// mesh component's own place, not `transform`, is where the brick is (`docs/re/collision-shapes.md`).
+/// `relative` is `FTransform::Identity` from both (the only callers, BRMK 1.11.6 and game 1.11.7).
 pub type PrimitiveDataFn = unsafe extern "C" fn(
     brick: *mut UObjectBase,
     component: *const c_void,

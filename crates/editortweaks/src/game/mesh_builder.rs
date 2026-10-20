@@ -346,7 +346,7 @@ fn valid(id: ElementId) -> Option<ElementId> {
 }
 
 /// A `TArray` pointing into `values`, for a `const TArray&` parameter: the callee must only read it.
-fn borrow<T>(values: &[T]) -> TArray<T> {
+pub fn borrow<T>(values: &[T]) -> TArray<T> {
     TArray {
         data: values.as_ptr().cast_mut(),
         num: values.len() as i32,

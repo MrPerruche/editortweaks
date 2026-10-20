@@ -140,7 +140,17 @@ picked when it touches it, lies inside, or has its center inside (a setting):
   without a body setup (the first version's log: "picked by its box: no body setup"). A click
   hits `SpinnerBodySetup` instead: `FindOrCreateSpinnerBodySetup`'s builder (BRMK 0x478B90) fills
   `ConvexElems` only, one piece per arc step (the cross-section at two angles), at the spinner's
-  size, and creates it (BRMK 0x478210, game 0xF4EC80) with `CollisionTraceFlag` (BRMK +0x3D, game
+  size (read 2026-10-18: params +0x00 profile index into the table at BRMK 0x493CE0, which the
+  visible mesh's builder 0x479220 reads too, +0x04/+0x08 sizes in m, +0x0C/+0x10 the two radii,
+  +0x14 the angle, +0x1C the step count N; the profile is turned by a quarter-turn count. For step
+  i, each profile point (px, py) gives `(-sin t (R1 + px SX), cos t (R2 + px SX), py SY)` at t = i
+  and i + 1 steps, stored one after the other: `VertexData` is `[a0, b0, a1, b1, ...]`, and piece i
+  + 1 starts with piece i's `b`s. The table: `0x493CE0(uint8 shape, int32* quarter_turns)` (game
+  RVA 0xF5AD90, `game/spinner_profiles.rs`) maps shapes 2..11 to a base shape and a turn, builds a
+  global map on first use (BRMK 0x48F090) and returns the shape's entry: a `TArray` of levels (0x18
+  bytes each, a `TArray` of 0x14-byte points, x and y first) and at +0x10 the level the collision
+  uses; the visible mesh's LOD i is level i, so it has more detail than the collision; shipping
+  returns 8 for an unknown shape), and creates it (BRMK 0x478210, game 0xF4EC80) with `CollisionTraceFlag` (BRMK +0x3D, game
   +0x31) = 2, `CTF_UseSimpleAsComplex`, and `bGenerateMirroredCollision` cleared. The mod reads
   the pieces (`game::collision`), makes their faces (`math::hull`) and places them unscaled at the
   brick; its box (`CalcSpinnerMeshBounds`, worked out from the arc) only checks them loosely.

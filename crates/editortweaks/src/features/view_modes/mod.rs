@@ -3,12 +3,14 @@
 //!
 //! - "Mirror" ([`mirror`]): what each brick has at its mirror image, as mirror mode sees it;
 //! - "Duplicates" ([`duplicates`]): bricks sharing their place with copies of themselves;
-//! - "Collision" ([`collision`]): bricks' collision shapes, with their own materials.
+//! - "Collision" ([`collision`]): bricks' collision shapes, with their own materials;
+//! - "Reference fit" ([`fit`]): bricks colored by how far they are from the reference models.
 //!
 //! How (`game::editor_view`): each one is a new entry of the game's view mode enum, which the view
 //! mode cycle reads. In the coloring ones, bricks get the material of the game's group view modes
 //! (hooking `GetEditorMaterialOverride`) and our colors in its custom primitive data (after the
-//! function writing the game's). Collision keeps the bricks' materials and adds meshes. A view mode works out every brick's colors at once ([`Coloring`]), kept
+//! function writing the game's). Collision keeps the bricks' materials and adds meshes; Reference fit
+//! gives bricks the hidden material and adds meshes. A view mode works out every brick's colors at once ([`Coloring`]), kept
 //! until the editor changes: after every change the editor re-pairs mirrored bricks
 //! (`UpdateMirroredObjects`), and then bricks whose colors changed are repainted. The game names
 //! view modes from a fixed list, so ours are added to it: the panel's list shows them, and their
@@ -16,6 +18,7 @@
 
 mod collision;
 mod duplicates;
+mod fit;
 mod mirror;
 
 use std::collections::{BTreeMap, HashMap};
@@ -46,10 +49,11 @@ const GRAY: [f32; 3] = [0.2, 0.2, 0.2];
 const PLAIN: Colors = [GRAY, GRAY];
 
 /// Our view modes, in the order Z cycles through them: each one's name and how to make it.
-const MODES: [(&str, NewLook); 3] = [
+const MODES: [(&str, NewLook); 4] = [
     ("Mirror", || mirror::new().map(Look::Colors)),
     ("Duplicates", || duplicates::new().map(Look::Colors)),
     ("Collision", || collision::find().map(|()| Look::Collision)),
+    ("Reference fit", || fit::find().map(|()| Look::Fit)),
 ];
 
 /// Makes a view mode's [`Look`] (after engine init), or tells why it can't.
@@ -61,6 +65,8 @@ enum Look {
     Colors(Box<dyn Coloring>),
     /// Their collision shapes, with their own materials ([`collision`]).
     Collision,
+    /// Colored by their distance to the reference models, over the hidden material ([`fit`]).
+    Fit,
 }
 
 /// How one of our view modes colors bricks.
@@ -198,6 +204,10 @@ impl Feature for ViewModes {
         if let Err(reason) = brick_editor::after_tick(collision::after_tick) {
             log!("collision shapes won't be outlined: {reason}");
         }
+        // Without it, the reference fit view mode shows no colors.
+        if let Err(reason) = brick_editor::after_tick(fit::after_tick) {
+            log!("the reference fit won't show: {reason}");
+        }
         Ok(())
     }
 
@@ -291,10 +301,12 @@ unsafe extern "C" fn material_override(brick: *mut UObjectBase) -> *mut UObjectB
             return material;
         }
         match shown(brick) {
-            Some((code, views, view)) if matches!(view.look, Look::Colors(_)) => {
-                views.bricks.color_material(code, brick)
-            }
-            _ => material,
+            Some((code, views, view)) => match view.look {
+                Look::Colors(_) => views.bricks.color_material(code, brick),
+                Look::Fit => views.bricks.hidden_material(code, brick),
+                Look::Collision => material,
+            },
+            None => material,
         }
     }
 }
@@ -313,11 +325,22 @@ unsafe extern "C" fn primitive_data(
             Some((code, views, view)) => match view.look {
                 Look::Colors(_) => {
                     collision::remove(brick);
+                    fit::remove(brick);
                     views.paint(code, view, brick);
                 }
-                Look::Collision => collision::show(code, &views.bricks, brick),
+                Look::Collision => {
+                    fit::remove(brick);
+                    collision::show(code, &views.bricks, brick);
+                }
+                Look::Fit => {
+                    collision::remove(brick);
+                    fit::show(code, brick);
+                }
             },
-            None => collision::remove(brick),
+            None => {
+                collision::remove(brick);
+                fit::remove(brick);
+            }
         }
     }
 }
@@ -445,17 +468,25 @@ impl Views {
                 .first()
                 .and_then(|&first| code.view_mode(first))
                 .and_then(|value| self.view(value));
-            if let Some(View {
-                look: Look::Collision,
-                ..
-            }) = view
-            {
-                // Deleted bricks lose their shapes, changed ones get new ones.
-                collision::keep_only(&bricks);
-                collision::refresh(code, &self.bricks, &bricks);
-                return;
+            match view.map(|view| &view.look) {
+                Some(Look::Collision) => {
+                    // Deleted bricks lose their shapes, changed ones get new ones.
+                    fit::keep_only(&[]);
+                    collision::keep_only(&bricks);
+                    collision::refresh(code, &self.bricks, &bricks);
+                    return;
+                }
+                Some(Look::Fit) => {
+                    // Deleted bricks lose their colors, moved ones are measured again.
+                    collision::keep_only(&[]);
+                    fit::keep_only(&bricks);
+                    fit::refresh(code, &bricks);
+                    return;
+                }
+                _ => {}
             }
             collision::keep_only(&[]);
+            fit::keep_only(&[]);
             let Some(view) = view else {
                 return;
             };

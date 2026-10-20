@@ -149,7 +149,8 @@ mouse button for drag select). Their
 categories: a top one, `IC_EditorTweaks` ("Editor tweaks"), which the mod adds to
 `InputCategories` after each load, right after `IC_BrickEditor` (last if that isn't there); and
 inside it one subcategory per section (`IC_EditorTweaks_FastEditing`, ...), its `SortPriority`
-giving the sections' order. Until 2026-10-14 they were a single subcategory of `IC_BrickEditor`.
+giving the sections' order (since 2026-10-19 the sections follow the changelog's headers: Fast
+editing, User interface, Classic building & movement, Selection, References). Until 2026-10-14 they were a single subcategory of `IC_BrickEditor`.
 The selected category (`UBrickUserSettings::InputCategory`) isn't saved in the config files, so
 categories made at run time leave nothing behind.
 

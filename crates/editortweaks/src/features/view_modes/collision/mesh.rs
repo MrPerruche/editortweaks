@@ -20,6 +20,11 @@ const STEPS: u32 = 16;
 /// UV units per centimeter: one per meter, planar on each face.
 const UV_SCALE: f64 = 0.01;
 
+/// How far (cm) every face is pushed out along its normal. The brick under the shapes shows the
+/// hidden material, which would z-fight with a shape face lying on the brick's surface; this puts
+/// the shapes just in front. Too small to see, and to matter for what sticks out.
+const OUTSET: f64 = 0.1;
+
 /// The smallest radius and cylinder length the engine gives a scaled capsule
 /// (`FKSphylElem::GetScaledRadius`, `GetScaledCylinderLength`).
 const MIN_CAPSULE: f64 = 0.1;
@@ -41,7 +46,16 @@ pub fn scales_linearly(shapes: &Shapes) -> bool {
 
 /// The triangles of `shapes` scaled by `scale`, in the space of a component scaled by `scale`.
 pub fn triangles(shapes: &Shapes, scale: Vector) -> Built {
-    let mut mesh = Mesh::new(math::widen(scale));
+    build(shapes, scale, 0.0)
+}
+
+/// Like [`triangles`], with every face pushed out by [`OUTSET`], to show over the brick.
+pub fn drawn(shapes: &Shapes, scale: Vector) -> Built {
+    build(shapes, scale, OUTSET)
+}
+
+fn build(shapes: &Shapes, scale: Vector, outset: f64) -> Built {
+    let mut mesh = Mesh::new(math::widen(scale), outset);
     for shape in &shapes.boxes {
         mesh.add_box(shape);
     }
@@ -67,20 +81,24 @@ pub fn triangles(shapes: &Shapes, scale: Vector) -> Built {
 struct Mesh {
     triangles: Triangles,
     scale: Vec3,
+    /// How far (cm) vertices are pushed out along their normals.
+    outset: f64,
 }
 
 impl Mesh {
-    fn new(scale: Vec3) -> Self {
+    fn new(scale: Vec3, outset: f64) -> Self {
         Self {
             triangles: Triangles::default(),
             scale,
+            outset,
         }
     }
 
-    /// Adds a vertex given in the scaled space, with the direction its surface faces (for its UVs),
-    /// and returns its index.
+    /// Adds a vertex given in the scaled space, with the direction its surface faces (for its UVs
+    /// and the outset), and returns its index.
     fn vertex(&mut self, position: Vec3, normal: Vec3) -> u32 {
-        let local: Vec3 = core::array::from_fn(|axis| position[axis] / self.scale[axis]);
+        let out = math::add(position, math::scale(normal, self.outset));
+        let local: Vec3 = core::array::from_fn(|axis| out[axis] / self.scale[axis]);
         let triangles = &mut self.triangles;
         triangles.positions.push(math::narrow(local));
         let [u, v] = planar_uv(position, normal);
@@ -308,6 +326,24 @@ mod tests {
         let built = triangles(&unit_box(), [1.0; 3]);
         assert_eq!(built.triangles.corners.len(), 12);
         assert!((volume(&built.triangles) - 8.0).abs() < 1e-5);
+    }
+
+    #[test]
+    fn drawn_box_is_pushed_out_on_every_face() {
+        let exact = triangles(&unit_box(), [1.0; 3]).triangles;
+        let pushed = drawn(&unit_box(), [1.0; 3]).triangles;
+        assert_eq!(pushed.corners, exact.corners);
+        for (a, b) in exact.positions.iter().zip(&pushed.positions) {
+            // Each vertex has one face's normal: one axis moves, away from the center.
+            let moved: Vec<f64> = (0..3).map(|i| f64::from(b[i] - a[i])).collect();
+            assert_eq!(moved.iter().filter(|m| m.abs() > 1e-6).count(), 1);
+            assert!(
+                moved
+                    .iter()
+                    .all(|m| m.abs() < 1e-6 || (m.abs() - OUTSET).abs() < 1e-6)
+            );
+            assert!((0..3).all(|i| b[i].abs() >= a[i].abs()));
+        }
     }
 
     #[test]

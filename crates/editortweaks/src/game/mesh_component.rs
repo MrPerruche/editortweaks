@@ -1,4 +1,5 @@
-//! Extra meshes in the 3D view: `UStaticMeshComponent`s added to an actor at run time
+//! Extra meshes in the 3D view: `UStaticMeshComponent`s (or other primitive components, see
+//! [`MeshComponents::create_of`]) added to an actor at run time
 //! (`AActor::AddComponentByClass`) and attached to another component (`K2_AttachToComponent`), so
 //! they follow it; without collision. All through reflection; found by name in game 1.11.7 (build
 //! 25831956), see `docs/re/collision-shapes.md`.
@@ -55,6 +56,10 @@ pub struct MeshComponents {
     /// `USceneComponent::K2_SetRelativeTransform(const FTransform& NewTransform, bool bSweep,
     /// FHitResult& SweepHitResult, bool bTeleport)`: the others stay zero (no sweep).
     set_transform: SingleCall,
+    /// Offsets of `USceneComponent::RelativeLocation` (`FVector`) and `RelativeRotation`
+    /// (`FRotator`).
+    relative_location: usize,
+    relative_rotation: usize,
     /// `USceneComponent::SetVisibility(bool bNewVisibility, bool bPropagateToChildren)`.
     set_visible: SingleCall,
     /// `bool UStaticMeshComponent::SetStaticMesh(UStaticMesh* NewMesh)`.
@@ -205,6 +210,18 @@ impl MeshComponents {
                 "StructProperty",
                 size_of::<Transform>() as i32,
             )?,
+            relative_location: reflection::field_offset(
+                scene,
+                "RelativeLocation",
+                "StructProperty",
+                12,
+            )?,
+            relative_rotation: reflection::field_offset(
+                scene,
+                "RelativeRotation",
+                "StructProperty",
+                12,
+            )?,
             set_visible: SingleCall::find(
                 scene,
                 "SetVisibility",
@@ -283,16 +300,33 @@ impl MeshComponents {
     /// # Safety
     /// `component` must be a live primitive component, still in the main pass. Game thread only.
     pub unsafe fn outline_only(&self, component: *mut UObjectBase) -> bool {
+        // SAFETY: per the contract.
+        if !unsafe { self.set_drawn(component, false) } {
+            return false;
+        }
+        if let Some(outline_only) = &self.outline_only {
+            // SAFETY: per the contract.
+            unsafe { outline_only.shadow.call(component, false) };
+        }
+        true
+    }
+
+    /// Takes `component` out of the view's main pass and depth prepass (`drawn` false), or puts it
+    /// back (true). Its shadow and custom depth (the outline) are left as they are. Whether it
+    /// could.
+    ///
+    /// # Safety
+    /// `component` must be a live primitive component. Game thread only.
+    pub unsafe fn set_drawn(&self, component: *mut UObjectBase, drawn: bool) -> bool {
         let Some(outline_only) = &self.outline_only else {
             return false;
         };
-        // SAFETY: per the contract; the field's offset comes from reflection. The depth pass is
-        // left first: leaving the main pass then rebuilds the component's render state, which
-        // reads both.
+        // SAFETY: per the contract; the field's offset comes from reflection. The depth pass goes
+        // first: changing the main pass then rebuilds the component's render state, which reads
+        // both.
         unsafe {
-            outline_only.depth_pass.set(component.cast(), false);
-            outline_only.main_pass.call(component, false);
-            outline_only.shadow.call(component, false);
+            outline_only.depth_pass.set(component.cast(), drawn);
+            outline_only.main_pass.call(component, drawn);
         }
         true
     }
@@ -309,6 +343,28 @@ impl MeshComponents {
         mesh: *mut UObjectBase,
         scale: Vector,
     ) -> Option<*mut UObjectBase> {
+        // SAFETY: per the contract.
+        unsafe {
+            let component = self.create_of(self.class, parent, scale)?;
+            self.set_mesh(component, mesh);
+            self.check_custom_data(component);
+            Some(component)
+        }
+    }
+
+    /// A new primitive component of `class` (e.g. a procedural mesh component), attached to
+    /// `parent` (a scene component) without offset, scaled by `scale`, owned by `parent`'s actor,
+    /// without collision; `None` if the engine made none.
+    ///
+    /// # Safety
+    /// `parent` must be a live scene component and `class` a primitive component class. Game
+    /// thread only.
+    pub unsafe fn create_of(
+        &self,
+        class: *const UClass,
+        parent: *mut UObjectBase,
+        scale: Vector,
+    ) -> Option<*mut UObjectBase> {
         // SAFETY: per the contract; each call gets its parameters at their reflected offsets.
         unsafe {
             let actor = self.owner.call(parent);
@@ -317,7 +373,7 @@ impl MeshComponents {
             }
             let call = &self.add_component;
             let mut parameters = Parameters::new();
-            put(&mut parameters, call.class, self.class);
+            put(&mut parameters, call.class, class);
             // Attached below, to `parent` rather than to the actor's root.
             put(&mut parameters, call.manual, true);
             let [x, y, z] = scale;
@@ -337,8 +393,6 @@ impl MeshComponents {
             }
             self.set_collision.call(component, NO_COLLISION);
             self.attach.call(component, parent);
-            self.set_mesh(component, mesh);
-            self.check_custom_data(component);
             Some(component)
         }
     }
@@ -369,6 +423,20 @@ impl MeshComponents {
     pub unsafe fn set_transform(&self, component: *mut UObjectBase, transform: Transform) {
         // SAFETY: per the contract; the parameter is an `FTransform`.
         unsafe { self.set_transform.call(component, transform) };
+    }
+
+    /// Where `component` is relative to what it's attached to: its location and rotation (a
+    /// rotator).
+    ///
+    /// # Safety
+    /// `component` must be a live scene component. Game thread only.
+    pub unsafe fn relative_place(&self, component: *mut UObjectBase) -> (Vector, Vector) {
+        // SAFETY: per the contract; both offsets come from reflection, `FVector` and `FRotator`
+        // are three floats.
+        unsafe {
+            let field = |offset: usize| component.cast::<u8>().add(offset).cast::<Vector>().read();
+            (field(self.relative_location), field(self.relative_rotation))
+        }
     }
 
     /// Shows or hides `component`.
