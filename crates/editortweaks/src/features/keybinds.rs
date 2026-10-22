@@ -178,6 +178,14 @@ pub static KEEP_DRAGGING_SLIDERS: Keybind = Keybind::new(
     &["LeftAlt", "RightAlt"],
 );
 
+/// Shows more in the shot preview's tooltips while held (`gun_preview`).
+pub static EXTENDED_TOOLTIP: Keybind = Keybind::new(
+    "EditorTweaks_ExtendedTooltip",
+    "Extended tooltip information",
+    "Hold to show everything the shot preview's tooltips can tell, instead of the essentials.",
+    &["LeftShift", "RightShift"],
+);
+
 /// Every keybind, by section, in the order the settings list them. The sections are the
 /// changelog's headers (those having keys).
 static SECTIONS: [Section; 5] = [
@@ -197,7 +205,7 @@ static SECTIONS: [Section; 5] = [
     Section {
         name: "IC_EditorTweaks_UserInterface",
         title: "User interface",
-        keybinds: &[&KEEP_DRAGGING_SLIDERS],
+        keybinds: &[&KEEP_DRAGGING_SLIDERS, &EXTENDED_TOOLTIP],
     },
     Section {
         name: "IC_EditorTweaks_Building",
@@ -282,6 +290,38 @@ impl Keybind {
         }
     }
 
+    /// The key it's bound to, for people: its first binding, e.g. "Shift" or "Ctrl+Q" (its first
+    /// default key if the bindings can't be read). Game thread only.
+    pub fn key_label(&self) -> String {
+        self.first_bound().unwrap_or_else(|| {
+            let key = DefaultKey::parse(self.keys.first().copied().unwrap_or_default());
+            chord_label(key.key, &key.modifiers)
+        })
+    }
+
+    /// [`Self::key_label`] of its first binding, if the bindings can be read.
+    fn first_bound(&self) -> Option<String> {
+        let action = *self.action.get()?;
+        let players = PLAYERS.get()?;
+        // SAFETY: on the game thread, per `key_label`'s contract; the input is the local player's.
+        unsafe {
+            let input = players.local()?;
+            let mut first = None;
+            players.chords(input, action, |chord| {
+                if first.is_none() {
+                    let modifiers = Modifiers {
+                        shift: chord.shift,
+                        ctrl: chord.ctrl,
+                        alt: chord.alt,
+                        cmd: chord.cmd,
+                    };
+                    first = Some(chord_label(&chord.key.to_string(), &modifiers));
+                }
+            });
+            first
+        }
+    }
+
     /// Whether a key it's bound to is held, if the bindings can be read.
     fn bound_held(&self) -> Option<bool> {
         let action = *self.action.get()?;
@@ -325,6 +365,46 @@ fn is_chord_held(chord: &Chord) -> bool {
         cmd: chord.cmd,
     };
     modifiers_held(&modifiers) && key_held(&chord.key.to_string())
+}
+
+/// A key Unreal calls `key` with the modifier keys `modifiers`, for people: "Ctrl+Left Mouse
+/// Button", "Shift" (either side's).
+fn chord_label(key: &str, modifiers: &Modifiers) -> String {
+    let mut label = String::new();
+    for (needed, name) in [
+        (modifiers.ctrl, "Ctrl"),
+        (modifiers.alt, "Alt"),
+        (modifiers.shift, "Shift"),
+        (modifiers.cmd, "Win"),
+    ] {
+        if needed {
+            label += name;
+            label.push('+');
+        }
+    }
+    let side = key
+        .strip_prefix("Left")
+        .or_else(|| key.strip_prefix("Right"));
+    let name = match side.unwrap_or(key) {
+        "Shift" => "Shift",
+        "Control" => "Ctrl",
+        "Alt" => "Alt",
+        "Command" => "Win",
+        "SpaceBar" => "Space",
+        _ => "",
+    };
+    if name.is_empty() {
+        // Words apart: "RightMouseButton" is "Right Mouse Button".
+        for (index, letter) in key.chars().enumerate() {
+            if index > 0 && letter.is_uppercase() && !label.ends_with(' ') {
+                label.push(' ');
+            }
+            label.push(letter);
+        }
+    } else {
+        label += name;
+    }
+    label
 }
 
 /// Whether the modifier keys `needed` are held (others may be too).

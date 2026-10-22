@@ -4,9 +4,11 @@
 //! rendering are not. Found through BRMK 1.11.6's engine module, then in game 1.11.7 (build
 //! 25831956); see `docs/re/editor-operations.md`.
 //!
-//! Lines are kept until replaced ([`LineBatcher::replace`]): the batcher only drops lines with a
-//! positive lifetime, and ours have none. The batcher holds a single list, so each feature's lines
-//! are kept apart here (by the feature's name) and drawn together.
+//! The batcher's own tick only drops lines with a positive lifetime, and ours have none, yet in the
+//! editor lines drawn once are gone a frame later (seen 2026-10-21; what empties the batcher isn't
+//! known). A feature that doesn't draw every frame calls [`LineBatcher::keep`] every frame. The
+//! batcher holds a single list, so each feature's lines are kept apart here (by the feature's name)
+//! and drawn together.
 
 use std::sync::{Mutex, PoisonError};
 
@@ -64,6 +66,15 @@ struct Layer {
 
 /// Every feature's lines, in the order they first drew.
 static LAYERS: Mutex<Vec<Layer>> = Mutex::new(Vec::new());
+
+/// Every feature's lines for `batcher`, in the order the features first drew.
+fn layered(layers: &[Layer], batcher: *mut UObjectBase) -> Vec<Line> {
+    layers
+        .iter()
+        .filter(|layer| layer.batcher == batcher as usize)
+        .flat_map(|layer| layer.lines.iter().copied())
+        .collect()
+}
 
 /// The start of a `TArray`: its element count.
 #[repr(C)]
@@ -144,13 +155,24 @@ impl LineBatcher {
                 lines: lines.to_vec(),
             }),
         }
-        let lines: Vec<Line> = layers
-            .iter()
-            .filter(|layer| layer.batcher == batcher as usize)
-            .flat_map(|layer| layer.lines.iter().copied())
-            .collect();
         // SAFETY: per the contract.
-        unsafe { self.draw(batcher, &lines) }
+        unsafe { self.draw(batcher, &layered(&layers, batcher)) }
+    }
+
+    /// Draws again every feature's lines for `batcher` if it lost some (see the module's doc).
+    ///
+    /// # Safety
+    /// As for [`Self::replace`].
+    pub unsafe fn keep(&self, batcher: *mut UObjectBase) {
+        let layers = LAYERS.lock().unwrap_or_else(PoisonError::into_inner);
+        let lines = layered(&layers, batcher);
+        // SAFETY: per the contract; the array's offset comes from `DrawLine`'s own code.
+        unsafe {
+            let array = batcher.cast::<u8>().add(self.lines).cast::<ArrayHead>();
+            if usize::try_from((*array).num) != Ok(lines.len()) {
+                self.draw(batcher, &lines);
+            }
+        }
     }
 
     /// Replaces every line `batcher` shows with `lines`.

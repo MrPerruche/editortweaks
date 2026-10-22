@@ -12,7 +12,7 @@ use std::collections::HashMap;
 
 use brickrust::ue::coreuobject::UObjectBase;
 
-use super::{Coloring, Editor, Painting};
+use super::{Coloring, Editor, Painting, blend};
 use crate::game::editor_object::{LocalBounds, Places, Vector};
 
 /// The colors, free to change (see `Colors`): bricks with one copy, and bricks with the most copies
@@ -36,30 +36,7 @@ fn shade(copies: usize, most: usize) -> [f32; 3] {
     } else {
         1.0
     };
-    // Blended as a color picker's values (sRGB), where halfway looks halfway; blending the linear
-    // values themselves keeps most shades close to the paler end.
-    core::array::from_fn(|channel| {
-        let [from, to] = [FEWEST[channel], MOST[channel]].map(to_srgb);
-        to_linear(from + (to - from) * share)
-    })
-}
-
-/// A linear color value as a color picker's (sRGB, 0 to 1): the standard sRGB curve.
-fn to_srgb(linear: f32) -> f32 {
-    if linear <= 0.003_130_8 {
-        linear * 12.92
-    } else {
-        1.055 * linear.powf(1.0 / 2.4) - 0.055
-    }
-}
-
-/// The inverse of [`to_srgb`].
-fn to_linear(srgb: f32) -> f32 {
-    if srgb <= 0.040_45 {
-        srgb / 12.92
-    } else {
-        ((srgb + 0.055) / 1.055).powf(2.4)
-    }
+    blend(FEWEST, MOST, share)
 }
 
 struct Duplicates {

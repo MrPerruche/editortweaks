@@ -441,8 +441,6 @@ impl Scene {
         }
     }
 
-    /// The shown reference `ray` (in the space of the editor's root) meets first, and how far along
-    /// it (in units of its direction's length). Hidden references are left out.
     /// A number that changes whenever [`Self::fit_triangles`] would.
     pub fn fit_key(&self) -> u64 {
         let mut hasher = DefaultHasher::new();
@@ -482,10 +480,17 @@ impl Scene {
         triangles
     }
 
+    /// The shown reference `ray` (in the space of the editor's root) meets first, and how far along
+    /// it (in units of its direction's length). Hidden references are left out.
     pub fn pick(&self, ray: &Ray) -> Option<(&str, f64)> {
+        self.first_hit(ray, |shown| shown.placement.visible && !shown.hidden)
+    }
+
+    /// The reference among those `counts` keeps that `ray` meets first, and how far along it.
+    fn first_hit(&self, ray: &Ray, counts: impl Fn(&Shown) -> bool) -> Option<(&str, f64)> {
         self.shown
             .iter()
-            .filter(|shown| shown.placement.visible && !shown.hidden)
+            .filter(|shown| counts(shown))
             .filter_map(|shown| {
                 let placement = &shown.placement;
                 let local = pick::local_ray(

@@ -53,9 +53,12 @@ impl Marquee {
             let panel = match kept {
                 Some(panel) => panel,
                 None => {
-                    // A new editor widget: the old borders go with the old one.
+                    // A new editor widget, or the old one hidden (a menu over the editor): the old
+                    // borders come off it (the game keeps the editor's widget for the next editor).
                     self.panel = None;
-                    self.borders.clear();
+                    for border in self.borders.drain(..) {
+                        canvas.remove(&border);
+                    }
                     let Some(panel) = canvas.panel(controller) else {
                         return false;
                     };

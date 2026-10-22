@@ -1,14 +1,15 @@
-//! Widgets of our own over the editor's 3D view: plain borders (UMG `UBorder`s, whose default
-//! brush draws a solid color) on the canvas panel the editor's widget keeps over the view
-//! (`WBP_BrickEditor`'s `ViewportCanvasPanel`, a Blueprint variable, between the top and bottom
-//! dashboards), drawn with the game's UI, after the 3D view and its post-processing. All through
+//! Widgets of our own over the editor's 3D view, on the canvas panel the editor's widget keeps over
+//! the view (`WBP_BrickEditor`'s `ViewportCanvasPanel`, a Blueprint variable, between the top and
+//! bottom dashboards), drawn with the game's UI, after the 3D view and its post-processing: plain
+//! borders (UMG `UBorder`s, whose default brush draws a solid color), or any widget
+//! ([`ViewCanvas::add_widget`], e.g. the game's tooltip, `game::tooltip_widget`). All through
 //! reflection; found in BRMK 1.11.6's content and game 1.11.7 (build 25831956), see
 //! `docs/re/selection.md`.
 //!
 //! The editor's widget (a `UBrickEditorWidget`) keeps its editor in a weak pointer that isn't
 //! reflected, so the live one is found among all objects by its owning player. Borders are made
-//! like `UWidgetTree::ConstructWidget` makes them (inside the widget's tree) and added with
-//! `UCanvasPanel::AddChildToCanvas`; they don't take the mouse (`HitTestInvisible`).
+//! like `UWidgetTree::ConstructWidget` makes them (inside the widget's tree); widgets are added with
+//! `UCanvasPanel::AddChildToCanvas`, and don't take the mouse (`HitTestInvisible`).
 
 use brickrust::ue::coreuobject::{EObjectFlags, GObjects, UObjectBase};
 use brickrust::ue::fname::FName;
@@ -57,6 +58,8 @@ pub struct ViewCanvas {
     add_result: usize,
     /// `UBorder::SetBrushColor(FLinearColor InBrushColor)`.
     set_color: SingleCall,
+    /// `UWidget::RemoveFromParent()`.
+    remove_from_parent: Function,
     /// `UWidget::SetVisibility(ESlateVisibility InVisibility)`, and the values used.
     set_visibility: SingleCall,
     shown: u8,
@@ -127,6 +130,7 @@ pub fn find() -> Result<ViewCanvas, String> {
             "StructProperty",
             16,
         )?,
+        remove_from_parent: Function::find(widget, "RemoveFromParent")?,
         set_visibility: SingleCall::find(
             widget,
             "SetVisibility",
@@ -217,6 +221,29 @@ impl ViewCanvas {
                 return None;
             }
             self.set_color.call(widget, color);
+            let slot = self.add_widget(panel, widget, Z_ORDER)?;
+            Some(Border {
+                widget: WeakObject::new(widget),
+                slot: WeakObject::new(slot),
+            })
+        }
+    }
+
+    /// Adds `widget` to `panel` (the canvas from [`Self::panel`]) at the draw order `z_order`
+    /// among its other children, hidden until shown ([`Self::show_widget`]): its slot, `None` if it
+    /// couldn't be added.
+    ///
+    /// # Safety
+    /// `panel` must be a live canvas panel of an editor widget, `widget` a live widget not on
+    /// another panel. Game thread only.
+    pub unsafe fn add_widget(
+        &self,
+        panel: *mut UObjectBase,
+        widget: *mut UObjectBase,
+        z_order: i32,
+    ) -> Option<*mut UObjectBase> {
+        // SAFETY: per the contract; every call gets its parameters at their reflected offsets.
+        unsafe {
             self.set_visibility.call(widget, self.hidden);
             let mut parameters = Parameters::new();
             put(&mut parameters, self.add_content, widget);
@@ -225,11 +252,56 @@ impl ViewCanvas {
             if slot.is_null() {
                 return None;
             }
-            self.set_z_order.call(slot, Z_ORDER);
-            Some(Border {
-                widget: WeakObject::new(widget),
-                slot: WeakObject::new(slot),
-            })
+            self.set_z_order.call(slot, z_order);
+            Some(slot)
+        }
+    }
+
+    /// Shows `widget` (added with [`Self::add_widget`], `slot` its slot) at `position` (the panel's
+    /// units).
+    ///
+    /// # Safety
+    /// `widget` and `slot` must be live. Game thread only.
+    pub unsafe fn show_widget(
+        &self,
+        widget: *mut UObjectBase,
+        slot: *mut UObjectBase,
+        position: [f32; 2],
+    ) {
+        // SAFETY: per the contract.
+        unsafe {
+            self.set_position.call(slot, position);
+            self.set_visibility.call(widget, self.shown);
+        }
+    }
+
+    /// Hides `widget` (added with [`Self::add_widget`]).
+    ///
+    /// # Safety
+    /// `widget` must be live. Game thread only.
+    pub unsafe fn hide_widget(&self, widget: *mut UObjectBase) {
+        // SAFETY: per the contract.
+        unsafe { self.set_visibility.call(widget, self.hidden) };
+    }
+
+    /// Takes `widget` off its panel for good (the editor's widget is kept for the next editor, so
+    /// a widget of ours left on it would stay).
+    ///
+    /// # Safety
+    /// `widget` must be live. Game thread only.
+    pub unsafe fn remove_widget(&self, widget: *mut UObjectBase) {
+        // SAFETY: per the contract; no parameters.
+        unsafe { self.remove_from_parent.call(widget, &mut Parameters::new()) };
+    }
+
+    /// Takes `border` off its panel for good, if it's still there.
+    ///
+    /// # Safety
+    /// Game thread only.
+    pub unsafe fn remove(&self, border: &Border) {
+        if let Some(widget) = border.widget.get() {
+            // SAFETY: per the contract; the widget is live (`WeakObject::get`).
+            unsafe { self.remove_widget(widget) };
         }
     }
 
@@ -268,9 +340,8 @@ impl ViewCanvas {
         };
         // SAFETY: per the contract; both are live (`WeakObject::get`).
         unsafe {
-            self.set_position.call(slot, position);
             self.set_size.call(slot, size);
-            self.set_visibility.call(widget, self.shown);
+            self.show_widget(widget, slot, position);
         }
     }
 
@@ -281,7 +352,7 @@ impl ViewCanvas {
     pub unsafe fn hide(&self, border: &Border) {
         if let Some(widget) = border.widget.get() {
             // SAFETY: per the contract; the widget is live (`WeakObject::get`).
-            unsafe { self.set_visibility.call(widget, self.hidden) };
+            unsafe { self.hide_widget(widget) };
         }
     }
 

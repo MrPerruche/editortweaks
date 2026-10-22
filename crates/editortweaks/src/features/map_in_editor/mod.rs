@@ -381,6 +381,12 @@ impl State {
     }
 }
 
+/// Whether the map shows around the editor (false while that can't be told). For features that
+/// look at the world around the vehicle, e.g. where its shots land.
+pub fn shows_map() -> bool {
+    STATE.try_lock().is_ok_and(|state| state.shown)
+}
+
 fn state() -> MutexGuard<'static, State> {
     STATE.lock().unwrap_or_else(PoisonError::into_inner)
 }

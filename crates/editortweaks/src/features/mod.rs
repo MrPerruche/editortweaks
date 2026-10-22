@@ -14,6 +14,7 @@ mod editor_bounds;
 /// Shared hooks of the editor's mouse button actions (not a feature).
 mod editor_buttons;
 mod editor_frame;
+mod gun_preview;
 mod hello;
 /// The mod's rebindable keys, which other features read.
 mod keybinds;
@@ -54,6 +55,7 @@ pub static ALL: &[&dyn Feature] = &[
     &click_swap::ClickSwap,
     &actuator_arrows::ActuatorArrows,
     &suspension_arrows::SuspensionArrows,
+    &gun_preview::GunPreview,
     &map_in_editor::MapInEditor,
     &references::References,
     &settings_menu::SettingsMenu,
@@ -64,8 +66,10 @@ pub static SETTINGS: &[&[Section]] = &[
     &SELECTION,
     &brick_resize::SETTINGS,
     &map_in_editor::SETTINGS,
+    &gun_preview::SETTINGS,
     &references::SETTINGS,
     &slider_drag::SETTINGS,
+    &view_modes::SETTINGS,
 ];
 
 /// The settings of selecting bricks: which buttons, and what a box picks.

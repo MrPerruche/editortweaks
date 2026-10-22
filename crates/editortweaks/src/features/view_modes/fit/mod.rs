@@ -39,7 +39,9 @@ use brickrust::ue::coreuobject::UObjectBase;
 use model_io::{fit, loft};
 
 use self::worker::{Done, Job, Source, Worker};
+use super::Editor;
 use super::collision::mesh as shapes_mesh;
+use super::tooltip::{Hover, number};
 use crate::features::references::{self, looks::Looks};
 use crate::game::brick_model::BrickModels;
 use crate::game::collision::{Collision, Shapes};
@@ -209,6 +211,26 @@ pub fn after_tick(editor: *mut UObjectBase, _delta: f32) {
     unsafe {
         found.build_finished(editor);
         found.copy_outlines();
+    }
+}
+
+/// The tooltip's line over the brick under the mouse: how far the point of it under the mouse is
+/// from the nearest point of the reference models, as bricks are colored.
+///
+/// # Safety
+/// Game thread only.
+pub unsafe fn describe(editor: &Editor, hover: &Hover) -> Vec<String> {
+    // SAFETY: per the contract; the editor is live.
+    let Some(point) = (unsafe { hover.point(editor) }) else {
+        return Vec::new();
+    };
+    // SAFETY: as above.
+    match unsafe { references::fit_distance(editor.editor, hover.at(point.entry)) } {
+        Some(distance) => vec![format!(
+            "Distance to the reference: {} cm",
+            number(distance)
+        )],
+        None => vec!["No reference model to measure against".to_owned()],
     }
 }
 

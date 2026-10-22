@@ -1,8 +1,11 @@
 //! Our view modes, cycled with Z or picked in the editor panel's view mode list (nothing selected),
 //! each showing something the game doesn't:
 //!
+//! - "Connections" ([`connections`]): bricks colored by the part of the vehicle they hold together
+//!   with;
 //! - "Mirror" ([`mirror`]): what each brick has at its mirror image, as mirror mode sees it;
 //! - "Duplicates" ([`duplicates`]): bricks sharing their place with copies of themselves;
+//! - "Strength" ([`strength`]): bricks shaded by the damage it takes to break them off;
 //! - "Collision" ([`collision`]): bricks' collision shapes, with their own materials;
 //! - "Reference fit" ([`fit`]): bricks colored by how far they are from the reference models.
 //!
@@ -14,20 +17,39 @@
 //! until the editor changes: after every change the editor re-pairs mirrored bricks
 //! (`UpdateMirroredObjects`), and then bricks whose colors changed are repainted. The game names
 //! view modes from a fixed list, so ours are added to it: the panel's list shows them, and their
-//! names after Z aren't "Invalid".
+//! names after Z aren't "Invalid". Hiding bricks or showing them again (H, Alt + H) isn't an edit:
+//! a coloring view mode is worked out again when the hidden bricks change too (checked every frame),
+//! since Strength and Connections leave them out.
+//!
+//! Strength, Connections and Reference fit also have a tooltip next to the mouse ([`tooltip`],
+//! [`describe`]).
+//!
+//! The game's own Physics view mode gets more too ([`physics`]): the centers of lift and thrust
+//! next to its center of mass, and the tooltip over the three.
 
 mod collision;
+mod connections;
 mod duplicates;
 mod fit;
 mod mirror;
+mod physics;
+mod strength;
+mod tooltip;
 
+/// For the shot preview's tooltip: the AP unit and how numbers read.
+pub(crate) use strength::{AP_DAMAGE, AP_PENETRATION, break_off_damage};
+
+use std::collections::hash_map::DefaultHasher;
 use std::collections::{BTreeMap, HashMap};
-use std::sync::{Mutex, Once, OnceLock};
+use std::hash::{Hash, Hasher};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Mutex, Once, OnceLock, PoisonError};
 
 use brickrust::ue::coreuobject::UObjectBase;
 use core::ffi::c_void;
 
 use crate::framework::hook;
+use crate::framework::settings::{Section, Setting};
 use crate::game::brick_editor;
 use crate::game::editor_view::{
     self, Bricks, EditorCode, MaterialOverrideFn, PrimitiveDataFn, UpdateMirroredObjectsFn,
@@ -48,13 +70,54 @@ type Colors = [[f32; 3]; 2];
 const GRAY: [f32; 3] = [0.2, 0.2, 0.2];
 const PLAIN: Colors = [GRAY, GRAY];
 
+/// The view modes' settings, in the options' Editor tweaks menu.
+pub static SETTINGS: [Section; 1] = [Section {
+    title: "View modes",
+    settings: &[
+        Setting::Toggle(&tooltip::TOOLTIP),
+        Setting::Toggle(&physics::CENTERS),
+    ],
+}];
+
 /// Our view modes, in the order Z cycles through them: each one's name and how to make it.
-const MODES: [(&str, NewLook); 4] = [
+/// A view mode's value is its place here, kept in the user's settings: reordering them switches a
+/// saved one to another, once.
+const MODES: [(&str, NewLook); 6] = [
+    ("Connections", || connections::new().map(Look::Colors)),
     ("Mirror", || mirror::new().map(Look::Colors)),
     ("Duplicates", || duplicates::new().map(Look::Colors)),
+    ("Strength", || strength::new().map(Look::Colors)),
     ("Collision", || collision::find().map(|()| Look::Collision)),
     ("Reference fit", || fit::find().map(|()| Look::Fit)),
 ];
+
+/// The color `share` of the way from `from` to `to` (0 to 1), blended as a color picker's values
+/// (sRGB), where halfway looks halfway; blending the linear values themselves keeps most shades
+/// close to the paler end.
+fn blend(from: [f32; 3], to: [f32; 3], share: f32) -> [f32; 3] {
+    core::array::from_fn(|channel| {
+        let [from, to] = [from[channel], to[channel]].map(to_srgb);
+        to_linear(from + (to - from) * share)
+    })
+}
+
+/// A linear color value as a color picker's (sRGB, 0 to 1): the standard sRGB curve.
+fn to_srgb(linear: f32) -> f32 {
+    if linear <= 0.003_130_8 {
+        linear * 12.92
+    } else {
+        1.055 * linear.powf(1.0 / 2.4) - 0.055
+    }
+}
+
+/// The inverse of [`to_srgb`].
+fn to_linear(srgb: f32) -> f32 {
+    if srgb <= 0.040_45 {
+        srgb / 12.92
+    } else {
+        ((srgb + 0.055) / 1.055).powf(2.4)
+    }
+}
 
 /// Makes a view mode's [`Look`] (after engine init), or tells why it can't.
 type NewLook = fn() -> Result<Look, String>;
@@ -76,6 +139,14 @@ trait Coloring: Send + Sync {
     /// # Safety
     /// `editor.editor` must be a live `ABrickEditor`. Game thread only.
     unsafe fn paint(&self, editor: &Editor) -> Painting;
+
+    /// The lines of the tooltip over what `hover` points at; none by default.
+    ///
+    /// # Safety
+    /// As for [`Self::paint`].
+    unsafe fn describe(&self, _editor: &Editor, _hover: &tooltip::Hover) -> Vec<String> {
+        Vec::new()
+    }
 }
 
 /// What a view mode shows.
@@ -118,6 +189,15 @@ impl Editor<'_> {
                 .collect()
         }
     }
+
+    /// Whether `object` (one of the editor's) is hidden (H, or by the view mode).
+    ///
+    /// # Safety
+    /// `object` must be a live editor object. Game thread only.
+    unsafe fn is_hidden(&self, object: *const UObjectBase) -> bool {
+        // SAFETY: per the contract.
+        unsafe { self.code.is_hidden(object) }
+    }
 }
 
 pub struct ViewModes;
@@ -134,6 +214,9 @@ static VIEWS: OnceLock<Views> = OnceLock::new();
 static PAINTED: Mutex<BTreeMap<usize, Colors>> = Mutex::new(BTreeMap::new());
 /// What the view mode shown shows, for the editor as it is; `None` once it changed.
 static SHOWN: Mutex<Option<Shown>> = Mutex::new(None);
+/// Counts the editor's changes (edits, and changes of the hidden bricks): what the tooltip shows
+/// depends on them.
+static GENERATION: AtomicU64 = AtomicU64::new(0);
 
 struct Views {
     bricks: Bricks,
@@ -207,6 +290,16 @@ impl Feature for ViewModes {
         // Without it, the reference fit view mode shows no colors.
         if let Err(reason) = brick_editor::after_tick(fit::after_tick) {
             log!("the reference fit won't show: {reason}");
+        }
+        if let Err(reason) = brick_editor::after_tick(follow_hidden) {
+            log!("the coloring view modes won't follow hidden bricks: {reason}");
+        }
+        // Before the tooltip, which reads the centers.
+        if let Err(reason) = brick_editor::after_tick(physics::after_tick) {
+            log!("no centers of lift and thrust: {reason}");
+        }
+        if let Err(reason) = brick_editor::after_tick(tooltip::after_tick) {
+            log!("the view modes show no tooltip: {reason}");
         }
         Ok(())
     }
@@ -371,12 +464,146 @@ unsafe extern "C" fn update_mirrored_objects(editor: *mut UObjectBase) {
     unsafe {
         original(editor);
         // The editor changed, and so may every brick's colors.
-        if let Ok(mut shown) = SHOWN.lock() {
-            *shown = None;
-        }
+        changed();
         if let (Some(code), Some(views)) = (CODE.get(), VIEWS.get()) {
             views.repaint_changed(code, editor);
         }
+    }
+}
+
+/// How many times the editor changed (edits; changes of the hidden bricks only while a coloring
+/// view mode shows): what depends on the vehicle is worked out again when it moves on.
+pub(crate) fn generation() -> u64 {
+    GENERATION.load(Ordering::Relaxed)
+}
+
+/// The editor changed: what view modes show is worked out again.
+fn changed() {
+    if let Ok(mut shown) = SHOWN.lock() {
+        *shown = None;
+    }
+    GENERATION.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Every frame: repaints the coloring view mode shown if the hidden bricks changed.
+fn follow_hidden(editor: *mut UObjectBase, _delta: f32) {
+    /// The editor and its hidden objects, by address, hashed.
+    static HIDDEN: Mutex<Option<(usize, u64)>> = Mutex::new(None);
+    let (Some(code), Some(views)) = (CODE.get(), VIEWS.get()) else {
+        return;
+    };
+    let editor_view = Editor {
+        code,
+        bricks: &views.bricks,
+        editor,
+    };
+    // SAFETY: on the game thread (the editor's tick), `editor` the live editor ticking; its
+    // objects are live.
+    unsafe {
+        let Some((view, _)) = shown_view(editor) else {
+            return;
+        };
+        if !matches!(
+            views.view(view).map(|view| &view.look),
+            Some(Look::Colors(_))
+        ) {
+            return;
+        }
+        let mut hasher = DefaultHasher::new();
+        for &object in editor_view.objects() {
+            if !object.is_null() && code.is_hidden(object) {
+                (object as usize).hash(&mut hasher);
+            }
+        }
+        let now = (editor as usize, hasher.finish());
+        let before = HIDDEN
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .replace(now);
+        if before.is_some_and(|before| before != now) {
+            changed();
+            views.repaint_changed(code, editor);
+        }
+    }
+}
+
+/// Which of our view modes `editor` shows (its value), and the editor's [`GENERATION`].
+///
+/// # Safety
+/// `editor` must be a live `ABrickEditor`. Game thread only.
+unsafe fn shown_view(editor: *mut UObjectBase) -> Option<(u8, u64)> {
+    let views = VIEWS.get()?;
+    // SAFETY: per the contract.
+    let view = views.view(unsafe { view_of(editor) }?)?;
+    Some((view.value, GENERATION.load(Ordering::Relaxed)))
+}
+
+/// The view mode `editor` shows (any, the game's too), as its first brick tells; `None` without
+/// bricks.
+///
+/// # Safety
+/// `editor` must be a live `ABrickEditor`. Game thread only.
+unsafe fn view_of(editor: *mut UObjectBase) -> Option<u8> {
+    let (code, views) = (CODE.get()?, VIEWS.get()?);
+    // SAFETY: per the contract; the editor's objects are live.
+    unsafe {
+        let first = views
+            .bricks
+            .editor_objects(editor)
+            .iter()
+            .copied()
+            .find(|&object| !object.is_null() && views.bricks.is_brick(object))?;
+        code.view_mode(first)
+    }
+}
+
+/// The view mode whose tooltip `editor` shows (one of ours, or the game's Physics), and what the
+/// tooltip depends on besides the mouse: a count that moves on when the vehicle does.
+///
+/// # Safety
+/// `editor` must be a live `ABrickEditor`. Game thread only.
+unsafe fn tooltip_view(editor: *mut UObjectBase) -> Option<(u8, u64)> {
+    // SAFETY: per the contract.
+    unsafe { shown_view(editor).or_else(|| physics::shown(editor)) }
+}
+
+/// The tooltip of the view mode `value` ([`tooltip_view`]) over `editor`, at what `hover` points
+/// at: ours titled with the view mode's name, the Physics view mode's with the center under the
+/// mouse.
+///
+/// # Safety
+/// `editor` must be a live `ABrickEditor`. Game thread only.
+unsafe fn describe(
+    editor: *mut UObjectBase,
+    value: u8,
+    hover: &tooltip::Hover,
+) -> tooltip::Description {
+    if physics::is_physics(value) {
+        // SAFETY: per the contract.
+        return unsafe { physics::describe(editor, hover) };
+    }
+    let (Some(code), Some(views)) = (CODE.get(), VIEWS.get()) else {
+        return tooltip::Description::default();
+    };
+    let Some(view) = views.view(value) else {
+        return tooltip::Description::default();
+    };
+    let editor = Editor {
+        code,
+        bricks: &views.bricks,
+        editor,
+    };
+    // SAFETY: per the contract.
+    let lines = unsafe {
+        match &view.look {
+            Look::Colors(coloring) => coloring.describe(&editor, hover),
+            Look::Fit => fit::describe(&editor, hover),
+            Look::Collision => Vec::new(),
+        }
+    };
+    tooltip::Description {
+        title: view.name.to_owned(),
+        lines,
     }
 }
 

@@ -35,6 +35,7 @@ use std::sync::{Mutex, MutexGuard, OnceLock, PoisonError};
 use std::time::{Duration, Instant, SystemTime};
 
 use brickrust::ue::coreuobject::UObjectBase;
+use model_io::fit::Surface;
 use model_io::sidecar::{Kind, Sidecar, SourceMode};
 
 use self::loading::Loaded;
@@ -53,6 +54,7 @@ use crate::game::reflection::{self, Getter};
 use crate::game::textures::Textures;
 use crate::game::vehicle_box::VehicleBoxes;
 use crate::game::weak_object::WeakObject;
+use crate::math;
 use crate::prelude::*;
 
 /// How often the open vehicle, its sidecar and the referenced files are looked at.
@@ -298,6 +300,28 @@ pub fn fit_key() -> Option<u64> {
 pub fn fit_triangles() -> Option<Vec<[[f32; 3]; 3]>> {
     let state = STATE.try_lock().ok()?;
     Some(state.scene.fit_triangles())
+}
+
+/// How far `point` (in the world) is from the nearest point of the models the "Reference fit" view
+/// mode measures against ([`fit_triangles`]), in cm, as that view mode measures bricks. `None` if
+/// none counts, or while the references are busy.
+///
+/// # Safety
+/// `editor` must be the live editor. Game thread only.
+pub unsafe fn fit_distance(editor: *mut UObjectBase, point: [f32; 3]) -> Option<f64> {
+    /// The references' triangles ready for the measure, and their [`fit_key`].
+    static NEAREST: Mutex<Option<(u64, Surface)>> = Mutex::new(None);
+    let input = CODE.get()?.input.as_ref()?;
+    // SAFETY: per the contract. Only the origin is used.
+    let local = unsafe { select::root_ray(input, editor, point, [1.0, 0.0, 0.0]) }?;
+    let key = fit_key()?;
+    let mut nearest = NEAREST.lock().unwrap_or_else(PoisonError::into_inner);
+    if nearest.as_ref().is_none_or(|(built, _)| *built != key) {
+        *nearest = Some((key, Surface::new(&fit_triangles()?)));
+    }
+    let (_, surface) = nearest.as_ref()?;
+    // The root isn't scaled: this is in cm.
+    surface.distance(math::narrow(local.origin)).map(f64::from)
 }
 
 impl Feature for References {

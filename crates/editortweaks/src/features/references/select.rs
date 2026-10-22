@@ -178,11 +178,10 @@ unsafe fn release_select(input: &Input, state: &mut State, editor: *mut UObjectB
 /// # Safety
 /// As for [`press_select`].
 unsafe fn picked(input: &Input, state: &State, editor: *mut UObjectBase) -> Option<String> {
-    let code = CODE.get()?;
     if !SELECTABLE.get() {
         return None;
     }
-    // SAFETY: per the contract; the controller and root are live if not null.
+    // SAFETY: per the contract; the controller is live if not null.
     unsafe {
         input.modes.default_mode(editor)?;
         let controller = input.editor.player_controller(editor);
@@ -191,11 +190,7 @@ unsafe fn picked(input: &Input, state: &State, editor: *mut UObjectBase) -> Opti
         }
         let mouse = input.viewport.mouse(controller)?;
         let ray = input.viewport.ray(controller, mouse)?;
-        let root = code.root.call(editor);
-        if root.is_null() {
-            return None;
-        }
-        let local = to_local(&input.to_world.call(root), ray.origin, ray.direction)?;
+        let local = root_ray(input, editor, ray.origin, ray.direction)?;
         let (id, along) = state.scene.pick(&local)?;
         let end = math::narrow(math::add(
             math::widen(ray.origin),
@@ -210,6 +205,28 @@ unsafe fn picked(input: &Input, state: &State, editor: *mut UObjectBase) -> Opti
             return None;
         }
         Some(id.to_owned())
+    }
+}
+
+/// The ray from `origin` along `direction` (in the world) in the space of `editor`'s root, where
+/// references are placed.
+///
+/// # Safety
+/// `editor` must be the live editor. Game thread only.
+pub(super) unsafe fn root_ray(
+    input: &Input,
+    editor: *mut UObjectBase,
+    origin: [f32; 3],
+    direction: [f32; 3],
+) -> Option<Ray> {
+    let code = CODE.get()?;
+    // SAFETY: per the contract; the root is live if not null.
+    unsafe {
+        let root = code.root.call(editor);
+        if root.is_null() {
+            return None;
+        }
+        to_local(&input.to_world.call(root), origin, direction)
     }
 }
 
