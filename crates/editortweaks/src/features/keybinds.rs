@@ -15,6 +15,9 @@
 //! box; see [`key_delivered`]). If any of that isn't found (e.g. after a game update), the keybinds
 //! keep their default keys.
 //!
+//! Some keybinds are also entries of the mod's menu in the editor's top bar ("Editor tweaks", see
+//! `editor_menu`): [`Keybind::menu`]. Their rows are clickable, and [`menu_category`] is the menu.
+//!
 //! Default keys are `FKey` names, which Unreal derives from Windows' virtual keys: the top row's
 //! digits (`One`..) are the same physical keys on every layout (on AZERTY, the one typing `&`),
 //! letters follow the layout like the game's own (a letter's key is where the layout puts it).
@@ -68,7 +71,7 @@ pub static MODEL_EDITING: Keybind = Keybind::new(
     "EditorTweaks_ModelEditing",
     "Use models",
     "Hold while fast editing to use the faces, edges and vertices of bricks' models instead of their boxes.",
-    &["ThumbMouseButton"],
+    &["ThumbMouseButton", "ThumbMouseButton2", "Tab"],
 );
 
 /// Snaps the dragged part to other bricks while held during a resize or move (`brick_resize`).
@@ -118,6 +121,25 @@ pub static CLEAR_LINE: Keybind = Keybind::new(
     &[],
 );
 
+/// Clicked while fast editing (the resize key held) on a brick, gives its looks (color, material,
+/// pattern and the pattern's scale, rotation and offset) to the selected bricks and the bricks made
+/// next (`copy_properties`).
+pub static COPY_LOOKS: Keybind = Keybind::new(
+    "EditorTweaks_CopyLooks",
+    "Copy brick looks",
+    "Click while fast editing to copy the color, material, pattern and pattern scale, rotation and offset of the brick under the mouse onto the selected bricks (one step to undo); new bricks get them too. Not when the left or right mouse button is pressed before letting go of it (a drag), or the mouse moves.",
+    &["MiddleMouseButton"],
+);
+
+/// Like [`COPY_LOOKS`], but gives every brick property it can, each to the selected bricks having
+/// it (`copy_properties`). Takes the click when both keys are held.
+pub static COPY_PROPERTIES: Keybind = Keybind::new(
+    "EditorTweaks_CopyProperties",
+    "Copy brick properties",
+    "Click while fast editing to copy every property of the brick under the mouse that the selected bricks have (looks, size, wheel and axle settings, input channels...) onto them (one step to undo); not names. New bricks get its looks too. Not when the left or right mouse button is pressed before letting go of it (a drag), or the mouse moves.",
+    &["Ctrl+MiddleMouseButton"],
+);
+
 /// Slows down mouse moves of bricks and of the camera while held (`move_slowdown`).
 pub static SLOW_MOVES: Keybind = Keybind::new(
     "EditorTweaks_SlowMoves",
@@ -152,12 +174,12 @@ pub static PAN_VIEW: Keybind = Keybind::new(
     &["Shift+RightMouseButton"],
 );
 
-/// Shows or hides the map around the vehicle in the editor, like the "Show map" row of the editor's
-/// panel (`map_in_editor`).
+/// Shows or hides the map around the vehicle in the editor: sets the "Show map" row of the editor's
+/// panel (`map_in_editor`) to None and back.
 pub static SHOW_MAP: Keybind = Keybind::new(
     "EditorTweaks_ShowMap",
     "Show map",
-    "Press in the editor to show the map around the vehicle, placed as it will be when the vehicle is spawned at the garage selected in the editor's panel (Map, with nothing selected); if none is, the garage the editor was opened from, else the first. Press again to hide it.",
+    "Press in the editor to show the map around the vehicle, placed as it will be when the vehicle is spawned at the garage last chosen in the editor's panel (Show map, with nothing selected); if none was, the garage the editor was opened from, else the first. Press again to hide it.",
     &["Zero"],
 );
 
@@ -186,9 +208,19 @@ pub static EXTENDED_TOOLTIP: Keybind = Keybind::new(
     &["LeftShift", "RightShift"],
 );
 
+/// Opens the dialog writing the vehicle open in the editor as a 3D model (`model_export`). An entry
+/// of the editor's "Editor tweaks" menu; no key by default.
+pub static EXPORT_MODEL: Keybind = Keybind::menu(
+    "EditorTweaks_ExportModel",
+    "Export 3D model",
+    "Press in the editor (or pick it in the editor's Editor tweaks menu) to save the vehicle as a 3D model (.glb, .obj or .stl) with its colors and materials, in the Exports folder next to the game's saved vehicles. Opens a dialog to choose the bricks, the detail, collision instead and the file format.",
+    &[],
+    "/Game/BrickRigs/UI/Textures/Icons/T_SaveFileAs.T_SaveFileAs",
+);
+
 /// Every keybind, by section, in the order the settings list them. The sections are the
 /// changelog's headers (those having keys).
-static SECTIONS: [Section; 5] = [
+static SECTIONS: [Section; 6] = [
     Section {
         name: "IC_EditorTweaks_FastEditing",
         title: "Fast editing",
@@ -200,6 +232,8 @@ static SECTIONS: [Section; 5] = [
             &NEXT_ORIENTATION,
             &SLIDE_ALONG_LINE,
             &CLEAR_LINE,
+            &COPY_LOOKS,
+            &COPY_PROPERTIES,
         ],
     },
     Section {
@@ -222,6 +256,11 @@ static SECTIONS: [Section; 5] = [
         title: "References",
         keybinds: &[&SHOW_MAP, &SHOW_REFERENCES],
     },
+    Section {
+        name: "IC_EditorTweaks_Tools",
+        title: "Tools",
+        keybinds: &[&EXPORT_MODEL],
+    },
 ];
 
 /// Keybinds shown together in the input settings, under `title`: a subcategory of ours.
@@ -230,6 +269,19 @@ struct Section {
     name: &'static str,
     title: &'static str,
     keybinds: &'static [&'static Keybind],
+}
+
+/// The keybinds of the editor menu, in its order.
+pub fn menu_keybinds() -> impl Iterator<Item = &'static Keybind> {
+    all().filter(|keybind| keybind.menu_icon.is_some())
+}
+
+/// The editor menu's category, once made (see [`menu_keybinds`]).
+pub fn menu_category() -> Option<*mut UObjectBase> {
+    match *OURS.lock().unwrap_or_else(PoisonError::into_inner) {
+        Ours::Made { menu, .. } => Some(menu),
+        _ => None,
+    }
 }
 
 /// Every keybind.
@@ -245,6 +297,11 @@ const EDITOR_CATEGORY: &str = "IC_BrickEditor";
 const CATEGORY_LABEL: &str = "Editor tweaks (mod)";
 const CATEGORY_NAME: &str = "IC_EditorTweaks";
 const TABLE_NAME: &str = "EditorTweaksInputTable";
+/// The editor menu's category: its name in the top bar, its object's and its icon's path. Not one of
+/// the settings' categories.
+const MENU_LABEL: &str = "Editor tweaks";
+const MENU_NAME: &str = "IC_EditorTweaks_Menu";
+const MENU_ICON: &str = "/Game/BrickRigs/UI/Textures/Icons/T_VehicleEditor.T_VehicleEditor";
 
 /// A key of the mod, which players can rebind in the game's input settings.
 pub struct Keybind {
@@ -256,6 +313,8 @@ pub struct Keybind {
     description: &'static str,
     /// Its default keys: `FKey` names, after the modifier keys each needs (see [`DefaultKey`]).
     keys: &'static [&'static str],
+    /// For an entry of the editor menu: its icon's path there.
+    menu_icon: Option<&'static str>,
     /// The action's name, once in the game's input tables.
     action: OnceLock<FName>,
 }
@@ -272,8 +331,33 @@ impl Keybind {
             label,
             description,
             keys,
+            menu_icon: None,
             action: OnceLock::new(),
         }
+    }
+
+    /// A keybind that's also an entry of the editor menu, shown there with the texture at the path
+    /// `icon`.
+    const fn menu(
+        name: &'static str,
+        label: &'static str,
+        description: &'static str,
+        keys: &'static [&'static str],
+        icon: &'static str,
+    ) -> Self {
+        Self {
+            name,
+            label,
+            description,
+            keys,
+            menu_icon: Some(icon),
+            action: OnceLock::new(),
+        }
+    }
+
+    /// Its action's name in the game's input tables, once it's there.
+    pub fn action(&self) -> Option<FName> {
+        self.action.get().copied()
     }
 
     /// Whether it's held right now: one of the keys it's bound to in the game's input settings,
@@ -494,6 +578,8 @@ enum Ours {
         table: *mut UObjectBase,
         /// Our top category, which the game's list of them needs (subcategories aren't listed).
         category: *mut UObjectBase,
+        /// The editor menu's category.
+        menu: *mut UObjectBase,
     },
     /// Making them failed halfway: not tried again, the objects' names are taken.
     Failed,
@@ -581,7 +667,10 @@ unsafe fn add_ours(manager: *mut UObjectBase) -> Result<(), String> {
                 }
             };
         }
-        if let Ours::Made { table, category } = *ours {
+        if let Ours::Made {
+            table, category, ..
+        } = *ours
+        {
             input_table::add_once(tables.tables(manager), table, None);
             let categories = tables.categories(manager);
             let editor = input_table::find_named(categories, EDITOR_CATEGORY);
@@ -613,10 +702,21 @@ unsafe fn make(tables: &InputTables, manager: *mut UObjectBase) -> Result<Ours, 
                 manager,
                 prepared.category.name,
                 &prepared.category.label,
+                None,
                 core::ptr::null_mut(),
                 0,
             )
             .map_err(MakeError::Retry)?;
+        let menu = tables
+            .new_category(
+                manager,
+                prepared.menu.name,
+                &prepared.menu.label,
+                Some(prepared.menu_icon),
+                core::ptr::null_mut(),
+                0,
+            )
+            .map_err(MakeError::Final)?;
         let table = tables
             .new_table(manager, prepared.table_name)
             .map_err(MakeError::Final)?;
@@ -626,6 +726,7 @@ unsafe fn make(tables: &InputTables, manager: *mut UObjectBase) -> Result<Ours, 
                     manager,
                     prepared.category.name,
                     &prepared.category.label,
+                    None,
                     category,
                     place as i32,
                 )
@@ -639,6 +740,7 @@ unsafe fn make(tables: &InputTables, manager: *mut UObjectBase) -> Result<Ours, 
                     description: &action.description,
                     keys: &action.keys,
                     order: order as i32,
+                    menu_icon: action.menu_icon,
                 };
                 tables
                     .add_row(table, &row, subcategory)
@@ -651,7 +753,11 @@ unsafe fn make(tables: &InputTables, manager: *mut UObjectBase) -> Result<Ours, 
             all().count(),
             SECTIONS.len()
         );
-        Ok(Ours::Made { table, category })
+        Ok(Ours::Made {
+            table,
+            category,
+            menu,
+        })
     }
 }
 
@@ -659,6 +765,8 @@ unsafe fn make(tables: &InputTables, manager: *mut UObjectBase) -> Result<Ours, 
 struct Prepared {
     table_name: FName,
     category: PreparedCategory,
+    menu: PreparedCategory,
+    menu_icon: FName,
     sections: Vec<PreparedSection>,
 }
 
@@ -677,6 +785,7 @@ struct PreparedAction {
     label: Text,
     description: Text,
     keys: Vec<Chord>,
+    menu_icon: Option<FName>,
 }
 
 fn prepare() -> Result<Prepared, String> {
@@ -696,6 +805,8 @@ fn prepare() -> Result<Prepared, String> {
     Ok(Prepared {
         table_name: kismet::string_to_name(TABLE_NAME)?,
         category: prepare_category(CATEGORY_NAME, CATEGORY_LABEL)?,
+        menu: prepare_category(MENU_NAME, MENU_LABEL)?,
+        menu_icon: kismet::string_to_name(MENU_ICON)?,
         sections,
     })
 }
@@ -717,5 +828,6 @@ fn prepare_action(keybind: &Keybind) -> Result<PreparedAction, String> {
             .iter()
             .map(|key| DefaultKey::parse(key).chord())
             .collect::<Result<_, String>>()?,
+        menu_icon: keybind.menu_icon.map(kismet::string_to_name).transpose()?,
     })
 }

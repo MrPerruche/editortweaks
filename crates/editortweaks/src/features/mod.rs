@@ -6,22 +6,34 @@ use crate::framework::feature::Feature;
 use crate::framework::settings::{Section, Setting};
 
 mod actuator_arrows;
+mod axis_permutations;
+mod brick_names;
 mod brick_resize;
 mod camera_speed;
 mod click_swap;
+mod compact_panel;
+mod connector_markers;
+mod copy_properties;
 mod drag_select;
 mod editor_bounds;
 /// Shared hooks of the editor's mouse button actions (not a feature).
 mod editor_buttons;
 mod editor_frame;
+mod editor_menu;
+mod free_pitch;
 mod gun_preview;
 mod hello;
 /// The mod's rebindable keys, which other features read.
 mod keybinds;
 mod map_in_editor;
+/// Shared hook of clicks on the game's menu buttons, where features add buttons (not a feature).
+mod menu_buttons;
+mod model_export;
 /// Shared hooks of the editor's mouse movement (not a feature).
 mod mouse_moves;
 mod move_slowdown;
+/// Shared hook of property panels' numeric rows updating (not a feature).
+mod number_rows;
 mod ortho_view;
 mod precise_moves;
 mod precise_sliders;
@@ -43,40 +55,68 @@ pub static ALL: &[&dyn Feature] = &[
     &precise_sliders::PreciseSliders,
     &slider_formulas::SliderFormulas,
     &slider_drag::SliderDrag,
+    &axis_permutations::AxisPermutations,
     &camera_speed::CameraSpeed,
+    &free_pitch::FreePitch,
     &editor_frame::EditorFrame,
     &ortho_view::OrthoView,
     &editor_bounds::EditorBounds,
     &move_slowdown::MoveSlowdown,
     &precise_moves::PreciseMoves,
     &view_modes::ViewModes,
+    &brick_names::BrickNames,
     &brick_resize::BrickResize,
+    &copy_properties::CopyProperties,
     &drag_select::DragSelect,
     &click_swap::ClickSwap,
     &actuator_arrows::ActuatorArrows,
     &suspension_arrows::SuspensionArrows,
+    &connector_markers::ConnectorMarkers,
     &gun_preview::GunPreview,
     &map_in_editor::MapInEditor,
     &references::References,
+    &compact_panel::CompactPanel,
     &settings_menu::SettingsMenu,
+    &model_export::ModelExport,
+    &editor_menu::EditorMenu,
 ];
 
 /// Every feature's settings, by section of the menu, in the menu's order (see `settings_menu`).
 pub static SETTINGS: &[&[Section]] = &[
-    &SELECTION,
+    &EDITOR,
     &brick_resize::SETTINGS,
-    &map_in_editor::SETTINGS,
-    &gun_preview::SETTINGS,
     &references::SETTINGS,
-    &slider_drag::SETTINGS,
-    &view_modes::SETTINGS,
+    &model_export::SETTINGS,
+    &PREVIEWS,
 ];
 
-/// The settings of selecting bricks: which buttons, and what a box picks.
-static SELECTION: [Section; 1] = [Section {
-    title: "Selection",
+/// The settings of the editor itself: which buttons select, the camera's pitch, what a box picks,
+/// how selected bricks' connectors show, how far sliders drag, the value order button, how compact
+/// the side panel is.
+static EDITOR: [Section; 1] = [Section {
+    title: "Editor",
     settings: &[
         Setting::Toggle(&click_swap::SWAP_CLICKS),
+        Setting::Choice(&free_pitch::UPSIDE_DOWN),
         Setting::Choice(&drag_select::PICKS),
+        Setting::Toggle(&connector_markers::AXIS_COLORS),
+        Setting::Toggle(&slider_drag::LIFT_SLIDER_LIMITS),
+        Setting::Toggle(&axis_permutations::ORDER_BUTTON),
+        Setting::Choice(&compact_panel::COMPACT_PANEL),
     ],
+    unlisted: &[],
+}];
+
+/// The settings of what the editor previews: where shots go, the tooltips of the shot preview and
+/// the view modes, and the Physics view mode's centers and lift and drag.
+static PREVIEWS: [Section; 1] = [Section {
+    title: "Shot preview and view modes",
+    settings: &[
+        Setting::Choice(&gun_preview::SHOWS),
+        Setting::Toggle(&gun_preview::HITS_VEHICLE),
+        Setting::Choice(&view_modes::TOOLTIPS),
+        Setting::Toggle(&view_modes::CENTERS),
+        Setting::Choice(&view_modes::LIFT_DRAG),
+    ],
+    unlisted: &[],
 }];

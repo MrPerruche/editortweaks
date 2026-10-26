@@ -1,41 +1,35 @@
-//! Where the forces on a vehicle act, from plain data: the center of lift for a vehicle flying
-//! forward, and the center of thrust. Both are where the forces' sum acts, each force counted by
-//! how much of it goes along the sum (forces pushing elsewhere count less, against it negatively),
-//! so the sum must be big enough to have a direction.
+//! Where the forces on a vehicle act, from plain data: the centers of lift for a vehicle turning
+//! away from the way it flies (one per axis), and the center of any set of forces (thrust, drag).
+//! Each is where the forces' sum acts, each force counted by how much of it goes along the sum
+//! (forces pushing elsewhere count less, against it negatively), so the sum must be big enough to
+//! have a direction.
 //!
-//! Lift follows the game's formula (`docs/re/physics-centers.md`): a surface moving through the air
-//! with velocity `V` is pushed across `V`, away from the air hitting it, by
-//! `PI * Radius^2 * Speed^2 * Density * Factor(Angle)`, `Angle` being between `V` and the surface
-//! (`asin(|V.Normal|)`): `Factor` rises as a sine to 1 at [`PEAK_LIFT_ANGLE`] and falls back to 0 at
-//! [`MAX_LIFT_ANGLE`]. Speed and density are the same for every surface, so each counts by
-//! `Radius^2 * Factor`.
+//! Lift follows the game's formula ([`aero`]). Speed and density are the same for every surface, so
+//! each counts by its push per unit of both.
+//!
+//! Stability is about the lift that *changes* when the nose turns away from the airflow: behind the
+//! center of mass it turns the nose back. Pitch and yaw are separate (a plane can be stable in one
+//! and not the other), so each axis gets its own center: the vehicle flown with its nose
+//! [`TURN_ANGLE`] up minus down (pitch: wings, tailplanes), or left minus right (yaw: fins). Lift
+//! that stays the same both ways (a wing's incidence, wings in a side slip) cancels out, so each
+//! center only counts the surfaces working on its axis: what aircraft designers call the neutral
+//! point.
 
+use super::aero::{self, Coefficients, Surface};
 use crate::math::{self, Vec3};
 
-/// `BR.FluidDynamics.PeakLiftAngle` and `MaxLiftAngle`, the game's defaults (console variables), in
-/// degrees: lift is strongest at the first and gone from the second.
-const PEAK_LIFT_ANGLE: f64 = 22.5;
-const MAX_LIFT_ANGLE: f64 = 80.0;
-
-/// The vehicle's forward and up (its own X and Z axes, the editor's).
-const FORWARD: Vec3 = [1.0, 0.0, 0.0];
+/// The vehicle's forward, right and up (its own X, Y and Z axes, the editor's).
+pub const FORWARD: Vec3 = [1.0, 0.0, 0.0];
+const RIGHT: Vec3 = [0.0, 1.0, 0.0];
 const UP: Vec3 = [0.0, 0.0, 1.0];
 
-/// How far the nose points above the way the vehicle flies, in degrees, for the center of lift:
-/// enough for flat wings to lift, far below the peak.
-const ANGLE_OF_ATTACK: f64 = 5.0;
+/// How far the nose turns away from the way the vehicle flies, in degrees, for the centers of lift:
+/// enough for flat surfaces to lift, far below the peak.
+const TURN_ANGLE: f64 = 5.0;
 
 /// A sum of forces smaller than this (relative to the sum of their sizes) has no direction: they
 /// cancel out, e.g. only vertical fins, or thrusters pushing against each other.
 const CANCELLED: f64 = 1e-6;
-
-/// A lift surface, in the vehicle's space.
-#[derive(Clone, Copy, Debug)]
-pub struct LiftSurface {
-    pub location: Vec3,
-    pub normal: Vec3,
-    pub radius: f64,
-}
 
 /// A force and where it pushes, in the vehicle's space.
 #[derive(Clone, Copy, Debug)]
@@ -44,52 +38,48 @@ pub struct Force {
     pub force: Vec3,
 }
 
-/// The center of lift of `surfaces` for the vehicle flying forward with its nose
-/// [`ANGLE_OF_ATTACK`] up; `None` if they lift nothing then.
-pub fn center_of_lift(surfaces: &[LiftSurface]) -> Option<Vec3> {
-    let (sin, cos) = ANGLE_OF_ATTACK.to_radians().sin_cos();
-    // Flying slightly below where the nose points.
-    let velocity = math::sub(math::scale(FORWARD, cos), math::scale(UP, sin));
+/// The axis the nose turns around, for a center of lift.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Axis {
+    /// Nose up and down: horizontal surfaces.
+    Pitch,
+    /// Nose left and right: vertical surfaces.
+    Yaw,
+}
+
+impl Axis {
+    /// The way the vehicle flies (unit length) with its nose turned `degrees` around this axis: up
+    /// for pitch, left for yaw, so flying a little below or right of where the nose points.
+    fn velocity(self, degrees: f64) -> Vec3 {
+        let (sin, cos) = degrees.to_radians().sin_cos();
+        let side = match self {
+            Axis::Pitch => math::scale(UP, -sin),
+            Axis::Yaw => math::scale(RIGHT, sin),
+        };
+        math::add(math::scale(FORWARD, cos), side)
+    }
+}
+
+/// The center of lift of `surfaces` around `axis`: where the lift changing as the nose turns
+/// [`TURN_ANGLE`] one way and the other acts; `None` if no surface works on that axis.
+pub fn center_of_lift(
+    surfaces: &[Surface],
+    axis: Axis,
+    coefficients: &Coefficients,
+) -> Option<Vec3> {
+    let (one_way, other_way) = (axis.velocity(TURN_ANGLE), axis.velocity(-TURN_ANGLE));
     let forces: Vec<Force> = surfaces
         .iter()
         .filter_map(|surface| {
-            Some(Force {
+            let lift = |velocity| aero::lift(surface, velocity, coefficients).unwrap_or_default();
+            let change = math::sub(lift(one_way), lift(other_way));
+            (change != [0.0; 3]).then_some(Force {
                 location: surface.location,
-                force: lift(surface, velocity)?,
+                force: change,
             })
         })
         .collect();
     center_of(&forces)
-}
-
-/// The lift on `surface` moving with `velocity` (unit length), up to the factor every surface
-/// shares; `None` if it lifts nothing.
-fn lift(surface: &LiftSurface, velocity: Vec3) -> Option<Vec3> {
-    let normal = math::normalized(surface.normal)?;
-    let along = math::dot(velocity, normal);
-    let factor = lift_factor(along.abs().min(1.0).asin().to_degrees());
-    if factor <= 0.0 {
-        return None;
-    }
-    // Across the velocity, toward the side the surface moves away from.
-    let across = math::sub(normal, math::scale(velocity, along));
-    let direction = math::normalized(math::scale(across, -along.signum()))?;
-    Some(math::scale(
-        direction,
-        surface.radius * surface.radius * factor,
-    ))
-}
-
-/// The game's lift factor at `angle` degrees between the velocity and the surface.
-fn lift_factor(angle: f64) -> f64 {
-    if angle <= 0.0 || angle >= MAX_LIFT_ANGLE {
-        0.0
-    } else if angle < PEAK_LIFT_ANGLE {
-        (angle / PEAK_LIFT_ANGLE * core::f64::consts::FRAC_PI_2).sin()
-    } else {
-        let past = (angle - PEAK_LIFT_ANGLE) / (MAX_LIFT_ANGLE - PEAK_LIFT_ANGLE);
-        ((past * core::f64::consts::PI).cos() + 1.0) / 2.0
-    }
 }
 
 /// Where the sum of `forces` acts; `None` if they cancel out.

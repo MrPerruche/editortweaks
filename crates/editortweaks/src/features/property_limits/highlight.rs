@@ -7,7 +7,8 @@
 //! The game's range is the slider's (`MinValue`/`MaxValue`): the panel shows each property's own
 //! range on its sliders (`property`). The rules need the property and the edited object, which only
 //! the row knows: a numeric row fills its sliders in `UNumericPropertyWidget::UpdateValue`
-//! (`game::property_widget`), whenever the panel shows or refreshes the property. While it runs, it
+//! (`game::property_widget`, through `number_rows`), whenever the panel shows or refreshes the
+//! property. While it runs, it
 //! asks the property for its range: [`on_panel_range`] (from `property`'s `GetValueRange` hook)
 //! checks the value against the rules then. A slider shows the first edited object's value, so that
 //! one is checked.
@@ -21,15 +22,16 @@ use std::cell::{Cell, RefCell};
 use std::sync::OnceLock;
 
 use super::limits::{self, Edit};
-use crate::framework::hook;
+use crate::features::number_rows;
 use crate::game::numeric_property::{self, Container, NumericRange};
-use crate::game::property_widget::{self, PropertyWidgets, UpdateValueFn};
+use crate::game::property_widget::{self, PropertyWidgets};
 use crate::game::slider::{self, RangeFields, ValueFields};
 use crate::game::ui_style::{self, ButtonColorStyle, ColorStyleValues};
 use crate::game::weak_object::WeakObject;
 use crate::prelude::*;
 
-static UPDATE_VALUE: OnceLock<UpdateValueFn> = OnceLock::new();
+/// Whether rows are watched as they update (`number_rows`).
+static LISTENING: OnceLock<()> = OnceLock::new();
 /// Set once reflection is available; until then (or if it fails) sliders keep their colors.
 static SLIDERS: OnceLock<Sliders> = OnceLock::new();
 
@@ -67,26 +69,15 @@ thread_local! {
     static RESTYLED: RefCell<Vec<Restyled>> = const { RefCell::new(Vec::new()) };
 }
 
-pub(super) fn resolve() -> Result<*const u8, String> {
-    property_widget::UPDATE_VALUE.resolve()
-}
-
-/// # Safety
-/// `target` must be `UpdateValue`, resolved by [`resolve`].
-pub(super) unsafe fn install(target: *const u8) -> Result<(), String> {
-    // SAFETY: `update_value` matches `UpdateValueFn`, the hooked function's signature.
-    unsafe {
-        hook::install_typed(
-            property_widget::UPDATE_VALUE.name,
-            target,
-            update_value as UpdateValueFn,
-            &UPDATE_VALUE,
-        )
-    }
+/// Watches rows as they update. Before engine init.
+pub(super) fn install() -> Result<(), String> {
+    number_rows::listen(around_update)?;
+    let _ = LISTENING.set(());
+    Ok(())
 }
 
 pub(super) fn on_engine_init() {
-    if UPDATE_VALUE.get().is_none() {
+    if LISTENING.get().is_none() {
         return; // not hooked (pattern missing), already logged
     }
     let sliders = || -> Result<Sliders, String> {
@@ -141,11 +132,10 @@ pub(super) unsafe fn on_slider_moved(slider: *mut c_void) {
     }
 }
 
-unsafe extern "C" fn update_value(this: *mut c_void, event: *const c_void) {
-    let original = *UPDATE_VALUE.get().expect("hook recorded before use");
+/// A numeric row `this` updates (`number_rows`): restyles its sliders once filled.
+unsafe fn around_update(this: *mut c_void, update: &mut dyn FnMut()) {
     let previous = ROW_UPDATE.replace(Some(RowUpdate::default()));
-    // SAFETY: forwards the caller's arguments unchanged.
-    unsafe { original(this, event) };
+    update();
     let row = ROW_UPDATE.replace(previous).unwrap_or_default();
 
     let Some(sliders) = SLIDERS.get() else {

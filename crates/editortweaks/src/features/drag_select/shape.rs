@@ -1,8 +1,9 @@
 //! Bricks' shapes, for picking: what a click's trace hits (see `docs/re/selection.md`), placed in
 //! the world like the game places it.
 //!
-//! - Most bricks: their mesh's complex collision triangles (read through `game::brick_model`),
-//!   scaled to the brick's box like the game scales the mesh (see `brick_model::scale_to_fit`).
+//! - Most bricks: their mesh's complex collision triangles (read through `game::brick_model`; for
+//!   meshes without, mods' often, their render triangles from the game's files), scaled to the
+//!   brick's box like the game scales the mesh (see `brick_model::scale_to_fit`).
 //! - Spinners: the convex pieces the game builds along their arc, at their size (their own body
 //!   setup, read through `game::collision`); the pieces' faces are worked out here (`math::hull`).
 //!

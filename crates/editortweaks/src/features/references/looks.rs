@@ -8,7 +8,8 @@
 //!   draw into custom depth).
 //! - Models: `M_Simple_Master`, the game's plain lit material (a color, metallic, roughness), and
 //!   for textured parts the Bricksville sign's material (`M_LegacyProp_Master`, lit, with its
-//!   `HasBaseColorMap` switch on) with the part's texture as `BaseColor` and a flat normal map.
+//!   `HasBaseColorMap` switch on) with the part's texture as `BaseColor` and a flat normal map
+//!   ([`FLAT_NORMAL`]).
 //!   No map needs to have loaded the sign: it's loaded when a textured part first needs it. If it
 //!   can't be, textured parts show unlit with the masked image material (no shading, no shadows).
 //! - See-through models, by the setting [`SEE_THROUGH_LOOK`]:
@@ -16,8 +17,8 @@
 //!     its `Opacity` a screen-space dither). Its color is a shirt texture and color, picked by two
 //!     mask textures: a red one for both shows the shirt everywhere, so the part's texture and
 //!     color go there. Masked materials draw depth and motion like opaque ones, so the engine's
-//!     temporal anti-aliasing doesn't smear them as it does translucent ones. But the game's dither
-//!     is coarse (a 4 x 4 grid of 4 x 4-pixel blocks): the part looks covered in square tiles.
+//!     temporal anti-aliasing doesn't smear them as it does translucent ones. The game's dither is
+//!     coarse (a 4 x 4 grid of 4 x 4-pixel blocks), as hidden bricks show it.
 //!   - Smooth (the default): the glass bricks' base material (`M_Brick_Translucent`, lit and translucent) with
 //!     its `Opacity` and `EdgeOpacity` set to the reference's opacity. It's a layered material: those
 //!     are parameters of its one layer, set as such ([`SEE_THROUGH_LAYER`]). It takes its color
@@ -25,6 +26,9 @@
 //!     its own textures from the world: a model's textures can't show in it, so textured parts take
 //!     their texture's average color. Or they show their texture unlit with the translucent image
 //!     material.
+//! - A reference's color multiplies all of these (linear RGB, `Reference::color` converted): the
+//!   images' tint, the plain, dithered and see-through colors. Lit textured parts have no color
+//!   parameter, so they get their texture multiplied (`model_io::Image::tinted`, in `scene`).
 //! - Hidden references (the Hide key): the hidden bricks' material (`M_HiddenObject`) as it is.
 
 use std::cell::Cell;
@@ -43,7 +47,7 @@ use crate::prelude::*;
 pub static SEE_THROUGH_LOOK: Choice = Choice::new(
     "ReferencesSeeThroughLook",
     "See-through models",
-    "How a reference model looks while see-through (opacity below 100%). Smooth: really see-through, but the image smears while the camera moves; lit with each texture shown as its average color, or with its textures unlit (no shading). Dithered: a coarse checker of square blocks (like hidden bricks), lit, with its textures, and steady while the camera moves. Images are always smooth.",
+    "How reference models below 100% opacity look. Dithered: a checker of blocks, lit and textured. Smooth: truly see-through but smears while the camera moves, with average colors or unlit textures.",
     &[
         Alternative {
             key: "Dithered",
@@ -94,7 +98,10 @@ const LIT_TEXTURED: &str = "/Game/BrickRigs/Blueprints/Props/BricksvilleSign/Mat
 const LIT_BASE_COLOR: &str = "BaseColor";
 const LIT_NORMAL: &str = "Normal";
 const LIT_METALLIC: &str = "Metallic";
-const FLAT_NORMAL: &str = "/Engine/EngineMaterials/DefaultNormal.DefaultNormal";
+/// Not `DefaultNormal`: that one is a grid of bumpy tiles (the parts looked made of stone tiles).
+/// `FlatNormal` isn't cooked into the game; this one is (the glass bricks' layer's default), and
+/// holds 188, which sRGB decoding makes 0.5: flat.
+const FLAT_NORMAL: &str = "/Engine/EngineMaterials/BaseFlattenNormalMap.BaseFlattenNormalMap";
 
 /// The see-through material (the glass bricks' base) and its parameters (`docs/re/references.md`).
 const SEE_THROUGH: &str =
@@ -226,11 +233,7 @@ impl Looks {
                 if !texture.is_null() {
                     textures.set_texture(material, DITHERED_TEXTURE, texture);
                 }
-                textures.set_color(
-                    material,
-                    DITHERED_COLOR,
-                    [color[0], color[1], color[2], 1.0],
-                );
+                Self::set_dithered_color(textures, material, color);
                 textures.set_texture(material, DITHERED_NORMAL, flat_normal);
                 for (name, value) in DITHERED_PLAIN {
                     textures.set_scalar(material, name, value);
@@ -239,6 +242,25 @@ impl Looks {
             }
             material
         }
+    }
+
+    /// Changes the color (linear RGBA; alpha unused) of a material made by [`Self::dithered`].
+    ///
+    /// # Safety
+    /// `material` must be a live dithered material. Game thread only.
+    pub unsafe fn set_dithered_color(
+        textures: &Textures,
+        material: *mut UObjectBase,
+        color: [f32; 4],
+    ) {
+        // SAFETY: per the contract.
+        unsafe {
+            textures.set_color(
+                material,
+                DITHERED_COLOR,
+                [color[0], color[1], color[2], 1.0],
+            )
+        };
     }
 
     /// Changes the opacity of a material made by [`Self::dithered`].
@@ -279,7 +301,8 @@ impl Looks {
         red
     }
 
-    /// A material showing `texture` (null for none) with `opacity`; null if the engine made none.
+    /// A material showing `texture` (null for none) multiplied by `tint` (linear RGB), with
+    /// `opacity`; null if the engine made none.
     ///
     /// # Safety
     /// `context` must be a live object in the editor's world, `texture` null or a live texture.
@@ -289,6 +312,7 @@ impl Looks {
         textures: &Textures,
         context: *mut UObjectBase,
         texture: *mut UObjectBase,
+        tint: [f32; 3],
         opacity: f32,
     ) -> *mut UObjectBase {
         let parent = if is_opaque(opacity) {
@@ -301,31 +325,29 @@ impl Looks {
             let material = textures.instance(context, parent);
             if !material.is_null() {
                 textures.set_texture(material, IMAGE_TEXTURE, texture);
-                self.set_image_opacity(textures, material, opacity);
+                self.set_image_tint(textures, material, tint, opacity);
                 textures.set_scalar(material, IMAGE_ALPHA_FROM_TEXTURE, 1.0);
             }
             material
         }
     }
 
-    /// Changes the opacity of an image material made by [`Self::image`] (with the same opacity
-    /// kind: a masked one stays opaque).
+    /// Changes the tint and opacity of an image material made by [`Self::image`] (with the same
+    /// opacity kind: a masked one stays opaque).
     ///
     /// # Safety
     /// `material` must be a live image material. Game thread only.
-    pub unsafe fn set_image_opacity(
+    pub unsafe fn set_image_tint(
         &self,
         textures: &Textures,
         material: *mut UObjectBase,
+        tint: [f32; 3],
         opacity: f32,
     ) {
+        let [r, g, b] = tint;
         // SAFETY: per the contract.
         unsafe {
-            textures.set_color(
-                material,
-                IMAGE_TINT,
-                [1.0, 1.0, 1.0, opacity.clamp(0.0, 1.0)],
-            );
+            textures.set_color(material, IMAGE_TINT, [r, g, b, opacity.clamp(0.0, 1.0)]);
         }
     }
 
@@ -343,11 +365,26 @@ impl Looks {
         unsafe {
             let material = textures.instance(context, self.plain);
             if !material.is_null() {
-                textures.set_color(material, PLAIN_COLOR, [color[0], color[1], color[2], 1.0]);
+                Self::set_plain_color(textures, material, color);
                 textures.set_scalar(material, PLAIN_METALLIC, 0.0);
                 textures.set_scalar(material, PLAIN_ROUGHNESS, 0.7);
             }
             material
+        }
+    }
+
+    /// Changes the color (linear RGBA; alpha unused) of a material made by [`Self::plain`].
+    ///
+    /// # Safety
+    /// `material` must be a live plain material. Game thread only.
+    pub unsafe fn set_plain_color(
+        textures: &Textures,
+        material: *mut UObjectBase,
+        color: [f32; 4],
+    ) {
+        // SAFETY: per the contract.
+        unsafe {
+            textures.set_color(material, PLAIN_COLOR, [color[0], color[1], color[2], 1.0]);
         }
     }
 
@@ -365,7 +402,7 @@ impl Looks {
         // SAFETY: per the contract.
         unsafe {
             let (Some(parent), Some(flat_normal)) = (self.lit.get(), self.flat_normal.get()) else {
-                return self.image(textures, context, texture, 1.0);
+                return self.image(textures, context, texture, [1.0; 3], 1.0);
             };
             let material = textures.instance(context, parent);
             if !material.is_null() {

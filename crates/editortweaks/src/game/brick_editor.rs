@@ -110,6 +110,10 @@ pub struct Operation {
 /// 0x9CE60): bricks' places changed (0x1, 0x4 and 0x10; their meanings aren't mapped).
 pub const MOVED: u32 = 0x1 | 0x4 | 0x10;
 
+/// The flag the panel's write helpers set after a final edit of a brick property (e.g. the color
+/// one, game 0xEB43D0: `1 << 5`, or `1 << 6` for `FObjectOrderBrickProperty`).
+pub const PROPERTY_CHANGED: u32 = 0x20;
+
 type PostModifyFn = unsafe extern "C" fn(editor: *mut UObjectBase, operation: *const Operation);
 
 /// `PostModify` as hooked (or why not), see [`BrickEditor::after_modify`].

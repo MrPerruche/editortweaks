@@ -37,10 +37,15 @@ def uassetgui() -> Path:
 
 
 def export_json(asset: Path) -> dict:
-    """The asset as UAssetGUI's JSON (it reads a copy, in a scratch folder)."""
+    """The asset as UAssetGUI's JSON (it reads a copy, in a scratch folder). A cooked asset's
+    `.uexp` (and `.ubulk`) next to it are copied too: they hold its exports' data."""
     with tempfile.TemporaryDirectory() as scratch:
         copy = Path(scratch) / asset.name
         copy.write_bytes(asset.read_bytes())
+        for suffix in (".uexp", ".ubulk"):
+            sibling = asset.with_suffix(suffix)
+            if sibling.exists():
+                copy.with_suffix(suffix).write_bytes(sibling.read_bytes())
         out = Path(scratch) / "asset.json"
         subprocess.run([str(uassetgui()), "tojson", str(copy), str(out), "VER_UE4_27"], check=True)
         if not out.exists():
@@ -139,8 +144,33 @@ class Decompiler:
             return f"{show(e['AssigningProperty'])} = [{', '.join(map(show, e['Elements']))}]"
         if k == "EX_ArrayConst":
             return f"[{', '.join(map(show, e['Elements']))}]"
+        if k in ("EX_Int64Const", "EX_UInt64Const", "EX_IntConstByte", "EX_SkipOffsetConst"):
+            return str(e["Value"])
+        if k in ("EX_VectorConst", "EX_RotationConst", "EX_TransformConst"):
+            return f"{k[3:-5]}{json.dumps(e['Value'], separators=(',', ':'))}"
+        if k in ("EX_ObjToInterfaceCast", "EX_CrossInterfaceCast", "EX_InterfaceToObjCast"):
+            return f"Cast<{self.object_name(e['ClassPtr'])}>({show(e['Target'])})"
+        if k == "EX_MetaCast":
+            return f"ClassCast<{self.object_name(e['ClassPtr'])}>({show(e['TargetExpression'])})"
+        if k == "EX_InterfaceContext":
+            return show(e["InterfaceValue"])
+        if k == "EX_InstanceDelegate":
+            return f"delegate('{e['FunctionName']}')"
+        if k == "EX_AddMulticastDelegate":
+            return f"{show(e['Delegate'])} += {show(e['DelegateToAdd'])}"
+        if k == "EX_RemoveMulticastDelegate":
+            return f"{show(e['Delegate'])} -= {show(e['DelegateToAdd'])}"
+        if k == "EX_ClearMulticastDelegate":
+            return f"{show(e['DelegateToClear'])}.Clear()"
+        if k == "EX_CallMulticastDelegate":
+            return f"{show(e['Delegate'])}.Broadcast({', '.join(map(show, e['Parameters']))})"
+        if k == "EX_ArrayGetByRef":
+            return f"{show(e['ArrayVariable'])}[{show(e['ArrayIndex'])}]"
+        if k == "EX_DefaultVariable":
+            return "default." + property_name(e["Variable"])
         simple = {"EX_Self": "self", "EX_True": "true", "EX_False": "false", "EX_NoObject": "None",
-                  "EX_Nothing": "", "EX_EndOfScript": "end"}
+                  "EX_Nothing": "", "EX_EndOfScript": "end", "EX_IntZero": "0", "EX_IntOne": "1",
+                  "EX_NoInterface": "None"}
         return simple.get(k, k)
 
     def text(self, v: dict) -> str:
@@ -237,4 +267,32 @@ def size(e: dict) -> int:
         return 1 + size(e["AssigningProperty"]) + sum(map(size, e["Elements"])) + 1
     if k == "EX_ArrayConst":
         return 1 + POINTER + 4 + sum(map(size, e["Elements"])) + 1
+    if k in ("EX_IntZero", "EX_IntOne", "EX_NoInterface"):
+        return 1
+    if k == "EX_IntConstByte":
+        return 1 + 1
+    if k in ("EX_Int64Const", "EX_UInt64Const"):
+        return 1 + 8
+    if k == "EX_SkipOffsetConst":
+        return 1 + OFFSET
+    if k in ("EX_VectorConst", "EX_RotationConst"):
+        return 1 + 12
+    if k == "EX_TransformConst":
+        return 1 + 40
+    if k in ("EX_ObjToInterfaceCast", "EX_CrossInterfaceCast", "EX_InterfaceToObjCast"):
+        return 1 + POINTER + size(e["Target"])
+    if k == "EX_MetaCast":
+        return 1 + POINTER + size(e["TargetExpression"])
+    if k == "EX_InterfaceContext":
+        return 1 + size(e["InterfaceValue"])
+    if k == "EX_InstanceDelegate":
+        return 1 + NAME
+    if k in ("EX_AddMulticastDelegate", "EX_RemoveMulticastDelegate"):
+        return 1 + size(e["Delegate"]) + size(e["DelegateToAdd"])
+    if k == "EX_ClearMulticastDelegate":
+        return 1 + size(e["DelegateToClear"])
+    if k == "EX_CallMulticastDelegate":
+        return 1 + POINTER + size(e["Delegate"]) + sum(map(size, e["Parameters"])) + 1
+    if k == "EX_ArrayGetByRef":
+        return 1 + size(e["ArrayVariable"]) + size(e["ArrayIndex"])
     raise SystemExit(f"bytecode expression {k} not supported yet: add it to etlib/blueprint.py")

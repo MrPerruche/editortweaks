@@ -84,6 +84,13 @@ pub const GUIDE: Pen = Pen {
     on_top: true,
     halo: true,
 };
+/// A spinner's hub, while it's under the mouse with the resize key held.
+pub const HUB: Pen = Pen {
+    color: [0.55, 0.85, 1.0],
+    pixels: 1.5,
+    on_top: false,
+    halo: false,
+};
 /// Where the mouse points while resizing, when the engine hides the cursor.
 pub const POINTER: Pen = Pen {
     color: [1.0, 1.0, 1.0],
@@ -430,6 +437,11 @@ impl Drawing {
             geometry::add(point, geometry::scale(normal, half)),
             pen,
         );
+    }
+
+    /// The size of a pixel at `point`, in centimeters.
+    pub fn pixel_at(&self, point: Vec3) -> f64 {
+        self.pixels.at(point)
     }
 
     /// How long the segment from `start` to `end` looks (pixels, about: at its middle's distance).

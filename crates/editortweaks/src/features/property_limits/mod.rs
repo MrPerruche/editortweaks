@@ -15,6 +15,8 @@
 //! (until they edit that value). Arrow keys still stop at the slider's ends, and so does dragging
 //! unless `slider_drag` lifts that; a rule's `drag_min` then stops drags before typed values.
 //!
+//! The color row's sliders keep the game's range ([`is_color_slider`]).
+//!
 //! [`highlight`] colors sliders showing values outside of the game's range, and differently those
 //! outside of the rules too.
 
@@ -43,7 +45,6 @@ impl Feature for PropertyLimits {
         let property_targets = property::resolve()?;
         let brick_size_target = brick_size::resolve();
         let dependencies_targets = dependencies::resolve();
-        let highlight_target = highlight::resolve();
 
         // SAFETY: each target is the start of the function its pattern identifies, and each
         // submodule's detours have exactly the signatures declared next to those patterns.
@@ -60,12 +61,9 @@ impl Feature for PropertyLimits {
                     "limits depending on other properties only apply when their value is edited: {reason}"
                 ),
             }
-            match highlight_target {
-                Ok(target) => highlight::install(target)?,
-                Err(reason) => {
-                    log!("values outside of the game's range aren't highlighted: {reason}")
-                }
-            }
+        }
+        if let Err(reason) = highlight::install() {
+            log!("values outside of the game's range aren't highlighted: {reason}");
         }
         Ok(())
     }
@@ -81,4 +79,24 @@ impl Feature for PropertyLimits {
 /// Known from engine init on.
 pub(crate) fn keeps_slider_values() -> bool {
     slider::active()
+}
+
+/// Whether the values numeric properties store can be rewritten per edited object
+/// (`slider_formulas::per_object_value`, `axis_permutations::per_object_value`), from the hook of
+/// `ClampValue`. Known from load on.
+pub(crate) fn rewrites_stored_values() -> bool {
+    property::hooked()
+}
+
+/// How far values go where nothing limits them (see `rules::UNLIMITED`), for rows of ours that take
+/// typed values past their sliders' ends as bricks' do.
+pub(crate) const UNLIMITED: f32 = rules::UNLIMITED;
+
+/// Whether `slider` is one of a brick color row's, whose range stays (a hue past 360 isn't a color).
+///
+/// # Safety
+/// `slider` must be a live `UBrickSliderWidget`. Game thread only.
+pub(crate) unsafe fn is_color_slider(slider: *const core::ffi::c_void) -> bool {
+    // SAFETY: per the contract.
+    unsafe { slider::is_color_slider(slider) }
 }

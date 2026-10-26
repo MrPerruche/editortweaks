@@ -6,13 +6,14 @@
 //! - **Add reference**: Image... or Model..., opening the Windows file dialog; the new reference
 //!   links to its file where it is, or copies it next to the vehicle, as the setting [`ADD_AS`]
 //!   says (the File row changes it afterwards).
-//! - **Select references** (the setting [`select::SELECTABLE`]), **Show references** (also a key,
-//!   `keybinds::SHOW_REFERENCES`) to hide them all for now, and **Hidden references** to show again
-//!   those made invisible (opacity 0, or hidden in the sidecar), which can't be clicked.
+//! - **Show references**: Hidden (all of them for now, also the key `keybinds::SHOW_REFERENCES`),
+//!   Not selectable or Visible (the setting [`select::SELECTABLE`] off or on), and **Hidden
+//!   references** to show again those made invisible (opacity 0, or hidden in the sidecar), which
+//!   can't be clicked.
 //!
 //! With references selected (clicked, see [`select`]), the panel shows them instead of the
-//! editor's settings, as it shows selected bricks (`settings_list::replace`): their opacity, link
-//! or copy, position, rotation, width (images) or scale (models); for models their pivot, and
+//! editor's settings, as it shows selected bricks (`settings_list::replace`): their color and
+//! opacity (the game's color picker, alpha being the opacity), link or copy, position, rotation, width (images) or scale (models); for models their pivot, and
 //! for OBJ and STL files (glTF fixes them) the file's up and front axes and units. The first
 //! selected reference's values show; a change goes to every selected reference the row fits:
 //! positions move them together, the other values are set on each.
@@ -30,9 +31,11 @@ use model_io::sidecar::{Kind, Reference, SourceMode};
 use model_io::space::{Axis, Pivot, Units};
 
 use super::{CODE, State, edit, files, select, state};
+use crate::features::editor_bounds;
+use crate::features::property_limits;
 use crate::features::settings_list;
-use crate::framework::settings::{Alternative, Choice, Setting};
-use crate::game::property_reflection::{Check, List, Number, Row, Unit, Value};
+use crate::framework::settings::{Alternative, Choice};
+use crate::game::property_reflection::{Color, List, Number, Row, Unit, Value};
 use crate::prelude::*;
 
 /// What the editor's side panel asks the settings list for, with no brick selected, and the
@@ -44,7 +47,7 @@ const SECTION: &str = "References";
 /// cm.
 const VIEW_GAP: f64 = 20.0;
 
-/// The ends of the position sliders (typed values go further, up to the limit), in cm.
+/// The ends of the position sliders when the editor's bounds are unknown, in cm.
 const POSITION_RANGE: (f32, f32) = (-10_000.0, 10_000.0);
 /// The ends of an image's width, in cm.
 const WIDTH_RANGE: (f32, f32) = (1.0, 100_000.0);
@@ -64,7 +67,7 @@ type RowSpec = (
 pub static ADD_AS: Choice = Choice::new(
     "ReferencesAddAs",
     "New references",
-    "Whether a reference you add links to its file where it is, or copies it into the vehicle's folder, so moving or deleting the original doesn't lose it (on this PC only: copies aren't uploaded with the vehicle). The File row of a selected reference changes it afterwards.",
+    "Whether an added reference links to its file, or copies it into the vehicle's folder so moving the original doesn't lose it (copies stay on this PC). A reference's File row changes it later.",
     &[
         Alternative {
             key: "Link",
@@ -88,11 +91,11 @@ const GENERAL: [RowSpec; 3] = [
         always,
     ),
     (
-        "ReferencesShown",
+        "ReferencesVisibility",
         "Show references",
         SHOWN_DESCRIPTION,
-        Value::Check(&SHOWN),
-        has_references,
+        Value::List(&SHOWN),
+        always,
     ),
     (
         "ReferencesHidden",
@@ -103,19 +106,16 @@ const GENERAL: [RowSpec; 3] = [
     ),
 ];
 
-/// Where the setting [`select::SELECTABLE`] goes among [`GENERAL`]: after the Add row.
-const SELECTABLE_AT: usize = 1;
-
 /// The sections with references selected: their titles and rows.
 const SELECTED: [(&str, &[RowSpec]); 2] = [
     (
         "Reference",
         &[
             (
-                "ReferenceOpacity",
-                "Opacity",
-                OPACITY_DESCRIPTION,
-                Value::Number(&OPACITY),
+                TINT_KEY,
+                "Color",
+                TINT_DESCRIPTION,
+                Value::Color(&TINT),
                 always,
             ),
             (
@@ -194,13 +194,7 @@ const SELECTED: [(&str, &[RowSpec]); 2] = [
 /// number rows in this game version) is left out, the others stay.
 pub(super) fn add() -> Result<(), String> {
     let mut general = Vec::new();
-    for (index, spec) in GENERAL.iter().enumerate() {
-        if index == SELECTABLE_AT {
-            match settings_list::setting_row(Setting::Toggle(&select::SELECTABLE)) {
-                Ok(row) => general.push(row.when(has_references)),
-                Err(reason) => log!("no row for Select references: {reason}"),
-            }
-        }
+    for spec in &GENERAL {
         push_row(&mut general, spec);
     }
     settings_list::add(EDITOR_SETTINGS, vec![(SECTION, general)])?;
@@ -218,11 +212,42 @@ pub(super) fn add() -> Result<(), String> {
     settings_list::replace(EDITOR_SETTINGS, sections, is_selected)
 }
 
-/// Makes the row `spec` and adds it to `rows`, or logs why it can't be made.
-fn push_row(rows: &mut Vec<Row>, &(key, name, description, value, when): &RowSpec) {
+/// The color row's key.
+const TINT_KEY: &str = "ReferenceTint";
+
+/// The rows shown instead of the color row if the game's color picker isn't available: opacity,
+/// then red, green and blue sliders.
+const TINT_FALLBACK: [RowSpec; 2] = [
+    (
+        "ReferenceOpacity",
+        "Opacity",
+        OPACITY_DESCRIPTION,
+        Value::Number(&OPACITY),
+        always,
+    ),
+    (
+        "ReferenceColor",
+        "Color",
+        COLOR_DESCRIPTION,
+        Value::Number(&COLOR),
+        always,
+    ),
+];
+
+/// Makes the row `spec` and adds it to `rows`, or logs why it can't be made (adding the color
+/// row's fallback rows instead).
+fn push_row(rows: &mut Vec<Row>, spec: &RowSpec) {
+    let &(key, name, description, value, when) = spec;
     match settings_list::row(key, name, description, value) {
         Ok(row) => rows.push(row.when(when)),
-        Err(reason) => log!("no row {name}: {reason}"),
+        Err(reason) => {
+            log!("no row {name}: {reason}");
+            if key == TINT_KEY {
+                for fallback in &TINT_FALLBACK {
+                    push_row(rows, fallback);
+                }
+            }
+        }
     }
 }
 
@@ -230,23 +255,21 @@ fn always() -> bool {
     true
 }
 
-const ADD_DESCRIPTION: &str = "Add a picture (PNG or JPEG, such as a blueprint, placed behind the vehicle as seen from the front) or a 3D model (glTF, GLB, OBJ or STL) to build after. Whether it links to the file or copies it is the New references setting (Editor tweaks options). Only you see it; the vehicle doesn't change.";
-const HIDDEN_DESCRIPTION: &str =
-    "Some references are invisible (opacity 0), so they can't be clicked: show them again.";
-const SHOWN_DESCRIPTION: &str = "Uncheck to make every reference invisible for now (also the Show references key, 2 by default); they come back as they were. Hide (H) hides the selected ones only, like bricks, until Unhide all (Alt + H).";
-const OPACITY_DESCRIPTION: &str = "How opaque the reference is: see-through ones let the vehicle show through them (models dithered or smooth: a setting, Editor tweaks options). At 0 it's invisible and can't be clicked. With several references selected, the first one's values show here, and a change goes to all of them.";
-const POSITION_DESCRIPTION: &str =
-    "Where the reference is, from the vehicle's origin. Several selected move together.";
-const ROTATION_DESCRIPTION: &str =
-    "How the reference is turned: about the vehicle's front axis, side axis and vertical axis.";
+const ADD_DESCRIPTION: &str = "Import an image or model as reference. This reference will only be visible in the editor! You cannot spawn it in the world. You can go in settings to set whether the game keeps a link to the file (meaning the imported file must not be moved or destroyed) or keeps a copy safe it in its game file..";
+const HIDDEN_DESCRIPTION: &str = "Some references are invisible (opacity 0), so they can't be clicked. Click to make them visible again.";
+const SHOWN_DESCRIPTION: &str = "Hide references with \"Hidden\", make so you can't select them with \"Not selectable\", or use \"Visible\" to see them.";
+const OPACITY_DESCRIPTION: &str = "How opaque the reference is. How opacity is handled can be configured in Editor Tweaks' settings. If set to 0, it is invisible and can't be clicked but can be reverted in the side bar.";
+const COLOR_DESCRIPTION: &str = "Red, green and blue that multiply the reference's colors (its picture's, or its model's parts'): 100% each leaves them as they are.";
+const TINT_DESCRIPTION: &str = "The color multiplies the reference's colors (its picture's, or its model's parts'): white leaves them as they are. Alpha is how opaque the reference is (how see-through references look can be configured in Editor Tweaks' settings); at 0 it is invisible and can't be clicked, but can be reverted in the side bar.";
+const POSITION_DESCRIPTION: &str = "Where the reference is. The sliders span the editor, typed values can go further, as for bricks.";
+const ROTATION_DESCRIPTION: &str = "Rotate a reference.";
 const WIDTH_DESCRIPTION: &str = "How wide the picture is (its height follows).";
-const SCALE_DESCRIPTION: &str = "The model's size: 100% is its size in its file.";
-const FILE_DESCRIPTION: &str = "Link: the reference shows the file where it is. Copy: the file is copied into the vehicle's folder, so moving or deleting the original doesn't lose it (on this PC only: copies aren't uploaded with the vehicle).";
-const PIVOT_DESCRIPTION: &str = "Which point of the model is at the reference's position: the file's origin, the middle of the model, or the middle of its bottom.";
+const SCALE_DESCRIPTION: &str = "Scale of the reference.";
+const FILE_DESCRIPTION: &str = "Link: loads what is found at this file path. The file must not be moved or deleted, else the reference will be lost. Copy: keep a copy of the file save in game files, avoiding accidental edits and deletions.";
+const PIVOT_DESCRIPTION: &str = "Which point of the model is at the reference's position.";
 const UP_DESCRIPTION: &str =
-    "The axis pointing up in the model's file (Blender writes +Y in OBJ files, Z-up tools +Z).";
-const FORWARD_DESCRIPTION: &str =
-    "The axis the model's front faces in its file: it faces the vehicle's front.";
+    "What axis is up for this 3D model (Blender writes +Y in OBJ files, Z-up tools +Z).";
+const FORWARD_DESCRIPTION: &str = "What axis is forward for this 3D model";
 const UNITS_DESCRIPTION: &str = "What one unit of the model's file is.";
 
 /// An edit's context besides the reference.
@@ -347,10 +370,6 @@ fn vehicle_box(state: &State) -> Option<[[f64; 3]; 2]> {
     let editor = state.editor.as_ref()?.get()?;
     // SAFETY: rows run on the game thread; the editor is live (just checked).
     unsafe { code.boxes.of(editor) }
-}
-
-fn has_references() -> bool {
-    state().is_some_and(|state| !state.sidecar.references.is_empty())
 }
 
 /// Whether a reference is hidden: invisible, so it can't be clicked.
@@ -467,20 +486,47 @@ static SHOW_HIDDEN: Buttons = Buttons {
     },
 };
 
-/// The "Show references" check box.
+/// The "Show references" row: hidden, shown but not selectable, or shown and selectable.
 struct Shown;
 
 static SHOWN: Shown = Shown;
 
-impl Check for Shown {
-    fn checked(&self) -> bool {
-        state().is_none_or(|state| state.shown)
+const HIDDEN: usize = 0;
+const NOT_SELECTABLE: usize = 1;
+const VISIBLE: usize = 2;
+
+impl List for Shown {
+    fn items(&self) -> Vec<String> {
+        labels(&["Hidden", "Not selectable", "Visible"])
     }
 
-    fn set_checked(&self, checked: bool) {
-        if let Some(mut state) = state() {
-            state.show_all(checked);
+    fn chosen(&self) -> usize {
+        if !state().is_none_or(|state| state.shown) {
+            HIDDEN
+        } else if select::SELECTABLE.get() {
+            VISIBLE
+        } else {
+            NOT_SELECTABLE
         }
+    }
+
+    fn choose(&self, index: usize) -> bool {
+        let selectable = match index {
+            HIDDEN => None,
+            NOT_SELECTABLE => Some(false),
+            VISIBLE => Some(true),
+            _ => return false,
+        };
+        if let Some(selectable) = selectable
+            && selectable != select::SELECTABLE.get()
+        {
+            select::SELECTABLE.set(selectable);
+            settings_list::save();
+        }
+        if let Some(mut state) = state() {
+            state.show_all(selectable.is_some());
+        }
+        true
     }
 }
 
@@ -500,8 +546,32 @@ struct Numbers {
     /// Sets value `index` of a reference the row fits.
     set: fn(&mut Reference, usize, f64),
     together: Together,
-    range: (f32, f32),
+    /// The sliders' ends.
+    range: Ends,
+    /// The most any value can be set to, typed ones too.
+    limit: (f32, f32),
     unit: Unit,
+}
+
+/// The ends of a number row's sliders.
+#[derive(Clone, Copy)]
+enum Ends {
+    Fixed(f32, f32),
+    /// The editor's bounds along each axis, like bricks' positions.
+    Editor,
+}
+
+impl Ends {
+    /// The ends of the slider of value `index`.
+    fn of(self, index: usize) -> (f32, f32) {
+        match self {
+            Ends::Fixed(min, max) => (min, max),
+            Ends::Editor => match editor_bounds::bounds().and_then(|b| b.get(index).copied()) {
+                Some(bound) if bound > 0.0 => (-bound, bound),
+                _ => POSITION_RANGE,
+            },
+        }
+    }
 }
 
 impl Number for Numbers {
@@ -547,7 +617,15 @@ impl Number for Numbers {
     }
 
     fn range(&self) -> (f32, f32) {
-        self.range
+        self.range.of(0)
+    }
+
+    fn component_range(&self, index: usize) -> (f32, f32) {
+        self.range.of(index)
+    }
+
+    fn limit(&self) -> (f32, f32) {
+        self.limit
     }
 
     fn unit(&self) -> Unit {
@@ -564,9 +642,69 @@ static OPACITY: Numbers = Numbers {
     get: |reference| Some(vec![f64::from(reference.opacity)]),
     set: |reference, _, opacity| reference.opacity = (opacity as f32).clamp(0.0, 1.0),
     together: Together::Same,
-    range: (0.0, 1.0),
+    range: Ends::Fixed(0.0, 1.0),
+    limit: (0.0, 1.0),
     unit: Unit::Percent,
 };
+
+/// Red, green and blue, each 0 to 100%: they only multiply, so they never go past it.
+static COLOR: Numbers = Numbers {
+    get: |reference| Some(reference.color.map(f64::from).to_vec()),
+    set: |reference, index, value| {
+        if let Some(channel) = reference.color.get_mut(index) {
+            *channel = (value as f32).clamp(0.0, 1.0);
+        }
+    },
+    together: Together::Same,
+    range: Ends::Fixed(0.0, 1.0),
+    limit: (0.0, 1.0),
+    unit: Unit::Percent,
+};
+
+/// The color row: red, green and blue multiplying the reference's colors, and its opacity as alpha.
+struct Tint;
+
+static TINT: Tint = Tint;
+
+/// A reference's color and opacity as the color picker shows them (0 to 255).
+fn rgba(reference: &Reference) -> [u8; 4] {
+    let [r, g, b] = reference.color;
+    [r, g, b, reference.opacity].map(|value| {
+        // A color edited into the sidecar as NaN shows as white (`scene` reads it so).
+        let value = if value.is_nan() { 1.0 } else { value };
+        (value.clamp(0.0, 1.0) * 255.0).round() as u8
+    })
+}
+
+impl Color for Tint {
+    fn rgba(&self) -> [u8; 4] {
+        first_selected(|reference| Some(rgba(reference))).unwrap_or([u8::MAX; 4])
+    }
+
+    /// Only the channels the picker changed: the others keep their exact values on every reference.
+    fn set_rgba(&self, picked: [u8; 4]) {
+        let Some(old) = first_selected(|reference| Some(rgba(reference))) else {
+            return;
+        };
+        edit_selected(|reference, _| {
+            for (channel, (&old, &new)) in old.iter().zip(&picked).enumerate() {
+                if old == new {
+                    continue;
+                }
+                let value = f32::from(new) / 255.0;
+                match reference.color.get_mut(channel) {
+                    Some(color) => *color = value,
+                    None => reference.opacity = value,
+                }
+            }
+            Ok(())
+        });
+    }
+
+    fn has_alpha(&self) -> bool {
+        true
+    }
+}
 
 static POSITION: Numbers = Numbers {
     get: |reference| Some(reference.position.to_vec()),
@@ -576,7 +714,8 @@ static POSITION: Numbers = Numbers {
         }
     },
     together: Together::Moved,
-    range: POSITION_RANGE,
+    range: Ends::Editor,
+    limit: (-property_limits::UNLIMITED, property_limits::UNLIMITED),
     unit: Unit::Distance,
 };
 
@@ -592,7 +731,8 @@ static ROTATION: Numbers = Numbers {
         }
     },
     together: Together::Same,
-    range: (-180.0, 180.0),
+    range: Ends::Fixed(-180.0, 180.0),
+    limit: (-180.0, 180.0),
     unit: Unit::Angle,
 };
 
@@ -606,7 +746,8 @@ static WIDTH: Numbers = Numbers {
         }
     },
     together: Together::Same,
-    range: WIDTH_RANGE,
+    range: Ends::Fixed(WIDTH_RANGE.0, WIDTH_RANGE.1),
+    limit: WIDTH_RANGE,
     unit: Unit::Distance,
 };
 
@@ -625,7 +766,8 @@ static SCALE: Numbers = Numbers {
         };
     },
     together: Together::Same,
-    range: SCALE_RANGE,
+    range: Ends::Fixed(SCALE_RANGE.0, SCALE_RANGE.1),
+    limit: SCALE_RANGE,
     unit: Unit::Percent,
 };
 

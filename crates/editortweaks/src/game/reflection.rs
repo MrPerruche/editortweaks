@@ -263,25 +263,36 @@ pub struct BoolField {
 /// The `BoolProperty` `name` of `ustruct`; see [`struct_field`].
 pub fn bool_field(ustruct: *const UStruct, name: &'static str) -> Result<BoolField, String> {
     let property = struct_field(ustruct, name, "BoolProperty", 1)?;
-    // SAFETY: a live BoolProperty record. UE 4.27's `FBoolProperty` adds `FieldSize`, `ByteOffset`,
-    // `ByteMask` and `FieldMask` (a byte each) right after the `FProperty` fields.
-    let ([_, byte_offset, set, covered], offset) = unsafe {
-        (
-            property.add(1).cast::<[u8; 4]>().read(),
-            (*property).offset_internal,
-        )
-    };
-    if set == 0 || covered == 0 {
-        return Err(format!("field '{name}': unexpected bool layout"));
-    }
-    Ok(BoolField {
-        offset: offset as usize + usize::from(byte_offset),
-        set,
-        covered,
-    })
+    // SAFETY: a live property record.
+    unsafe { BoolField::of(property) }
+        .ok_or_else(|| format!("field '{name}': unexpected bool layout"))
 }
 
 impl BoolField {
+    /// The field `property` describes, if it's a `BoolProperty` of the expected layout.
+    ///
+    /// # Safety
+    /// `property` must be a live property record.
+    pub unsafe fn of(property: *const FProperty) -> Option<Self> {
+        // SAFETY: per the contract, and a BoolProperty record: UE 4.27's `FBoolProperty` adds
+        // `FieldSize`, `ByteOffset`, `ByteMask` and `FieldMask` (a byte each) right after the
+        // `FProperty` fields.
+        let ([_, byte_offset, set, covered], offset) = unsafe {
+            if !is_kind(property, "BoolProperty") {
+                return None;
+            }
+            (
+                property.add(1).cast::<[u8; 4]>().read(),
+                (*property).offset_internal,
+            )
+        };
+        (set != 0 && covered != 0).then(|| BoolField {
+            offset: offset as usize + usize::from(byte_offset),
+            set,
+            covered,
+        })
+    }
+
     /// The field's value in the struct at `base`.
     ///
     /// # Safety
@@ -394,6 +405,18 @@ pub unsafe fn is_class(ustruct: *const UStruct) -> bool {
         let meta = (*ustruct).ufield.uobject.class_private;
         !meta.is_null() && (*meta).ustruct.InheritsFrom_str("Class")
     }
+}
+
+/// `EClassFlags::CLASS_Native`: a C++ class.
+const CLASS_NATIVE: u32 = 0x80;
+
+/// Whether `ustruct` is a C++ class, not one a Blueprint made (nor a plain struct).
+///
+/// # Safety
+/// `ustruct` must be a live class or struct.
+pub unsafe fn is_native_class(ustruct: *const UStruct) -> bool {
+    // SAFETY: per the contract; a class record starts with its `UStruct`.
+    unsafe { is_class(ustruct) && (*ustruct.cast::<UClass>()).ClassFlags & CLASS_NATIVE != 0 }
 }
 
 /// The class of a live object.
@@ -532,6 +555,9 @@ pub type NativeThunk =
 /// `UFunction` fields brickrust doesn't declare: their offsets in UE 4.27 shipping builds, right
 /// after `UStruct` (0xB0 bytes). Editor builds (BRMK) differ.
 const FUNCTION_FLAGS: usize = 0xB0;
+/// `ParmsSize` (`uint16`): the bytes of its parameters, which `ProcessEvent` copies in and out. A
+/// Blueprint function's `PropertiesSize` also counts its local variables.
+const FUNCTION_PARMS_SIZE: usize = 0xB6;
 const FUNCTION_THUNK: usize = 0xD8;
 /// `EFunctionFlags::FUNC_Native`: implemented in C++.
 const FUNC_NATIVE: u32 = 0x400;
@@ -682,13 +708,27 @@ impl Parameters {
     /// `function` must be a live function record.
     pub unsafe fn fit(function: *const UFunction) -> bool {
         // SAFETY: per the contract.
-        let size = unsafe { (*function.cast::<UStruct>()).properties_size };
-        usize::try_from(size).is_ok_and(|size| size <= Self::SIZE)
+        unsafe { parameters_size(function) <= Self::SIZE }
     }
 
     pub fn as_mut_ptr(&mut self) -> *mut u8 {
         self.0.as_mut_ptr()
     }
+}
+
+/// The bytes of `function`'s parameters (see [`FUNCTION_PARMS_SIZE`]).
+///
+/// # Safety
+/// `function` must be a live function record.
+unsafe fn parameters_size(function: *const UFunction) -> usize {
+    // SAFETY: per the contract; the field lies within a UFunction.
+    usize::from(unsafe {
+        function
+            .cast::<u8>()
+            .add(FUNCTION_PARMS_SIZE)
+            .cast::<u16>()
+            .read()
+    })
 }
 
 /// Calls the reflected function `function` on `object` through `ProcessEvent`, as Blueprints do.
@@ -894,6 +934,29 @@ impl Function {
     pub unsafe fn call(&self, object: *mut UObjectBase, parameters: &mut Parameters) {
         // SAFETY: per the contract; the parameters fit (checked in `find`).
         unsafe { call(object, self.function, parameters.as_mut_ptr()) }
+    }
+
+    /// Calls the event on `object` as the game's C++ does (`FindFunctionChecked`, then
+    /// `ProcessEvent`): the version of `object`'s class, its Blueprint's if that implements it. The
+    /// one found on a C++ class is only the event's declaration: called, it runs nothing.
+    ///
+    /// # Safety
+    /// As for [`Function::call`].
+    pub unsafe fn call_event(
+        &self,
+        object: *mut UObjectBase,
+        parameters: &mut Parameters,
+    ) -> Result<(), String> {
+        // SAFETY: per the contract; an override has the declaration's parameters (checked by size).
+        unsafe {
+            let class = class_of(object.cast()).cast::<UClass>();
+            let function = find_function(class, self.name)?;
+            if parameters_size(function) != parameters_size(self.function) {
+                return Err(format!("{}: its override's parameters differ", self.name));
+            }
+            call(object, function, parameters.as_mut_ptr());
+        }
+        Ok(())
     }
 }
 

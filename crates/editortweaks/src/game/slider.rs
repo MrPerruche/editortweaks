@@ -28,9 +28,10 @@
 use core::ffi::c_void;
 
 use brickrust::ue::coreuobject::UObjectBase;
+use brickrust::ue::uclass::UFunction;
 
 use crate::framework::sig::FunctionSig;
-use crate::game::reflection::{self, BoolFunction};
+use crate::game::reflection::{self, BoolFunction, Parameters};
 
 pub const SET_VALUE_INTERNAL: FunctionSig = FunctionSig {
     name: "UBrickSliderWidget::SetValueInternal",
@@ -122,6 +123,61 @@ impl ValueFields {
     pub unsafe fn value_type(&self, slider: *const c_void) -> u8 {
         // SAFETY: as for `value`.
         unsafe { slider.byte_add(self.value_type).cast::<u8>().read() }
+    }
+}
+
+/// The reflected `SetValueType(ENumericValueType)` (BRMK export 0x451E40): stores the type and, if
+/// it changed, shows the value again (`UpdateSliderValue(false, false)`). A numeric row sets each
+/// slider's type from its property whenever it updates (BRMK 0x3883F0: the range, the type, then
+/// the value), so a type set afterwards lasts until the row's next update.
+pub struct SetValueType {
+    function: *const UFunction,
+    /// Offset of its one parameter.
+    value_type: usize,
+}
+
+// SAFETY: a reflection record living as long as the game; only called on the game thread.
+unsafe impl Send for SetValueType {}
+unsafe impl Sync for SetValueType {}
+
+/// Finds `SetValueType`, its one parameter checked to be a one-byte enum. After engine init.
+pub fn set_value_type() -> Result<SetValueType, String> {
+    let class =
+        reflection::find_class("BrickSliderWidget").ok_or("class BrickSliderWidget not found")?;
+    let function = reflection::find_function(class, "SetValueType")?;
+    // SAFETY: a live function record; its parameters in order.
+    unsafe {
+        let mut parameters = reflection::properties(function.cast());
+        match (parameters.next(), parameters.next()) {
+            (Some(value_type), None)
+                // An enum is an EnumProperty, or a ByteProperty for the older `TEnumAsByte`.
+                if (reflection::is_kind(value_type, "EnumProperty")
+                    || reflection::is_kind(value_type, "ByteProperty"))
+                    && (*value_type).element_size == 1
+                    && Parameters::fit(function) =>
+            {
+                Ok(SetValueType {
+                    function,
+                    value_type: (*value_type).offset_internal as usize,
+                })
+            }
+            _ => Err("SetValueType: unexpected parameters".into()),
+        }
+    }
+}
+
+impl SetValueType {
+    /// Has `slider` show its value as `value_type` (an `ENumericValueType`).
+    ///
+    /// # Safety
+    /// `slider` must be a live `UBrickSliderWidget`. Game thread only.
+    pub unsafe fn call(&self, slider: *mut UObjectBase, value_type: u8) {
+        let mut parameters = Parameters::new();
+        // SAFETY: per the contract; the parameter is a byte at its reflected offset (checked).
+        unsafe {
+            reflection::put(&mut parameters, self.value_type, value_type);
+            reflection::call(slider, self.function, parameters.as_mut_ptr());
+        }
     }
 }
 

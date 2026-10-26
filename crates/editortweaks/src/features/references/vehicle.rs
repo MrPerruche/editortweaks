@@ -1,10 +1,20 @@
 //! Which folder the open vehicle is saved in, and noticing when its sidecar or a reference's file
 //! changes on disk.
+//!
+//! The game autosaves an unsaved vehicle into a folder of its own, `Vehicles\AutoSave` (its file
+//! browser lists it as the "dedicated autosave", `bInIsDedicatedAutoSave`, and recovers it from
+//! there), whichever vehicle it is: each autosave of another unsaved vehicle replaces the last. So
+//! a sidecar there is marked with the autosave it was written with ([`mark_for`]), and belongs to
+//! the vehicle there only while that's still the one autosaved ([`belongs`]).
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
-use model_io::sidecar::{self, Reference};
+use model_io::sidecar::{self, Mark, Reference, Sidecar};
+
+/// The autosave folder's name in the vehicles' folder, and the vehicle file in it.
+const AUTOSAVE_FOLDER: &str = "AutoSave";
+const AUTOSAVE_FILE: &str = "Autosave.brv";
 
 use crate::game::editor_file::FileInfo;
 
@@ -35,6 +45,43 @@ pub fn folder_of(info: &FileInfo) -> Option<PathBuf> {
         vehicles_folder()?.join(id)
     };
     folder.is_dir().then_some(folder)
+}
+
+/// The folder the game autosaves unsaved vehicles in (it may not exist).
+pub fn autosave_folder() -> Option<PathBuf> {
+    Some(vehicles_folder()?.join(AUTOSAVE_FOLDER))
+}
+
+/// Whether `folder` is the game's autosave folder (told by name, as Windows does: any case).
+pub fn is_autosave(folder: &Path) -> bool {
+    autosave_folder().is_some_and(|autosave| {
+        autosave
+            .to_string_lossy()
+            .eq_ignore_ascii_case(&folder.to_string_lossy())
+    })
+}
+
+/// The stamp of the vehicle autosaved in the autosave folder, `None` if there's none.
+pub fn autosave_stamp() -> Option<Stamp> {
+    stamp(&autosave_folder()?.join(AUTOSAVE_FILE))
+}
+
+/// The mark a sidecar written into `folder` gets: in the autosave folder, the vehicle autosaved
+/// there now; elsewhere none (the folder is the vehicle's own).
+pub fn mark_for(folder: &Path) -> Option<Mark> {
+    is_autosave(folder)
+        .then(|| Mark::of(folder, AUTOSAVE_FILE))
+        .flatten()
+}
+
+/// Whether `sidecar`, read in `folder`, belongs to the vehicle there: in the autosave folder only
+/// if it's marked with the vehicle autosaved there now (one unmarked was written before marks).
+pub fn belongs(sidecar: &Sidecar, folder: &Path) -> bool {
+    !is_autosave(folder)
+        || sidecar
+            .vehicle
+            .as_ref()
+            .is_some_and(|mark| mark.file == AUTOSAVE_FILE && mark.matches(folder))
 }
 
 /// Whether `folder` was created after `time` (give or take a moment for clocks and rounding): the

@@ -16,44 +16,57 @@
 use super::geometry::{self, Frame, Ray, Vec3};
 use super::model::Element;
 use super::scene::{Piece, Placed};
-use crate::framework::settings::{Setting, Toggle};
+use crate::framework::settings::{Alternative, Choice, Toggle};
 use crate::math::Quat;
 
-/// When snapping turns the moved bricks to match the target now: each case a setting
-/// ([`SETTINGS`]).
+/// When snapping turns the moved bricks to match the target now: each case a setting (see
+/// `super::SETTINGS`).
 pub fn matching() -> Matching {
+    let (edges, faces) = match TURN_TO_MATCH.get() {
+        1 => (true, false),
+        2 => (false, true),
+        3 => (true, true),
+        _ => (false, false),
+    };
     Matching {
-        faces: FACES.get(),
-        edges: EDGES.get(),
+        faces,
+        edges,
         square: SQUARE.get(),
     }
 }
 
-/// The settings of when snapping turns the moved bricks, in the menu's order.
-pub static SETTINGS: [Setting; 3] = [
-    Setting::Toggle(&FACES),
-    Setting::Toggle(&EDGES),
-    Setting::Toggle(&SQUARE),
-];
-
-static FACES: Toggle = Toggle::new(
-    "MatchFaces",
-    "Faces onto faces",
-    "Moved bricks snapped by a face onto a face turn to lie flat on it: facing it, or facing the \
-     same way.",
-    true,
+/// Which cases snapping turns the moved bricks in, a setting: the options of [`matching`], in
+/// order.
+pub(super) static TURN_TO_MATCH: Choice = Choice::new(
+    "TurnToMatch",
+    "Turn to match",
+    "Moved bricks snapped by an edge onto an edge turn to run along it, and by a face onto a face \
+     turn to lie flat on it.",
+    &[
+        Alternative {
+            key: "Off",
+            name: "Off",
+        },
+        Alternative {
+            key: "Edges",
+            name: "Edges",
+        },
+        Alternative {
+            key: "Faces",
+            name: "Faces",
+        },
+        Alternative {
+            key: "Both",
+            name: "Both",
+        },
+    ],
+    3,
 );
-static EDGES: Toggle = Toggle::new(
-    "MatchEdges",
-    "Edges onto edges",
-    "Moved bricks snapped by an edge onto an edge turn to run along it, either way.",
-    true,
-);
-static SQUARE: Toggle = Toggle::new(
+pub(super) static SQUARE: Toggle = Toggle::new(
     "MatchSquare",
-    "Square up",
-    "After either, moved bricks also turn about that face's normal or that edge to line up with \
-     the target brick's axes.",
+    "Align to target",
+    "After turning to match, moved bricks also turn (about that face or edge) so their sides line \
+     up with the target brick's, instead of keeping their angle.",
     true,
 );
 

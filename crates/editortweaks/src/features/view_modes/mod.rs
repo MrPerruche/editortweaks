@@ -25,9 +25,10 @@
 //! [`describe`]).
 //!
 //! The game's own Physics view mode gets more too ([`physics`]): the centers of lift and thrust
-//! next to its center of mass, and the tooltip over the three.
+//! next to its center of mass, lift and drag arrows with the center of drag and a handle for where
+//! the air comes from, and the tooltip over them.
 
-mod collision;
+pub(crate) mod collision;
 mod connections;
 mod duplicates;
 mod fit;
@@ -36,8 +37,12 @@ mod physics;
 mod strength;
 mod tooltip;
 
+/// The Physics view mode's settings.
+pub(crate) use physics::{CENTERS, LIFT_DRAG};
 /// For the shot preview's tooltip: the AP unit and how numbers read.
 pub(crate) use strength::{AP_DAMAGE, AP_PENETRATION, break_off_damage};
+/// The tooltips setting, shared with the shot preview.
+pub(crate) use tooltip::{TOOLTIPS, shot_preview_shows};
 
 use std::collections::hash_map::DefaultHasher;
 use std::collections::{BTreeMap, HashMap};
@@ -49,7 +54,6 @@ use brickrust::ue::coreuobject::UObjectBase;
 use core::ffi::c_void;
 
 use crate::framework::hook;
-use crate::framework::settings::{Section, Setting};
 use crate::game::brick_editor;
 use crate::game::editor_view::{
     self, Bricks, EditorCode, MaterialOverrideFn, PrimitiveDataFn, UpdateMirroredObjectsFn,
@@ -69,15 +73,6 @@ type Colors = [[f32; 3]; 2];
 /// view mode's module.
 const GRAY: [f32; 3] = [0.2, 0.2, 0.2];
 const PLAIN: Colors = [GRAY, GRAY];
-
-/// The view modes' settings, in the options' Editor tweaks menu.
-pub static SETTINGS: [Section; 1] = [Section {
-    title: "View modes",
-    settings: &[
-        Setting::Toggle(&tooltip::TOOLTIP),
-        Setting::Toggle(&physics::CENTERS),
-    ],
-}];
 
 /// Our view modes, in the order Z cycles through them: each one's name and how to make it.
 /// A view mode's value is its place here, kept in the user's settings: reordering them switches a
@@ -307,6 +302,11 @@ impl Feature for ViewModes {
     fn on_engine_init(&self) {
         if let Err(reason) = engine_init() {
             log!("inactive: {reason}");
+        }
+        // Before the features listening after it (fast editing, box selection): a press on the
+        // airflow's handle is its own.
+        if let Err(reason) = physics::listen() {
+            log!("the airflow's handle can't be dragged: {reason}");
         }
     }
 }

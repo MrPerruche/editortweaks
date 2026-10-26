@@ -9,7 +9,8 @@
 //! - With [`LIFT_SLIDER_LIMITS`] (a setting), no drag stops at the slider's ends (plain, Shift,
 //!   Ctrl or Alt): values only stop at the property's own limits (`property_limits` and its rules, some of which
 //!   stop drags before typed values: `drag_min`). In absolute mode (the value under the cursor),
-//!   dragging past an end carries on proportionally. Arrow keys still stop at the ends.
+//!   dragging past an end carries on proportionally. Arrow keys still stop at the ends. The color
+//!   picker's sliders still stop there (`property_limits::is_color_slider`).
 //!
 //! How: the slider's mouse move handler (`game::slider_drag`) is hooked. Its clamp to the slider's
 //! range is removed from its code (or put back, as the setting says when a drag moves);
@@ -28,7 +29,7 @@ use std::time::Instant;
 use super::keybinds;
 use super::property_limits;
 use crate::framework::hook;
-use crate::framework::settings::{Section, Setting, Toggle};
+use crate::framework::settings::Toggle;
 use crate::game::numeric_property::NumericValue;
 use crate::game::property_widget::{self, PropertyWidgets};
 use crate::game::slate::{self, Geometry, PointerEvent};
@@ -39,18 +40,12 @@ use crate::platform::keyboard;
 use crate::platform::timer::ThreadTimer;
 use crate::prelude::*;
 
-/// Slider drags' settings, by section of the menu (see `features::SETTINGS`).
-pub static SETTINGS: [Section; 1] = [Section {
-    title: "Sliders",
-    settings: &[Setting::Toggle(&LIFT_SLIDER_LIMITS)],
-}];
-
 /// Lift the slider's own limits from every kind of drag, so only the property's limits apply.
-static LIFT_SLIDER_LIMITS: Toggle = Toggle::new(
+pub static LIFT_SLIDER_LIMITS: Toggle = Toggle::new(
     "LiftSliderLimits",
     "Drag past slider ends",
-    "Slider drags (plain, Shift, Ctrl or Alt) carry on past the slider's ends: values only stop at \
-     the property's own limits. Arrow keys still stop at the ends.",
+    "Dragging a slider carries on past its ends, up to the property's own limits. Arrow keys still \
+     stop at the ends.",
     true,
 );
 
@@ -257,13 +252,36 @@ unsafe extern "C" fn on_mouse_move(
     let (moved, width) = unsafe { ((*event).cursor_delta[0], (*geometry).absolute_width()) };
     if !keybinds::KEEP_DRAGGING_SLIDERS.is_held() {
         ALT_DRAG.take();
-        return drag_step(sliders, slider, call);
+        let reply = drag_step(sliders, slider, call);
+        // SAFETY: a live slider being dragged, on the game thread.
+        unsafe { keep_color_drag_in_range(sliders, slider) };
+        return reply;
     }
 
     alt_drag_moved(slider, moved, width);
     // SAFETY: the caller's event: only this thread uses it during the call, and it's restored
     // before returning.
     unsafe { as_still_shift_drag(event.cast_mut(), call) }
+}
+
+/// Keeps the drag of a color picker's slider within its range: its clamp is lifted from the game's
+/// code, so without this the drag would run past the end unseen and moving back would take effect
+/// late.
+///
+/// # Safety
+/// `slider` must be a live slider. Game thread only.
+unsafe fn keep_color_drag_in_range(sliders: &Sliders, slider: *mut c_void) {
+    // SAFETY: per the contract.
+    unsafe {
+        if !property_limits::is_color_slider(slider) {
+            return;
+        }
+        let (min, max) = sliders.range.get(slider);
+        let dragged = sliders.drag.drag_value(slider);
+        if dragged < min || dragged > max {
+            sliders.drag.set_drag_value(slider, dragged.clamp(min, max));
+        }
+    }
 }
 
 /// Runs `call` with `event` turned into a Shift-drag that didn't move: the game then keeps the value
@@ -461,7 +479,10 @@ unsafe fn alt_drag_step(sliders: &Sliders, slider: *mut c_void, distance: f32, s
         1.0
     };
     let mut target = alt_drag_target(current, span, distance * distance.abs() * seconds);
-    if !sliders.lifted.load(Ordering::Relaxed) {
+    // SAFETY: per the contract.
+    if !sliders.lifted.load(Ordering::Relaxed)
+        || unsafe { property_limits::is_color_slider(slider) }
+    {
         target = target.max(min).min(max);
     }
     if !target.is_finite() || target == current {

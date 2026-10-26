@@ -14,7 +14,9 @@
 //!   the screen by its distance, which the view doesn't show. The editor's own pivot (middle button,
 //!   Space) already turns around the selection and stays as it is.
 //! - The zoom steps (the mouse wheel) zoom the orthographic view, by [`ZOOM_STEP`] each, gliding
-//!   like the game's zoom; the perspective view keeps its own zoom for when it's back.
+//!   like the game's zoom; the perspective view keeps its own zoom for when it's back. Other
+//!   features can take a zoom step first ([`listen_zoom_steps`]: the loader hooks a function only
+//!   once).
 //! - It shows what's in front of the camera, as the perspective view does: flying the camera into
 //!   the vehicle cuts through it. How deep it shows follows its width ([`view_depth`]): its depth
 //!   steps (32-bit, linear) are that depth times 2^-24, so a narrower view tells apart faces nearer
@@ -103,6 +105,7 @@ static ORIGINAL: OnceLock<ApplyCameraModifiersFn> = OnceLock::new();
 static ORIGINAL_ZOOM_IN: OnceLock<NativeThunk> = OnceLock::new();
 static ORIGINAL_ZOOM_OUT: OnceLock<NativeThunk> = OnceLock::new();
 static ORIGINAL_ZOOM_CHANGED: OnceLock<ZoomChangedFn> = OnceLock::new();
+static ZOOM_LISTENERS: Mutex<Vec<ZoomListener>> = Mutex::new(Vec::new());
 /// What the editor's code tells, found at load.
 static CODE: OnceLock<EditorCode> = OnceLock::new();
 /// Set once reflection is available; until then (or if it fails) the view stays the game's.
@@ -236,6 +239,19 @@ impl Feature for OrthoView {
             Err(reason) => log!("inactive: {reason}"),
         }
     }
+}
+
+/// Whether a listener takes a zoom step (in, the mouse wheel up, if `true`): then the game's handler,
+/// the orthographic zoom and the listeners after it don't get it.
+pub type ZoomListener = fn(bool) -> bool;
+
+/// Calls `listener` with every zoom step of the editor from now on, before anything else and after
+/// the listeners before it; never if the zoom steps couldn't be hooked (logged).
+pub fn listen_zoom_steps(listener: ZoomListener) {
+    ZOOM_LISTENERS
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .push(listener);
 }
 
 /// Finds the parts and hooks the zoom steps and the zoom notification.
@@ -403,8 +419,8 @@ unsafe extern "C" fn zoom_out_detour(
 }
 
 /// Runs `original`, a zoom step's thunk (in or out) called with `context`, `stack` and `result`,
-/// unless the editor's view is orthographic: then it narrows or widens it by [`ZOOM_STEP`]
-/// instead.
+/// unless a listener takes it ([`listen_zoom_steps`]) or the editor's view is orthographic: then
+/// it narrows or widens it by [`ZOOM_STEP`] instead.
 ///
 /// # Safety
 /// `context`, `stack` and `result` must be the arguments `original` was called with, on the game
@@ -430,6 +446,15 @@ unsafe fn zoom_step(
                 stack,
             )
         {
+            // Copied: a listener may listen too.
+            let listeners = ZOOM_LISTENERS
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .clone();
+            if listeners.iter().any(|listener| listener(zoom_in)) {
+                zoom.handled(result);
+                return;
+            }
             let mut state = STATE.lock().unwrap_or_else(PoisonError::into_inner);
             if matches!(state.mode, Mode::Orthographic | Mode::Entering { .. }) {
                 let factor = if zoom_in { 1.0 / ZOOM_STEP } else { ZOOM_STEP };

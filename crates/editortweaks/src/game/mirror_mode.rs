@@ -238,6 +238,23 @@ impl MirrorMode {
         rotation: Vector,
         axis: u8,
     ) -> Vector {
+        // SAFETY: per the contract.
+        unsafe { self.mirrored_place(object, location, rotation, axis).0 }
+    }
+
+    /// Where and how turned the editor puts the counterpart of `object` if `object` is at
+    /// `location` with `rotation` (pitch, yaw, roll): its location and rotation (an `FQuat`, x, y,
+    /// z, w), see [`Self::mirrored_location`].
+    ///
+    /// # Safety
+    /// `object` must be a live editor object, `axis` 1 to 3 (see [`Self::axis`]). Game thread only.
+    pub unsafe fn mirrored_place(
+        &self,
+        object: *mut UObjectBase,
+        location: Vector,
+        rotation: Vector,
+        axis: u8,
+    ) -> (Vector, [f32; 4]) {
         let mut quaternion = Quat::default();
         // SAFETY: per the contract.
         unsafe {
@@ -248,14 +265,14 @@ impl MirrorMode {
                 location,
                 rotation,
             };
-            self.mirror(
+            let (location, rotation) = self.mirror(
                 &Placed {
                     place,
                     rotation: quaternion,
                 },
                 axis,
-            )
-            .0
+            );
+            (location, rotation.0)
         }
     }
 

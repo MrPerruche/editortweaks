@@ -57,20 +57,19 @@ use shape::{Fit, Mesh, Meshes, Place, Shape};
 pub static PICKS: Choice = Choice::new(
     "DragSelectPicks",
     "Drag select picks",
-    "Which bricks a drag select box selects: those it touches, those entirely inside it, or those \
-     whose center is inside it. Bricks behind others count too, hidden ones don't.",
+    "Which bricks a drag select box selects. Bricks behind others count too, hidden ones don't.",
     &[
         Alternative {
             key: "Touching",
-            name: "Bricks it touches",
-        },
-        Alternative {
-            key: "Inside",
-            name: "Bricks inside it",
+            name: "Touched bricks",
         },
         Alternative {
             key: "Centers",
-            name: "Bricks with their center in it",
+            name: "Center inside",
+        },
+        Alternative {
+            key: "Inside",
+            name: "Fully inside",
         },
     ],
     0,
@@ -79,15 +78,15 @@ pub static PICKS: Choice = Choice::new(
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Picking {
     Touching,
-    Inside,
     Centers,
+    Inside,
 }
 
 /// Which bricks a box picks now.
 fn picking() -> Picking {
     match PICKS.get() {
-        1 => Picking::Inside,
-        2 => Picking::Centers,
+        1 => Picking::Centers,
+        2 => Picking::Inside,
         _ => Picking::Touching,
     }
 }

@@ -18,8 +18,8 @@
 //! the hidden set (a `TSet`), which the game's function fills.
 
 use core::ffi::c_void;
-use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Mutex, OnceLock, PoisonError};
 
 use brickrust::ue::coreuobject::UObjectBase;
 
@@ -43,7 +43,9 @@ static ORIGINAL: OnceLock<UpdateFn> = OnceLock::new();
 /// Offset of `ABrickPlayerController::BrickEditor`, checked against the game's code.
 static EDITOR_FIELD: OnceLock<usize> = OnceLock::new();
 /// What to do with each view: see [`on_view`].
-static ON_VIEW: OnceLock<fn(bool)> = OnceLock::new();
+static ON_VIEW: Mutex<Vec<fn(bool)>> = Mutex::new(Vec::new());
+/// Whether [`install`] hooked the function (or why not), so that features can share the hook.
+static INSTALLED: OnceLock<Result<(), String>> = OnceLock::new();
 static SHOW_MAP: AtomicBool = AtomicBool::new(false);
 
 /// Whether the map shows around the editor (see the module's documentation).
@@ -57,14 +59,22 @@ pub fn set_show_map(show: bool) {
 }
 
 /// Calls `callback` at each view the controller makes (the game thread, before the game lists what
-/// to hide), with whether its vehicle editor is open.
+/// to hide), with whether its vehicle editor is open. Callbacks run in the order features asked.
 pub fn on_view(callback: fn(bool)) {
-    let _ = ON_VIEW.set(callback);
+    ON_VIEW
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .push(callback);
 }
 
 /// Finds the function, checks the field it tests against reflection, and hooks it. After engine
 /// init (the reflection check), though it only has to be before the first view of the editor.
+/// Features share the hook: later calls give the first one's result.
 pub fn install() -> Result<(), String> {
+    INSTALLED.get_or_init(hook_function).clone()
+}
+
+fn hook_function() -> Result<(), String> {
     let found = UPDATE_HIDDEN_COMPONENTS.locate()?;
     // SAFETY: the displacement lies inside the matched pattern.
     let code_offset = unsafe { found.address.add(3).cast::<u32>().read_unaligned() } as usize;
@@ -108,7 +118,12 @@ unsafe extern "C" fn update(
             .add(field)
             .cast::<*mut UObjectBase>();
         let editor = slot.read();
-        if let Some(callback) = ON_VIEW.get() {
+        // Copied out, so that a callback may ask for more without a deadlock.
+        let callbacks = ON_VIEW
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
+        for callback in callbacks {
             callback(!editor.is_null());
         }
         if show_map() && !editor.is_null() {

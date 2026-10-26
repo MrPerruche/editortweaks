@@ -1,5 +1,7 @@
 //! A model as plain data: parts of triangles, each with one material.
 
+use std::collections::HashMap;
+
 use crate::image::Image;
 
 /// The most triangles a model may have. A reference is something to build next to, not a scan:
@@ -129,6 +131,66 @@ impl Part {
                 piece
             })
             .collect()
+    }
+
+    /// Moves the triangles `taken` picks (by their index) into a part of their own, returned; both
+    /// parts are left with only the positions (and UVs) their triangles use.
+    pub fn split_off(&mut self, taken: impl Fn(usize) -> bool) -> Part {
+        let (moved, kept): (Vec<_>, Vec<_>) =
+            (0..self.corners.len()).partition(|&index| taken(index));
+        let moved = self.with_triangles(&moved);
+        *self = self.with_triangles(&kept);
+        moved
+    }
+
+    /// Gives each triangle's corners the UVs in `uvs` (one entry per triangle, its corners in
+    /// order), splitting the vertices whose corners get different ones (seams). Does nothing if
+    /// `uvs` isn't one entry per triangle.
+    pub fn set_corner_uvs(&mut self, uvs: &[[[f32; 2]; 3]]) {
+        if uvs.len() != self.corners.len() {
+            return;
+        }
+        let mut vertex_of: HashMap<(u32, [u32; 2]), u32> = HashMap::new();
+        let mut positions = Vec::with_capacity(self.positions.len());
+        let mut new_uvs = Vec::with_capacity(self.positions.len());
+        for (corners, uvs) in self.corners.iter_mut().zip(uvs) {
+            for (corner, &uv) in corners.iter_mut().zip(uvs) {
+                let key = (*corner, uv.map(f32::to_bits));
+                *corner = *vertex_of.entry(key).or_insert_with(|| {
+                    positions.push(self.positions[*corner as usize]);
+                    new_uvs.push(uv);
+                    positions.len() as u32 - 1
+                });
+            }
+        }
+        self.positions = positions;
+        self.uvs = new_uvs;
+    }
+
+    /// A part of the triangles at `indices` only, with the positions (and UVs) they use.
+    fn with_triangles(&self, indices: &[usize]) -> Part {
+        let none = u32::MAX;
+        let mut moved = vec![none; self.positions.len()];
+        let mut part = Part {
+            name: self.name.clone(),
+            material: self.material,
+            ..Part::default()
+        };
+        for &triangle in indices {
+            let corners = self.corners[triangle].map(|index| {
+                let slot = &mut moved[index as usize];
+                if *slot == none {
+                    *slot = part.positions.len() as u32;
+                    part.positions.push(self.positions[index as usize]);
+                    if !self.uvs.is_empty() {
+                        part.uvs.push(self.uvs[index as usize]);
+                    }
+                }
+                *slot
+            });
+            part.corners.push(corners);
+        }
+        part
     }
 
     /// For a part read without normals: splits vertices shared by triangles that meet at more than
@@ -393,6 +455,59 @@ mod tests {
         assert_eq!(triangles, original);
         // The first piece only holds the 4 positions its 2 triangles use.
         assert_eq!(pieces[0].positions.len(), 4);
+    }
+
+    #[test]
+    fn split_off_moves_the_triangles_picked() {
+        // A strip of 4 triangles over 6 positions: the last two moved off.
+        let mut part = Part {
+            material: Some(1),
+            positions: (0..6).map(|i| [i as f32, (i % 2) as f32, 0.0]).collect(),
+            uvs: (0..6).map(|i| [i as f32, 0.0]).collect(),
+            corners: (0..4).map(|i| [i, i + 1, i + 2]).collect(),
+            ..Part::default()
+        };
+        let original: Vec<_> = part
+            .corners
+            .iter()
+            .map(|t| t.map(|i| part.positions[i as usize]))
+            .collect();
+        let moved = part.split_off(|index| index >= 2);
+        let corners = |part: &Part| -> Vec<_> {
+            part.corners
+                .iter()
+                .map(|t| t.map(|i| part.positions[i as usize]))
+                .collect()
+        };
+        assert_eq!(corners(&part), original[..2]);
+        assert_eq!(corners(&moved), original[2..]);
+        // Each keeps the 4 positions its triangles use, with their UVs.
+        assert_eq!((part.positions.len(), part.uvs.len()), (4, 4));
+        assert_eq!((moved.positions.len(), moved.uvs.len()), (4, 4));
+        assert_eq!(moved.uvs[0], [2.0, 0.0]);
+        assert_eq!(moved.material, Some(1));
+    }
+
+    #[test]
+    fn corner_uvs_split_seams() {
+        // Two triangles sharing an edge (vertices 1 and 2); vertex 2 gets two UVs, vertex 1 one.
+        let mut part = Part {
+            positions: vec![[0.0; 3], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [1.0, 1.0, 0.0]],
+            corners: vec![[0, 1, 2], [2, 1, 3]],
+            ..Part::default()
+        };
+        part.set_corner_uvs(&[
+            [[0.0, 0.0], [1.0, 0.0], [0.0, 1.0]],
+            [[0.5, 1.0], [1.0, 0.0], [1.0, 1.0]],
+        ]);
+        assert_eq!(part.positions.len(), 5);
+        assert_eq!(part.uvs.len(), 5);
+        assert_eq!(part.corners, [[0, 1, 2], [3, 1, 4]]);
+        assert_eq!(part.positions[3], [0.0, 1.0, 0.0]);
+        assert_eq!(part.uvs[3], [0.5, 1.0]);
+        // Not one entry per triangle: left as it was.
+        part.set_corner_uvs(&[]);
+        assert_eq!(part.positions.len(), 5);
     }
 
     /// The unit cube with 8 shared vertices (index = x + 2y + 4z) and 12 triangles, two per face,

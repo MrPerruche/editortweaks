@@ -359,9 +359,12 @@ unsafe extern "C" fn update_rotation_detour(
         // SAFETY: the original function with its own arguments.
         return unsafe { original(interface, rotation, delta) };
     };
+    // The result is the rotator of the turned rotation nearest the one given, so a camera that
+    // goes over the top (see `features/free_pitch`: pitch beyond ±90°, no roll) keeps its form,
+    // which the game's limits would otherwise mangle: its roll is held at zero.
     let convert = |by: Quat, rotator: [f32; 3]| {
         let turned = by * Quat::from_rotator(math::widen(rotator));
-        math::narrow(turned.to_rotator())
+        math::narrow(turned.to_rotator_near(math::widen(rotator)))
     };
     let into = frame.rotation.inverse();
     // SAFETY: the game calls this with its interface (whose rotation is at `ROTATION`) and a
@@ -379,11 +382,13 @@ unsafe extern "C" fn update_rotation_detour(
             rotation.write_unaligned(local_given);
         }
         original(interface, rotation, delta);
+        // A changed rotator comes back as the one nearest the world's it replaces.
         let back = |now: [f32; 3], local: [f32; 3], world: [f32; 3]| {
             if now == local {
                 world
             } else {
-                convert(frame.rotation, now)
+                let turned = frame.rotation * Quat::from_rotator(math::widen(now));
+                math::narrow(turned.to_rotator_near(math::widen(world)))
             }
         };
         let (now_stored, now_given) = (stored.read_unaligned(), rotation.read_unaligned());
@@ -455,6 +460,20 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn an_upside_down_camera_stays_upside_down() {
+        // Pitch 100° is the same rotation as pitch 80°, yaw and roll half a turn on.
+        let camera = [100.0, 30.0, 0.0];
+        let rotation = Quat::from_rotator(camera);
+        let near = rotation.to_rotator_near(camera);
+        for (got, want) in near.into_iter().zip(camera) {
+            assert!((got - want).abs() < 1e-6, "{near:?} vs {camera:?}");
+        }
+        // With no reference near it, the pitch within ±90° is the nearest.
+        let level = rotation.to_rotator_near([80.0, -150.0, 180.0]);
+        assert!(level[0].abs() <= 90.0, "{level:?}");
     }
 
     #[test]

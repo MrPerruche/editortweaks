@@ -231,6 +231,12 @@ pub const ADD_TO_SELECTION: &str = "Action_AddToSelection";
 /// turns the camera, WASD moves it, the cursor hides.
 pub const MOVE_CAMERA: &str = "Action_MoveCamera";
 
+/// `FBrActionResult Action_PivotCamera(const FBrActionParams&)` (`UEditorInputComponent`, BRMK
+/// 0x223110): the middle mouse button (and Space) in the editor, pressed and released. Like
+/// [`MOVE_CAMERA`] with bit 1 of the camera flags: while it's held the mouse turns the camera around
+/// the selection, and the cursor hides.
+pub const PIVOT_CAMERA: &str = "Action_PivotCamera";
+
 /// `FBrActionResult Action_DeleteSelection(const FBrActionParams&)`: deletes the selected bricks
 /// (Delete; input row `DeleteSelectedBricks`). The name is in the game's function table (a string at
 /// game 0x39904F0).

@@ -4,32 +4,78 @@
 //! by section, saved to `EditorTweaks.ini` as they change (see `framework::settings`). Back returns
 //! to the options.
 //!
+//! Features' dialogs ([`Dialog`]) are made the same way: [`open`] opens the in-game menu (as Escape
+//! does) and, once it opened its root context, the dialog's context `<root>/<context>`, whose page
+//! lists the dialog's settings, with a button of its own that closes the menu and runs the
+//! dialog's action. Back returns to the in-game menu.
+//!
 //! The game does the work: its menu opens the context (title, Back button, transition) and shows
 //! the page, a settings page that lists the game's settings of its categories. Ours is the gameplay
 //! settings page (`WBP_GameplaySettings`, nothing but a settings page for the gameplay category),
 //! listing our category instead while in our context, and the game's settings list
 //! (`UBrickUserSettings::ReflectBrickProperties`, shared through `features::settings_list`) gets our
-//! rows when a page asks for our category. We only add our button and show our page where the
+//! rows when a page asks for our category. We only add our buttons and show our page where the
 //! menu's Blueprint does for its own contexts: once it made the new context's buttons, before the
 //! panel pools the unused ones. See `game::menu` and `game::property_reflection`.
 
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Mutex, OnceLock, PoisonError};
+use std::time::{Duration, Instant};
 
 use brickrust::ue::coreuobject::UObjectBase;
 use brickrust::ue::fname::FName;
 
-use super::settings_list;
+use super::{menu_buttons, settings_list};
 use crate::features::SETTINGS;
 use crate::framework::hook;
+use crate::framework::settings::Section;
 use crate::game::kismet;
 use crate::game::menu::{
-    self, AddPropertiesFn, ClickedFn, Menus, OpenMenuFn, RemoveUnusedButtonsFn,
+    self, AddPropertiesFn, Menus, OpenMenuFn, RemoveUnusedButtonsFn, WindowManager,
 };
 use crate::game::text::Text;
 use crate::game::weak_object::WeakObject;
 use crate::prelude::*;
 
 pub struct SettingsMenu;
+
+/// A feature's dialog: a page of the in-game menu listing settings, with a button running
+/// [`Dialog::action`]. Added with [`add_dialog`], opened with [`open`].
+pub struct Dialog {
+    /// The last part of its context, a sub-context of the menu's root (as `Options` is).
+    pub context: &'static str,
+    pub title: &'static str,
+    /// Its settings' category: a gameplay tag the game doesn't know, which only its page asks for.
+    pub category: &'static str,
+    pub sections: &'static [Section],
+    /// The button's text, and its icon (a texture's path).
+    pub button: &'static str,
+    pub icon: &'static str,
+    /// Runs when the button is clicked, once the menu is closed. During the click: keep it short,
+    /// e.g. note a request for the editor's next tick.
+    pub action: fn(),
+}
+
+/// Lists `dialog`, to be opened with [`open`]. Before engine init (in `on_load`).
+pub fn add_dialog(dialog: &'static Dialog) {
+    DIALOGS
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .push(dialog);
+}
+
+/// Opens the in-game menu on `dialog` (added with [`add_dialog`]). Game thread only.
+pub fn open(dialog: &'static Dialog) {
+    let Some(window) = WINDOW.get() else {
+        log!("{} not opened: the menu wasn't found", dialog.title);
+        return;
+    };
+    state().pending = Some((dialog, Instant::now()));
+    // SAFETY: on the game thread, per the contract.
+    if !unsafe { window.open_menu() } {
+        state().pending = None;
+        log!("{} not opened: no window manager", dialog.title);
+    }
+}
 
 /// The button's text and the page's title.
 const TITLE: &str = "Editor tweaks";
@@ -50,12 +96,20 @@ const OPTIONS: &str = "Options";
 /// The last part of our context, a sub-context of the options (as `Gameplay` is).
 const CONTEXT: &str = "EditorTweaks";
 
+/// The menu's root contexts (`UMenuWidget::NativeConstruct` opens one), where a dialog being
+/// opened takes over.
+const ROOTS: [&str; 2] = ["InGameMenu", "MainMenu"];
+
+/// How long after [`open`] the menu may take to show its root (it loads its widget first).
+const OPENING: Duration = Duration::from_secs(5);
+
+static DIALOGS: Mutex<Vec<&'static Dialog>> = Mutex::new(Vec::new());
 static MENUS: OnceLock<Menus> = OnceLock::new();
+static WINDOW: OnceLock<WindowManager> = OnceLock::new();
 static OURS: OnceLock<Ours> = OnceLock::new();
 
 static ORIGINAL_OPEN_MENU: OnceLock<OpenMenuFn> = OnceLock::new();
 static ORIGINAL_REMOVE_UNUSED_BUTTONS: OnceLock<RemoveUnusedButtonsFn> = OnceLock::new();
-static ORIGINAL_CLICKED: OnceLock<ClickedFn> = OnceLock::new();
 static ORIGINAL_ADD_PROPERTIES: OnceLock<AddPropertiesFn> = OnceLock::new();
 
 /// Names and texts, made once after engine init.
@@ -65,6 +119,17 @@ struct Ours {
     icon: FName,
     page: FName,
     context: FName,
+    dialogs: Vec<DialogNames>,
+}
+
+/// A dialog's names and texts.
+struct DialogNames {
+    dialog: &'static Dialog,
+    context: FName,
+    title: Text,
+    category: FName,
+    button: Text,
+    icon: FName,
 }
 
 // SAFETY: names and texts kept for the whole game; only used on the game thread.
@@ -78,8 +143,14 @@ struct State {
     opening: Vec<(*mut UObjectBase, String)>,
     /// Our button and the menu showing it, until that menu opens another context.
     button: Option<(WeakObject, WeakObject)>,
-    /// The menu in our context, until it opens another.
-    in_ours: Option<WeakObject>,
+    /// A dialog's button, the menu showing it and the dialog, until that menu opens another
+    /// context.
+    dialog_button: Option<(WeakObject, WeakObject, &'static Dialog)>,
+    /// The menu in our context or a dialog's, and the category its page lists, until it opens
+    /// another.
+    in_ours: Option<(WeakObject, FName)>,
+    /// The dialog [`open`] asked for, until the menu shows its root.
+    pending: Option<(&'static Dialog, Instant)>,
 }
 
 // SAFETY: the menus `OpenMenu` runs for (alive while it runs) and weak object references, only
@@ -89,13 +160,13 @@ unsafe impl Send for State {}
 static STATE: Mutex<State> = Mutex::new(State {
     opening: Vec::new(),
     button: None,
+    dialog_button: None,
     in_ours: None,
+    pending: None,
 });
 
 fn state() -> std::sync::MutexGuard<'static, State> {
-    STATE
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
+    STATE.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
 impl Feature for SettingsMenu {
@@ -115,25 +186,58 @@ impl Feature for SettingsMenu {
     }
 }
 
-/// Makes our names, texts and rows, finds the menus and hooks them.
-fn start() -> Result<(), String> {
-    let mut sections = Vec::new();
-    for section in SETTINGS.iter().copied().flatten() {
-        let rows = section
+/// The rows of `sections`, by section (sections without settings to show are left out).
+fn rows(
+    sections: impl IntoIterator<Item = &'static Section>,
+) -> Result<Vec<settings_list::Section>, String> {
+    let mut rows = Vec::new();
+    for section in sections {
+        if section.settings.is_empty() {
+            continue;
+        }
+        let section_rows = section
             .settings
             .iter()
             .map(|&setting| settings_list::setting_row(setting))
             .collect::<Result<Vec<_>, _>>()?;
-        sections.push((section.title, rows));
+        rows.push((section.title, section_rows));
     }
-    settings_list::add(CATEGORY, sections)?;
+    Ok(rows)
+}
+
+/// Makes our names, texts and rows, finds the menus and hooks them.
+fn start() -> Result<(), String> {
+    settings_list::add(CATEGORY, rows(SETTINGS.iter().copied().flatten())?)?;
+    let dialogs = DIALOGS
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .clone();
+    let mut dialog_names = Vec::new();
+    for dialog in dialogs {
+        settings_list::add(dialog.category, rows(dialog.sections)?)?;
+        dialog_names.push(DialogNames {
+            dialog,
+            context: kismet::string_to_name(dialog.context)?,
+            title: kismet::string_to_text(dialog.title)?,
+            category: kismet::string_to_name(dialog.category)?,
+            button: kismet::string_to_text(dialog.button)?,
+            icon: kismet::string_to_name(dialog.icon)?,
+        });
+    }
     let _ = OURS.set(Ours {
         category: kismet::string_to_name(CATEGORY)?,
         title: kismet::string_to_text(TITLE)?,
         icon: kismet::string_to_name(ICON)?,
         page: kismet::string_to_name(PAGE)?,
         context: kismet::string_to_name(CONTEXT)?,
+        dialogs: dialog_names,
     });
+    match WindowManager::find() {
+        Ok(window) => {
+            let _ = WINDOW.set(window);
+        }
+        Err(reason) => log!("dialogs don't open: {reason}"),
+    }
     let found = Menus::find()?;
     let menus = MENUS.get_or_init(|| found);
     // SAFETY: each target is the start of the function its detour matches (see `game::menu`); the
@@ -152,32 +256,50 @@ fn start() -> Result<(), String> {
             &ORIGINAL_REMOVE_UNUSED_BUTTONS,
         )?;
         hook::install_typed(
-            "UMenuButtonWidget::OnClicked",
-            menus.on_clicked,
-            clicked as ClickedFn,
-            &ORIGINAL_CLICKED,
-        )?;
-        hook::install_typed(
             "UMenuSettingsPageWidget::AddProperties_Implementation",
             menus.add_properties,
             add_properties as AddPropertiesFn,
             &ORIGINAL_ADD_PROPERTIES,
         )?;
     }
-    Ok(())
+    menu_buttons::listen(clicked)
 }
 
-/// A menu opens a context: notes which while it does (see `remove_unused_buttons`).
+/// A menu opens a context: notes which while it does (see `remove_unused_buttons`). A menu showing
+/// its root while a dialog is being opened goes on to the dialog.
 unsafe extern "C" fn open_menu(menu: *mut UObjectBase, context: FName) {
     let Some(original) = ORIGINAL_OPEN_MENU.get() else {
         return;
     };
     // SAFETY: the name the game passes.
     let leaf = unsafe { menu::context_leaf(&context) };
-    state().opening.push((menu, leaf));
+    state().opening.push((menu, leaf.clone()));
     // SAFETY: forwards the caller's arguments.
     unsafe { original(menu, context) };
     state().opening.pop();
+    if !ROOTS.contains(&leaf.as_str()) {
+        return;
+    }
+    let pending = state().pending.take();
+    let Some((dialog, asked)) = pending.filter(|(_, asked)| asked.elapsed() < OPENING) else {
+        return;
+    };
+    let (Some(menus), Some(ours)) = (MENUS.get(), OURS.get()) else {
+        return;
+    };
+    if let Some(names) = ours
+        .dialogs
+        .iter()
+        .find(|names| core::ptr::eq(names.dialog, dialog))
+    {
+        log!(
+            "{} opened after {} ms",
+            dialog.title,
+            asked.elapsed().as_millis()
+        );
+        // SAFETY: the live menu `OpenMenu` ran for, on the game thread.
+        unsafe { menus.open(menu, names.context) };
+    }
 }
 
 /// A button panel pools the buttons it doesn't use any more. A menu's panel does so once the menu
@@ -200,7 +322,7 @@ unsafe extern "C" fn remove_unused_buttons(panel: *mut UObjectBase) {
 }
 
 /// `menu` made the buttons of its new context, whose last part is `leaf`, on `panel`: the options
-/// get our button, our context our page.
+/// get our button, our context our page, a dialog's context its page and button.
 ///
 /// # Safety
 /// `menu` must be a live menu and `panel` its button panel. Game thread only.
@@ -222,9 +344,16 @@ unsafe fn context_made(
             state.button = None;
         }
         if state
+            .dialog_button
+            .as_ref()
+            .is_some_and(|(_, shown_in, _)| shown_in.is(menu))
+        {
+            state.dialog_button = None;
+        }
+        if state
             .in_ours
             .as_ref()
-            .is_some_and(|in_ours| in_ours.is(menu))
+            .is_some_and(|(in_ours, _)| in_ours.is(menu))
         {
             state.in_ours = None;
         }
@@ -232,76 +361,122 @@ unsafe fn context_made(
     // SAFETY: per the contract.
     unsafe {
         match leaf {
-            OPTIONS => match menus.add_button(panel, &ours.title, ours.icon) {
+            OPTIONS => match menus.panels.add_button(panel, &ours.title, ours.icon) {
                 Some(button) => {
                     state().button = Some((WeakObject::new(button), WeakObject::new(menu)));
                 }
                 None => log!("no button added to the options"),
             },
             CONTEXT => {
-                state().in_ours = Some(WeakObject::new(menu));
+                state().in_ours = Some((WeakObject::new(menu), ours.category));
                 menus.show_page(menu, ours.page, &ours.title);
             }
-            _ => {}
+            _ => {
+                let Some(names) = ours
+                    .dialogs
+                    .iter()
+                    .find(|names| names.dialog.context == leaf)
+                else {
+                    return;
+                };
+                match menus.panels.add_button(panel, &names.button, names.icon) {
+                    Some(button) => {
+                        state().dialog_button =
+                            Some((WeakObject::new(button), WeakObject::new(menu), names.dialog));
+                    }
+                    None => log!("no button added to {}", names.dialog.title),
+                }
+                state().in_ours = Some((WeakObject::new(menu), names.category));
+                menus.show_page(menu, ours.page, &names.title);
+            }
         }
     }
 }
 
-/// A menu button was clicked: ours opens our context, as the options' buttons open theirs.
-unsafe extern "C" fn clicked(button: *mut UObjectBase) {
-    let Some(original) = ORIGINAL_CLICKED.get() else {
+/// A menu button was clicked (`menu_buttons`): ours opens our context, as the options' buttons open
+/// theirs; a dialog's closes the menu and runs the dialog's action.
+fn clicked(button: *mut UObjectBase) {
+    let (Some(menus), Some(ours)) = (MENUS.get(), OURS.get()) else {
         return;
     };
-    // SAFETY: on the game thread, before the click changes anything.
-    let menu = unsafe { menu_of_ours(button) };
-    // SAFETY: forwards the caller's argument; ours has no delegate, so this does nothing for it.
-    unsafe { original(button) };
-    if let (Some(menu), Some(menus), Some(ours)) = (menu, MENUS.get(), OURS.get()) {
-        // SAFETY: a live menu, on the game thread.
-        unsafe { menus.open(menu, ours.context) };
+    // SAFETY: on the game thread (button clicks are UI code); ours have no delegate, so the click
+    // changed nothing yet.
+    unsafe {
+        let options = shown_in(menus, button, |state| {
+            state
+                .button
+                .as_ref()
+                .map(|(ours, shown_in)| (*ours, *shown_in))
+        });
+        if let Some(menu) = options {
+            menus.open(menu, ours.context);
+            return;
+        }
+        let dialog = state()
+            .dialog_button
+            .as_ref()
+            .filter(|(ours, _, _)| ours.is(button))
+            .map(|(_, _, dialog)| *dialog);
+        let shown = shown_in(menus, button, |state| {
+            state
+                .dialog_button
+                .as_ref()
+                .map(|(ours, shown_in, _)| (*ours, *shown_in))
+        });
+        if let (Some(menu), Some(dialog)) = (shown, dialog) {
+            menus.close(menu);
+            (dialog.action)();
+        }
     }
 }
 
-/// The menu showing `button`, if it's our button.
+/// The menu showing `button`, if it's the button `ours` picks from the state (with the menu it was
+/// shown in).
 ///
 /// # Safety
 /// Game thread only.
-unsafe fn menu_of_ours(button: *mut UObjectBase) -> Option<*mut UObjectBase> {
-    let menus = MENUS.get()?;
-    let menu = state()
-        .button
-        .as_ref()
+unsafe fn shown_in(
+    menus: &Menus,
+    button: *mut UObjectBase,
+    ours: impl FnOnce(&State) -> Option<(WeakObject, WeakObject)>,
+) -> Option<*mut UObjectBase> {
+    let menu = ours(&state())
         .filter(|(ours, _)| ours.is(button))
         .and_then(|(_, shown_in)| shown_in.get())?;
     // SAFETY: a live menu; the button must still be among its panel's (not pooled and reused by
     // another panel since).
     unsafe {
         let panel = menus.button_panel(menu)?;
-        menus.shows(panel, button).then_some(menu)
+        menus.panels.shows(panel, button).then_some(menu)
     }
 }
 
-/// A settings page lists its settings: the page shown in our context lists our category, for the
-/// time of it (pages are pooled and reused, so it keeps its own).
+/// A settings page lists its settings: the page shown in our context (or a dialog's) lists our
+/// category (or the dialog's), for the time of it (pages are pooled and reused, so it keeps its
+/// own).
 unsafe extern "C" fn add_properties(page: *mut UObjectBase) {
     let Some(original) = ORIGINAL_ADD_PROPERTIES.get() else {
         return;
     };
-    let (Some(menus), Some(ours)) = (MENUS.get(), OURS.get()) else {
+    let Some(menus) = MENUS.get() else {
         // SAFETY: forwards the caller's argument.
         unsafe { original(page) };
         return;
     };
-    let in_ours = state().in_ours.as_ref().and_then(WeakObject::get);
+    let in_ours = state()
+        .in_ours
+        .as_ref()
+        .and_then(|(menu, category)| Some((menu.get()?, *category)));
     // SAFETY: the live page being constructed and a live menu, on the game thread.
     unsafe {
-        if !in_ours.is_some_and(|menu| menus.current_page(menu) == page) {
+        let Some((_, category)) = in_ours.filter(|&(menu, _)| menus.current_page(menu) == page)
+        else {
             original(page);
             return;
-        }
+        };
         let categories = menus.categories(page);
         let own = categories.to_vec();
-        categories.fill(ours.category);
+        categories.fill(category);
         original(page);
         for (category, own) in menus.categories(page).iter_mut().zip(own) {
             *category = own;

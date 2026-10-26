@@ -13,7 +13,7 @@ use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use super::limits::{self, Edit, Limits, Rule};
-use crate::features::{slider_drag, slider_formulas};
+use crate::features::{axis_permutations, slider_drag, slider_formulas};
 use crate::framework::hook;
 use crate::game::numeric_property::{
     self, ClampValueFn, Container, GetValueRangeFn, NumericRange, NumericValue,
@@ -79,6 +79,11 @@ pub(super) unsafe fn install(targets: Targets) -> Result<(), String> {
     }
 }
 
+/// Whether `ClampValue` is hooked, so features can rewrite stored values from it.
+pub(super) fn hooked() -> bool {
+    CLAMP_VALUE.get().is_some()
+}
+
 unsafe extern "C" fn clamp_value_detour(
     property: *const c_void,
     out: *mut NumericValue,
@@ -88,9 +93,13 @@ unsafe extern "C" fn clamp_value_detour(
     let original = *CLAMP_VALUE.get().expect("hook recorded before use");
     // SAFETY: `input` is the caller's value, valid for the whole call.
     let input = unsafe { &*input };
-    // A typed formula using `x` gives each edited object its own value (`slider_formulas`).
+    // A typed formula using `x` gives each edited object its own value (`slider_formulas`), and so
+    // does putting values in their next order (`axis_permutations`).
     // SAFETY: these are the arguments of this ClampValue call.
-    let per_object = unsafe { slider_formulas::per_object_value(property, container, input) };
+    let per_object = unsafe {
+        slider_formulas::per_object_value(property, container, input)
+            .or_else(|| axis_permutations::per_object_value(property, container, input))
+    };
     let input = per_object.as_ref().unwrap_or(input);
     // SAFETY: forwards the caller's arguments, with only the input value possibly replaced.
     let call_original = || unsafe { original(property, out, container, input) };

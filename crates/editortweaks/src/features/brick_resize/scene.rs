@@ -9,6 +9,7 @@ use super::draw::PixelSize;
 use super::geometry::{self, Bounds, Frame, Ray, Vec3};
 use super::model::{BrickModel, Element, Pointing};
 use super::parts::{self, Part};
+use super::spinner::SpinnerBrick;
 use crate::game::weak_object::WeakObject;
 
 /// A brick and its box.
@@ -23,13 +24,25 @@ pub struct Placed {
     /// The axes it's mirrored along (its box reported inside out: a negative size).
     pub mirrored: [bool; 3],
     /// Its model, once models are added (see [`Scene::add_models`]), if it has one that fits its
-    /// box.
+    /// box; a spinner's from the start (its shape, see [`Self::spinner`]).
     pub model: Option<BrickModel>,
+    /// For a spinner: its values and cross-section. It's pointed at and snapped to by its model
+    /// whether models are on or not.
+    pub spinner: Option<SpinnerBrick>,
     /// Whether a move moves it (its frame is then where the move shows it).
     pub moving: bool,
     /// Whether it's the mirror mode counterpart of a brick a move moves: it moves along, mirrored
     /// (its frame is then where the move shows it too).
     pub mirroring: bool,
+}
+
+impl Placed {
+    /// The model it's seen by, with models on or not (`models`): a spinner always by its own.
+    pub fn shown_model(&self, models: bool) -> Option<&BrickModel> {
+        self.model
+            .as_ref()
+            .filter(|_| models || self.spinner.is_some())
+    }
 }
 
 /// What the mouse is doing this frame, in the vehicle.
@@ -102,11 +115,14 @@ impl Scene {
         self.models
     }
 
-    /// Gives every brick its model, as `model_of` finds it; how many have one.
+    /// Gives every brick its model, as `model_of` finds it (spinners keep theirs); how many have
+    /// one.
     pub fn add_models(&mut self, mut model_of: impl FnMut(&Placed) -> Option<BrickModel>) -> usize {
         self.models = true;
         for placed in &mut self.bricks {
-            placed.model = model_of(placed);
+            if placed.spinner.is_none() {
+                placed.model = model_of(placed);
+            }
         }
         self.bricks
             .iter()
@@ -151,7 +167,7 @@ impl Scene {
             if geometry::ray_box(&local, &placed.bounds.grown(margin)).is_none() {
                 continue;
             }
-            let model = placed.model.as_ref().filter(|_| models);
+            let model = placed.shown_model(models);
             let (distance, near) = if let Some(model) = model {
                 let Some(pointing) = model.pointed(&local, &local_pixels(&placed.frame, &pixels))
                 else {

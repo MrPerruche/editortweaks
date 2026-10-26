@@ -6,6 +6,9 @@
 //! brick -> `UBrickEditorObject::GetRootComponent` (its `UStaticMeshComponent`) -> `StaticMesh`
 //! -> `BodySetup` (a brick's body setup is its mesh's, `UBrick::GetBodySetup`) -> `TriMeshes`
 //! (`TArray<physx::PxTriangleMesh*>`, not reflected) -> PhysX's virtual functions.
+//!
+//! Meshes without complex collision (mods' bricks often have only simple collision) are read from
+//! the pak file the game loaded them from instead (`game::cooked_meshes`): their render triangles.
 
 use core::ffi::{CStr, c_char, c_void};
 
@@ -14,6 +17,7 @@ use brickrust::ue::tarray::TArray;
 use brickrust::ue::uclass::UStruct;
 
 use crate::framework::sig::Module;
+use crate::game::cooked_meshes;
 use crate::game::reflection::{self, Getter};
 use crate::math::Vec3;
 
@@ -49,11 +53,7 @@ type NameFn = unsafe extern "C" fn(mesh: *const c_void) -> *const c_char;
 type FlagsFn = unsafe extern "C" fn(mesh: *const c_void, flags: *mut u8) -> *mut u8;
 
 /// A mesh's triangles, in its own space (unscaled).
-pub struct Triangles {
-    pub vertices: Vec<[f32; 3]>,
-    /// Three vertex indices each.
-    pub triangles: Vec<[u32; 3]>,
-}
+pub use model_io::cooked::Triangles;
 
 /// Reads bricks' meshes and their triangles (after engine init).
 pub struct BrickModels {
@@ -64,6 +64,8 @@ pub struct BrickModels {
     /// Offsets of `UStaticMeshComponent::StaticMesh` and `UStaticMesh::BodySetup`.
     static_mesh: usize,
     body_setup: usize,
+    /// Offset of `UStaticMesh::StaticMaterials` (`TArray<FStaticMaterial>`): its material slots.
+    static_materials: usize,
     /// Offset of `TriMeshes`: the last field of `UBodySetupCore`, right before `UBodySetup`'s
     /// first, the reflected `AggGeom`.
     tri_meshes: usize,
@@ -135,6 +137,12 @@ impl BrickModels {
                 "ObjectProperty",
                 8,
             )?,
+            static_materials: reflection::field_offset(
+                class("StaticMesh")?,
+                "StaticMaterials",
+                "ArrayProperty",
+                16,
+            )?,
             tri_meshes,
             physx: Module::find(PHYSX_COMMON).ok_or(format!("{PHYSX_COMMON} not loaded"))?,
         })
@@ -171,7 +179,8 @@ impl BrickModels {
         }
     }
 
-    /// The triangles of `mesh`'s complex collision, or why there are none.
+    /// The triangles of `mesh`'s complex collision, else of its render data read from its package
+    /// file; or why there are none.
     ///
     /// # Safety
     /// `mesh` must be a live static mesh. Game thread only (PhysX meshes are made and released
@@ -179,13 +188,58 @@ impl BrickModels {
     pub unsafe fn triangles(&self, mesh: *mut UObjectBase) -> Result<Triangles, String> {
         // SAFETY: per the contract; the offset comes from reflection (checked above), and the body
         // setup is live if not null.
-        unsafe {
+        let collision = unsafe {
             let body_setup = read::<*mut UObjectBase>(mesh.cast(), self.body_setup);
             if body_setup.is_null() {
-                return Err("no body setup".into());
+                Err("no body setup".into())
+            } else {
+                self.triangles_of_body_setup(body_setup)
             }
-            self.triangles_of_body_setup(body_setup)
+        };
+        collision.or_else(|reason| {
+            // SAFETY: per the contract.
+            unsafe { cooked_meshes::triangles(mesh, 0) }
+                .map(|(_, triangles)| triangles)
+                .map_err(|cooked| format!("{reason}, and its package can't be read: {cooked}"))
+        })
+    }
+
+    /// The triangles of `mesh` like [`Self::triangles`], but with each triangle's material slot
+    /// where the mesh has several (wheels: the rim, then the tyre): its render triangles read from
+    /// its package file then, as collision triangles don't say. Collision triangles (no slots) if
+    /// the package can't be read.
+    ///
+    /// # Safety
+    /// As for [`Self::triangles`].
+    pub unsafe fn triangles_by_slot(&self, mesh: *mut UObjectBase) -> Result<Triangles, String> {
+        // SAFETY: per the contract; the offset comes from reflection.
+        let slots = unsafe { read::<TArray<u8>>(mesh.cast(), self.static_materials).num };
+        if slots > 1 {
+            // SAFETY: per the contract.
+            if let Ok((_, triangles)) = unsafe { cooked_meshes::triangles(mesh, 0) } {
+                return Ok(triangles);
+            }
         }
+        // SAFETY: per the contract.
+        unsafe { self.triangles(mesh) }
+    }
+
+    /// The triangles of `mesh`'s LOD `level` (0 is [`Self::triangles`]), read from its package
+    /// file, or of its least detailed LOD if it has fewer; and which LOD that is.
+    ///
+    /// # Safety
+    /// As for [`Self::triangles`].
+    pub unsafe fn level(
+        &self,
+        mesh: *mut UObjectBase,
+        level: usize,
+    ) -> Result<(usize, Triangles), String> {
+        if level == 0 {
+            // SAFETY: per the contract.
+            return unsafe { self.triangles(mesh) }.map(|triangles| (0, triangles));
+        }
+        // SAFETY: per the contract.
+        unsafe { cooked_meshes::triangles(mesh, level) }
     }
 
     /// The triangles of `body_setup`'s complex collision, or why there are none. Bricks whose mesh
@@ -207,10 +261,7 @@ impl BrickModels {
         if meshes.num > MAX_MESHES || meshes.num > meshes.max || meshes.data.is_null() {
             return Err(format!("unexpected triangle meshes ({})", meshes.num));
         }
-        let mut triangles = Triangles {
-            vertices: Vec::new(),
-            triangles: Vec::new(),
-        };
+        let mut triangles = Triangles::default();
         for index in 0..meshes.num as usize {
             // SAFETY: the array holds `num` triangle mesh pointers.
             let physx_mesh = unsafe { meshes.data.add(index).read() };

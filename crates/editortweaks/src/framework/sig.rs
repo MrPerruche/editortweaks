@@ -256,6 +256,24 @@ pub fn direct_calls_in_all_parts(function: *const u8) -> Vec<*const u8> {
         .collect()
 }
 
+/// Every pointer-sized slot of the game exe's data sections holding `address`: where a function is
+/// listed in virtual function tables (a table's other entries lie around it).
+pub fn pointers_to(address: *const u8) -> Vec<*const usize> {
+    let mut found = Vec::new();
+    for data in GameImage::get().data_sections() {
+        // SAFETY: sections start page-aligned, so every 8-byte slot is aligned and in bounds.
+        let slots =
+            unsafe { std::slice::from_raw_parts(data.as_ptr().cast::<usize>(), data.len() / 8) };
+        found.extend(
+            slots
+                .iter()
+                .filter(|&&slot| slot == address as usize)
+                .map(|slot| slot as *const usize),
+        );
+    }
+    found
+}
+
 /// Whether `address` lies in the game exe's code. Unlike [`is_function_start`], this holds for
 /// leaf functions too, e.g. to check a pointer read from a vtable before calling it.
 pub fn is_code(address: *const u8) -> bool {

@@ -49,7 +49,7 @@ use brickrust::ue::uclass::UStruct;
 
 use self::ballistics::{Contact, Ending, Flight, Frame, Ricochet, Shot};
 use super::{map_in_editor, view_modes};
-use crate::framework::settings::{Alternative, Choice, Section, Setting, Toggle};
+use crate::framework::settings::{Alternative, Choice, Toggle};
 use crate::game::brick_connections::{self, Connections};
 use crate::game::brick_editor;
 use crate::game::collision::Collision;
@@ -74,8 +74,12 @@ pub struct GunPreview;
 pub static SHOWS: Choice = Choice::new(
     "ShotPreview",
     "Shot preview",
-    "Where shots go: selected guns (and the guns stacked with them), every gun, or none show the path of their shots, to where they end. With the map shown, shots stop at what they hit.",
+    "Shows the path of shots from selected guns (and those stacked with them) or from every gun. With the map shown, shots stop at what they hit.",
     &[
+        Alternative {
+            key: "Off",
+            name: "Off",
+        },
         Alternative {
             key: "Selected",
             name: "Selected guns",
@@ -84,29 +88,17 @@ pub static SHOWS: Choice = Choice::new(
             key: "All",
             name: "All guns",
         },
-        Alternative {
-            key: "Off",
-            name: "Off",
-        },
     ],
-    0,
+    1,
 );
-const SELECTED: u8 = 0;
-const ALL: u8 = 1;
+const SELECTED: u8 = 1;
+const ALL: u8 = 2;
 
 /// Whether shots hit the vehicle's own bricks.
 pub static HITS_VEHICLE: Toggle = Toggle::new(
     "ShotPreviewHitsVehicle",
     "Shot preview hits this vehicle",
-    "In game, a vehicle's shots pass through the vehicle itself. On: the preview shows them hitting its bricks anyway, as a shot from another vehicle would: what they go through and which bricks they break off (magenta). Off: they pass through, as in game.",
-    true,
-);
-
-/// Whether the shot preview's tooltips show.
-pub static TOOLTIP: Toggle = Toggle::new(
-    "ShotPreviewTooltip",
-    "Shot preview tooltip",
-    "With the mouse on a gun or barrel, a shot's path, a marker where it hits something, or a brick it hits, a tooltip tells about it: strength, penetration, how far and how fast, what it does there. Hold the extended tooltip key (Shift) for more.",
+    "On: previewed shots hit this vehicle's own bricks as another vehicle's would, showing what they go through and break off (magenta). Off: they pass through, as in game.",
     true,
 );
 
@@ -114,15 +106,6 @@ pub static TOOLTIP: Toggle = Toggle::new(
 pub fn tooltip_shows() -> bool {
     label::shows()
 }
-
-pub static SETTINGS: [Section; 1] = [Section {
-    title: "Shot preview",
-    settings: &[
-        Setting::Choice(&SHOWS),
-        Setting::Toggle(&HITS_VEHICLE),
-        Setting::Toggle(&TOOLTIP),
-    ],
-}];
 
 /// The colors, free to change (linear RGB): the path at full damage and at the least, what it goes
 /// through, where it ricochets, a brick of the vehicle it breaks off and one it hits that holds,
@@ -530,7 +513,7 @@ unsafe fn tick(code: &Code, editor: *mut UObjectBase, state: &mut State) {
             }
         }
     }
-    if TOOLTIP.get() {
+    if view_modes::shot_preview_shows() {
         let vehicle = state.vehicle.as_ref().map(|(_, vehicle)| vehicle);
         let hidden = |object: *mut UObjectBase| {
             // SAFETY: one of the editor's objects, live.

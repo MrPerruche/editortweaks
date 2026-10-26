@@ -425,6 +425,14 @@ impl BrickModel {
         Some(Self { model, scale })
     }
 
+    /// `model` as it is: made in the brick's own space (a spinner's, `super::spinner`).
+    pub fn unscaled(model: Arc<Model>) -> Self {
+        Self {
+            model,
+            scale: [1.0; 3],
+        }
+    }
+
     /// A point of the model (by index), in the brick.
     pub fn point(&self, index: u32) -> Vec3 {
         let point = self.model.points[index as usize];

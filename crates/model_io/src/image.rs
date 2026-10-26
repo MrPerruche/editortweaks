@@ -70,6 +70,28 @@ impl Image {
         [r, g, b, (weight / samples as f64) as f32]
     }
 
+    /// The image with its colors multiplied by `tint` (linear RGB, as the engine's materials
+    /// multiply them), alpha kept.
+    pub fn tinted(&self, tint: [f32; 3]) -> Image {
+        // The result for every value of a channel: one table per channel, then a lookup per pixel.
+        let tables: [[u8; 256]; 3] = tint.map(|tint| {
+            core::array::from_fn(|value| {
+                let linear = srgb_to_linear(value as f32 / 255.0) * tint.max(0.0);
+                (linear_to_srgb(linear.min(1.0)) * 255.0 + 0.5) as u8
+            })
+        });
+        let mut rgba = self.rgba.clone();
+        for pixel in rgba.as_chunks_mut::<4>().0 {
+            for (value, table) in pixel.iter_mut().zip(&tables) {
+                *value = table[usize::from(*value)];
+            }
+        }
+        Image {
+            rgba,
+            ..self.clone()
+        }
+    }
+
     /// The image as a PNG file's contents: the engine's texture import (`ImportBufferAsTexture2D`)
     /// takes files, not pixels. Fast compression: it's decoded again right away.
     pub fn to_png(&self) -> Result<Vec<u8>, String> {
@@ -88,12 +110,53 @@ impl Image {
 }
 
 /// An sRGB-encoded value (0 to 1) as a linear one.
-fn srgb_to_linear(value: f32) -> f32 {
+pub fn srgb_to_linear(value: f32) -> f32 {
     if value <= 0.04045 {
         value / 12.92
     } else {
         ((value + 0.055) / 1.055).powf(2.4)
     }
+}
+
+/// A linear value (0 to 1) as an sRGB-encoded one.
+pub fn linear_to_srgb(value: f32) -> f32 {
+    if value <= 0.003_130_8 {
+        value * 12.92
+    } else {
+        1.055 * value.powf(1.0 / 2.4) - 0.055
+    }
+}
+
+/// Undoes an unknown mapping of values to bytes, from samples of it: `outputs[i]` is the byte the
+/// value `values[i]` came out as, the values increasing. For each byte, the value it stands for:
+/// the mean of the samples that gave it, else interpolated between the nearest ones. `None` if the
+/// bytes don't grow over at least half their range (no mapping to undo).
+pub fn inverse_curve(values: &[f32; 256], outputs: &[u8; 256]) -> Option<[f32; 256]> {
+    if outputs[255] < outputs[0].saturating_add(128) {
+        return None;
+    }
+    let mut sums = [0.0f32; 256];
+    let mut counts = [0u32; 256];
+    for (&value, &output) in values.iter().zip(outputs) {
+        sums[usize::from(output)] += value;
+        counts[usize::from(output)] += 1;
+    }
+    let known: Vec<(usize, f32)> = (0..256)
+        .filter(|&byte| counts[byte] > 0)
+        .map(|byte| (byte, sums[byte] / counts[byte] as f32))
+        .collect();
+    let (&first, &last) = (known.first()?, known.last()?);
+    Some(core::array::from_fn(|byte| {
+        match known.iter().position(|&(known, _)| known >= byte) {
+            None => last.1,
+            Some(0) => first.1,
+            Some(next) => {
+                let ((low, below), (high, above)) = (known[next - 1], known[next]);
+                let share = (byte - low) as f32 / (high - low) as f32;
+                below + (above - below) * share
+            }
+        }
+    }))
 }
 
 /// Reads and decodes the PNG or JPEG file at `path`.
@@ -269,6 +332,23 @@ mod tests {
     use super::*;
 
     #[test]
+    fn curves_are_undone() {
+        let values: [f32; 256] = core::array::from_fn(|i| srgb_to_linear(i as f32 / 255.0));
+        // Stored as sRGB: each byte is its own value back.
+        let encoded: [u8; 256] = core::array::from_fn(|i| i as u8);
+        let curve = inverse_curve(&values, &encoded).unwrap();
+        assert!((0..256).all(|byte| (curve[byte] - values[byte]).abs() < 1e-6));
+        // Stored linearly: dark values share bytes, and the byte for half is about half.
+        let linear: [u8; 256] = values.map(|value| (value * 255.0).round() as u8);
+        let curve = inverse_curve(&values, &linear).unwrap();
+        assert!((curve[128] - 128.0 / 255.0).abs() < 0.01, "{}", curve[128]);
+        assert_eq!(curve[255], 1.0);
+        assert!(curve[0] < 0.002);
+        // Nothing came through.
+        assert!(inverse_curve(&values, &[200; 256]).is_none());
+    }
+
+    #[test]
     fn average_color_is_linear_and_weighted_by_alpha() {
         // Black and sRGB 188 (about linear 0.5), opaque; a transparent red that doesn't count.
         let image = Image {
@@ -281,6 +361,27 @@ mod tests {
         assert_eq!((r, r), (g, b));
         assert!((a - 2.0 / 3.0).abs() < 1e-6);
         assert_eq!(Image::default().average_color(), [1.0, 1.0, 1.0, 0.0]);
+    }
+
+    #[test]
+    fn tinting_multiplies_in_linear_space() {
+        let image = Image {
+            width: 3,
+            height: 1,
+            rgba: vec![200, 100, 50, 77, 255, 255, 255, 255, 10, 20, 30, 0],
+        };
+        // White changes nothing.
+        assert_eq!(image.tinted([1.0; 3]), image);
+        // Black blanks the colors, not the alpha.
+        let black = image.tinted([0.0; 3]);
+        assert_eq!(black.rgba[0..4], [0, 0, 0, 77]);
+        assert_eq!(black.rgba[8..12], [0, 0, 0, 0]);
+        // Half of linear white is sRGB 188.
+        let half = image.tinted([0.5; 3]);
+        assert_eq!(half.rgba[4..8], [188, 188, 188, 255]);
+        // A channel at a time; more than white doesn't wrap around.
+        let red = image.tinted([1.0, 0.0, 2.0]);
+        assert_eq!(red.rgba[4..8], [255, 0, 255, 255]);
     }
 
     /// A PNG of `size` pixels in the given colour type and depth, `data` being the packed samples.

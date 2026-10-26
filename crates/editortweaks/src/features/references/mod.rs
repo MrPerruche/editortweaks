@@ -14,7 +14,10 @@
 //! hidden bricks and can't be clicked. All of them disappear with the Show references row or key
 //! ([`keybinds::SHOW_REFERENCES`]). Neither is saved. An
 //! unsaved vehicle keeps its references in memory until its first save, and a Save As carries them
-//! over to the new folder ([`carry_over`]).
+//! over to the new folder ([`carry_over`]). The game autosaves unsaved vehicles into one folder
+//! (see [`vehicle`]), and the vehicle is that folder's from then on: its references are written
+//! there with each autosave, marked with it ([`write_autosave`], [`follow_autosave`]). Recovering
+//! the autosave shows them; once another vehicle is autosaved there they're stale and not shown.
 //!
 //! The "Reference fit" view mode (`view_modes`) measures bricks against the model references
 //! ([`fit_key`], [`fit_triangles`]), and makes its material with [`looks`].
@@ -70,9 +73,12 @@ pub static SETTINGS: [Section; 1] = [Section {
     title: "References",
     settings: &[
         crate::framework::settings::Setting::Choice(&panel::ADD_AS),
-        crate::framework::settings::Setting::Toggle(&select::SELECTABLE),
         crate::framework::settings::Setting::Choice(&looks::SEE_THROUGH_LOOK),
     ],
+    // The side panel's "Show references" row sets it.
+    unlisted: &[crate::framework::settings::Setting::Toggle(
+        &select::SELECTABLE,
+    )],
 }];
 
 /// The game code this feature uses, found at engine init.
@@ -118,6 +124,9 @@ struct State {
     unreadable: bool,
     /// The references last shown, to carry them over to a Save As or a first save.
     last_seen: Option<Seen>,
+    /// The stamp of the vehicle in the autosave folder at the last poll (`None` before the first):
+    /// when it changes, the game autosaved there.
+    autosave: Option<Option<Stamp>>,
     scene: Scene,
     /// Model reads report here.
     loads: Option<(Sender<Loaded>, Receiver<Loaded>)>,
@@ -156,11 +165,13 @@ impl State {
             folder: None,
             sidecar: Sidecar {
                 version: model_io::sidecar::CURRENT_VERSION,
+                vehicle: None,
                 references: Vec::new(),
             },
             sidecar_stamp: None,
             unreadable: false,
             last_seen: None,
+            autosave: None,
             scene: Scene::new(),
             loads: None,
             selected: Vec::new(),
@@ -264,6 +275,7 @@ impl State {
         for problem in edit::make_missing_copies(&mut self.sidecar, &folder) {
             log!("{problem}");
         }
+        self.sidecar.vehicle = vehicle::mark_for(&folder);
         match self.sidecar.write(&folder) {
             Ok(()) => {
                 self.sidecar_stamp = Some(vehicle::stamp(&vehicle::sidecar_path(&folder)));
@@ -540,13 +552,28 @@ unsafe fn poll(code: &Code, editor: *mut UObjectBase, state: &mut State) -> Vec<
 
     let now = SystemTime::now();
     let folder = vehicle::folder_of(&info);
+    let autosave = vehicle::autosave_stamp();
+    let autosaved = state.autosave.is_some_and(|seen| seen != autosave);
+    state.autosave = Some(autosave);
     if state.folder != folder || (folder.is_none() && info_changed) {
         match &folder {
             Some(folder) => log!("vehicle folder: {}", folder.display()),
             None => log!("no vehicle folder (not saved yet?)"),
         }
+        if autosaved && state.folder.as_deref().is_some_and(vehicle::is_autosave) {
+            // The autosave folder's vehicle, autosaved as it's left.
+            follow_autosave(state);
+        }
         state.flush();
-        if let (Some(to), Some(seen)) = (&folder, state.last_seen.as_ref()) {
+        // The game's first autosave of an unsaved vehicle makes it the autosave folder's vehicle
+        // (its file info then names that folder): the same vehicle, its references go along.
+        // Recovering the autosave from the game's browser doesn't write it.
+        let first_autosave = autosaved
+            && state.folder.is_none()
+            && folder.as_deref().is_some_and(vehicle::is_autosave);
+        if let (true, Some(to)) = (first_autosave, &folder) {
+            write_autosave(&state.sidecar, to);
+        } else if let (Some(to), Some(seen)) = (&folder, state.last_seen.as_ref()) {
             carry_over(seen, to);
         }
         // Another vehicle: an unsaved one starts without references.
@@ -555,9 +582,13 @@ unsafe fn poll(code: &Code, editor: *mut UObjectBase, state: &mut State) -> Vec<
         state.sidecar = Sidecar::default();
         state.sidecar_stamp = None;
         state.unreadable = false;
-        state.selected.clear();
-        state.hidden.clear();
+        if !first_autosave {
+            state.selected.clear();
+            state.hidden.clear();
+        }
         state.refresh_panel = true;
+    } else if autosaved {
+        follow_autosave(state);
     }
 
     if let Some(folder) = state.folder.clone() {
@@ -592,6 +623,14 @@ fn read_sidecar(state: &mut State, folder: &Path) {
     state.sidecar_stamp = Some(stamp);
     state.refresh_panel = true;
     match Sidecar::read(folder) {
+        Ok(Some(sidecar)) if !vehicle::belongs(&sidecar, folder) => {
+            log!(
+                "{}: written with an earlier autosave, not shown",
+                path.display()
+            );
+            state.sidecar = Sidecar::default();
+            state.unreadable = false;
+        }
         Ok(Some(mut sidecar)) => {
             let mut ids = HashSet::new();
             sidecar.references.retain(|reference| {
@@ -648,6 +687,7 @@ fn carry_over(seen: &Seen, to: &Path) {
         for problem in edit::make_missing_copies(&mut sidecar, to) {
             log!("{problem}");
         }
+        sidecar.vehicle = vehicle::mark_for(to);
         sidecar.write(to)
     });
     let from = seen
@@ -666,5 +706,55 @@ fn carry_over(seen: &Seen, to: &Path) {
             "saved as {}: references not carried over: {reason}",
             to.display()
         ),
+    }
+}
+
+/// After the game autosaved into its autosave folder, the open vehicle staying the same: if that's
+/// the vehicle autosaved there, writes its references along, marked with this autosave. Another
+/// vehicle open (one saved in its own folder), the sidecar there is left: it no longer belongs.
+fn follow_autosave(state: &mut State) {
+    match state.folder.clone() {
+        Some(folder) if vehicle::is_autosave(&folder) => {
+            if state.unreadable {
+                // Read again: it may belong to no vehicle now.
+                state.sidecar_stamp = None;
+            } else {
+                state.unwritten = None;
+                state.write();
+            }
+        }
+        Some(_) => {}
+        // Still unsaved: the game names the autosave folder as soon as it autosaved, so this is
+        // a moment's gap at most.
+        None => {
+            if let Some(folder) = vehicle::autosave_folder() {
+                write_autosave(&state.sidecar.clone(), &folder);
+            }
+        }
+    }
+}
+
+/// Writes the references of an unsaved vehicle the game just autosaved into its autosave `folder`,
+/// marked with that autosave (none: the sidecar there, another vehicle's, is deleted). Links stay
+/// links; copies are made there once it's the open vehicle's folder.
+fn write_autosave(sidecar: &Sidecar, folder: &Path) {
+    if let Err(reason) = Sidecar::read(folder) {
+        log!("autosaved: references not written along: {reason}");
+        return;
+    }
+    let sidecar = Sidecar {
+        vehicle: vehicle::mark_for(folder),
+        ..sidecar.clone()
+    };
+    if sidecar.vehicle.is_none() {
+        log!("autosaved: references not written along: the autosave can't be read");
+        return;
+    }
+    match sidecar.write(folder) {
+        Ok(()) => log!(
+            "autosaved: {} references written along",
+            sidecar.references.len()
+        ),
+        Err(reason) => log!("autosaved: references not written along: {reason}"),
     }
 }

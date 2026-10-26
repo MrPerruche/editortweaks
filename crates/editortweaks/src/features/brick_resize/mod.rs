@@ -19,13 +19,19 @@
 //!   a moment before the button doesn't unsnap;
 //! - releasing the button makes it one step to undo. With mirror mode on, the brick's counterpart
 //!   changes along;
-//! - hold the model key too ([`keybinds::MODEL_EDITING`], the thumb mouse button by default): the
+//! - hold the model key too ([`keybinds::MODEL_EDITING`], either thumb mouse button or Tab by default): the
 //!   bricks' models replace their boxes, for what the mouse points at, drags and snaps to: their
 //!   faces, edges and vertices (see [`model`]). Dragging one resizes the box like the box's part it
 //!   lies on: a face moves along its normal keeping its slope (its sizes in proportion), an edge
 //!   across its length, a vertex away from the opposite corner; snapped, a vertex goes onto the
 //!   target, an edge and a face through it. Bricks without a model (see `game::brick_model`) keep
 //!   their box.
+//!
+//! Spinners show their real shape instead of their box, models or not, and dragging it changes
+//! their own values (see [`spinner`]): the inner or outer side the thickness, the top or bottom the
+//! height (each a whole side, curved or not, split where it turns from facing up or down to facing
+//! outward or inward), the rims between sides both, the end cap the angle (the start cap too on
+//! round ones, turning the brick).
 //!
 //! While moving bricks with the mouse free (the move mode's gizmo showing: G pressed twice), the
 //! same keys move them instead (a prototype, see [`motion`]):
@@ -72,7 +78,11 @@
 //! be placed.
 //! While a button is held the engine reports the mouse's movement to the editor, which would turn
 //! the camera with it: the resize takes it instead ([`super::mouse_moves`]), and follows it when
-//! the engine holds the cursor still ([`Drag::point`]). Each change writes `BrickSize` and tells the
+//! the engine holds the cursor still ([`Drag::point`]). The middle button's camera pivot
+//! (`Action_PivotCamera`) is taken while the resize key is held or a drag goes on: it would hide the
+//! cursor and hold it still, and the button may be one of the keys above (e.g. the model key, or
+//! `copy_properties`' keys, which copy the brick [`hovered_brick`] tells). Each change writes
+//! `BrickSize` and tells the
 //! brick like the editor's panel does (`game::scalable_brick::BrickSizes`), then moves the brick
 //! like a committed move (`game::editor_object::SpawnTransforms`); the last one runs as an editor
 //! operation (`game::brick_editor`), which makes the undo step. Moving bricks instead gives the
@@ -89,6 +99,7 @@ mod parts;
 mod resize;
 mod scene;
 mod snap;
+mod spinner;
 
 use std::collections::HashSet;
 use std::sync::{Mutex, Once, OnceLock, PoisonError, TryLockError};
@@ -100,7 +111,7 @@ use super::editor_buttons::{self, Button, Click, Press};
 use super::keybinds;
 use super::mouse_moves::{self, Handling, Movement, Pointer};
 use super::precise_moves::{self, Place};
-use crate::framework::settings::Section;
+use crate::framework::settings::{Section, Setting};
 use crate::game::brick_editor::{self, BrickEditor};
 use crate::game::brick_model::BrickModels;
 use crate::game::editor_mode::{self, EditorModes};
@@ -112,6 +123,8 @@ use crate::game::line_batcher::{self, LineBatcher};
 use crate::game::mirror_mode::{self, MirrorMode};
 use crate::game::move_mode::{self, Move, MoveMode};
 use crate::game::scalable_brick::BrickSizes;
+use crate::game::spinner::{Spinners, Values};
+use crate::game::spinner_profiles::SpinnerProfiles;
 use crate::game::viewport::{self, Viewport};
 use crate::game::weak_object::WeakObject;
 use crate::math;
@@ -127,24 +140,26 @@ use motion::{Aim, Grab, Motion, Orientation};
 use resize::{Grip, Resize};
 use scene::{Piece, Placed, Scene, View};
 use snap::Snapper;
+use spinner::{SpinnerBrick, SpinnerModels};
 
 pub struct BrickResize;
 
-/// Fast editing's settings, by section of the menu (see `features::SETTINGS`).
-pub static SETTINGS: [Section; 3] = [
-    Section {
-        title: "Fast editing: snapping",
-        settings: &snap::SETTINGS,
-    },
-    Section {
-        title: "Fast editing: turning to match",
-        settings: &motion::SETTINGS,
-    },
-    Section {
-        title: "Fast editing: lines",
-        settings: &line_tool::SETTINGS,
-    },
-];
+/// Fast editing's settings, by section of the menu (see `features::SETTINGS`): what snapping snaps
+/// to, when it turns the moved bricks, and how long a line lasts.
+pub static SETTINGS: [Section; 1] = [Section {
+    title: "Fast editing",
+    settings: &[
+        Setting::Choice(&snap::POINTS),
+        Setting::Choice(&snap::EDGE_FRACTIONS),
+        Setting::Choice(&snap::CROSSINGS),
+        Setting::Toggle(&snap::SEAMS),
+        Setting::Choice(&snap::ANYWHERE),
+        Setting::Choice(&motion::TURN_TO_MATCH),
+        Setting::Toggle(&motion::SQUARE),
+        Setting::Choice(&line_tool::LINE_LASTS),
+    ],
+    unlisted: &[],
+}];
 
 /// Set once everything is found; until then (or if that fails) the hooks change nothing.
 static GAME: OnceLock<Game> = OnceLock::new();
@@ -168,6 +183,9 @@ static LOG_NO_MODEL: Once = Once::new();
 static LOG_NO_FIT: Once = Once::new();
 static LOG_SNAPPED: Once = Once::new();
 static LOG_SLOW_SNAP: Once = Once::new();
+static LOG_SPINNER: Once = Once::new();
+static LOG_SPINNER_SHAPE: Once = Once::new();
+static LOG_SPINNER_BOX: Once = Once::new();
 
 /// How long finding what to snap to may take before it's logged (once), in milliseconds.
 const SLOW_SNAP_MS: f64 = 4.0;
@@ -200,6 +218,8 @@ struct Game {
     /// How the move mode moves bricks; without it (or without the selection, which tells the
     /// bricks moved), bricks can't be moved.
     moves: Option<&'static MoveMode>,
+    /// Spinners' values and cross-sections; without both, spinners keep their box.
+    spinners: Option<(Spinners, SpinnerProfiles)>,
 }
 
 impl Feature for BrickResize {
@@ -217,7 +237,7 @@ impl Feature for BrickResize {
                 log!(
                     "active: resize key (Alt by default) + drag a scalable brick's face, edge or \
                      corner (or a moved brick's, while moving with the gizmo showing), snap key \
-                     (Ctrl) to snap, model key (thumb mouse button) for models"
+                     (Ctrl) to snap, model key (thumb mouse buttons or Tab) for models"
                 )
             }
             Err(reason) => log!("inactive: {reason}"),
@@ -247,6 +267,10 @@ fn engine_init() -> Result<(), String> {
         mirror: optional(mirror_mode::find(), "mirrored counterparts won't follow"),
         models: optional(BrickModels::find(), "bricks keep their boxes on models"),
         moves,
+        spinners: optional(
+            Spinners::find().and_then(|spinners| Ok((spinners, SpinnerProfiles::find()?))),
+            "spinners keep their box",
+        ),
     };
     let _ = GAME.set(game);
     mouse_moves::listen(take_movement)?;
@@ -274,7 +298,8 @@ fn after_tick(editor: *mut UObjectBase, _delta: f32) {
 }
 
 /// The left button (`Select`) starts and ends resizing or moving; the right one (`MoveCamera`) looks
-/// deeper for snap targets while dragging, or places line points (see [`State::right_click`]).
+/// deeper for snap targets while dragging, or places line points (see [`State::right_click`]); the
+/// middle one (`PivotCamera`) doesn't pivot the camera while fast editing ([`State::pivot_click`]).
 /// Whether the game's handler is skipped.
 fn on_button(press: &Press) -> bool {
     let Some(game) = GAME.get() else {
@@ -287,10 +312,32 @@ fn on_button(press: &Press) -> bool {
             (Button::Select, Click::Pressed) => state.press(game),
             (Button::Select, Click::Released) => state.release(game),
             (Button::MoveCamera, click) => state.right_click(click),
+            (Button::PivotCamera, click) => state.pivot_click(click),
             // Shift + click and the keys.
             _ => false,
         }
     }
+}
+
+/// The brick fast editing points at now (its box or model shows), unless something is dragged.
+/// Game thread only.
+pub fn hovered_brick() -> Option<*mut UObjectBase> {
+    let state = STATE.lock().unwrap_or_else(PoisonError::into_inner);
+    if state.drag.is_some() {
+        return None;
+    }
+    let (scene, hover) = (state.scene.as_ref()?, state.hover.as_ref()?);
+    scene.get(hover.index).object.get_live()
+}
+
+/// Whether fast editing drags something now (a resize, a move, a spinner's handle). Game thread
+/// only.
+pub fn is_dragging() -> bool {
+    STATE
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .drag
+        .is_some()
 }
 
 /// Takes the mouse's movement while resizing: the camera stays still, and the movement moves the
@@ -328,6 +375,9 @@ struct Hover {
     /// How dragging it resizes the brick; `None` if it can't (the brick isn't scalable, or the
     /// piece drags no side), or while moving bricks.
     grip: Option<Grip>,
+    /// The spinner's piece it's on, and how dragging it changes the spinner (`None` if it can't);
+    /// `None` if it isn't one, or while moving bricks.
+    spinner: Option<(spinner::Part, Option<spinner::Grip>)>,
     /// The point of the brick under the mouse (in the vehicle).
     point: Vec3,
     /// The mouse then.
@@ -378,14 +428,31 @@ impl SnapKey {
     }
 }
 
-#[expect(
-    clippy::large_enum_variant,
-    reason = "there's one drag at a time: its size doesn't matter"
-)]
+// Only one drag goes on at a time, so its size doesn't matter.
+#[allow(clippy::large_enum_variant)]
 enum Action {
     Resize(Resizing),
     Move(Moving),
+    Spinner(SpinnerEditing),
 }
+
+/// A spinner being changed.
+struct SpinnerEditing {
+    brick: Edited,
+    /// Its mirror mode counterpart, and the mirror axis.
+    counterpart: Option<(Edited, u8)>,
+    dragging: spinner::Dragging,
+    /// The spinner as grabbed.
+    grabbed: SpinnerBrick,
+    /// The change asked for last (none yet: a click).
+    edit: Option<spinner::Edit>,
+    /// Where the mouse was pressed (screen pixels), until it moves away: a click changes nothing
+    /// (not even a stepped angle, or a thickness the radius doesn't allow).
+    pressed_at: Option<[f32; 2]>,
+}
+
+/// How far the mouse must move (pixels) for a press on a spinner to drag it.
+const SPINNER_DRAG_PIXELS: f32 = 1.0;
 
 /// A brick being resized.
 struct Resizing {
@@ -496,13 +563,17 @@ struct State {
     drawn: bool,
     /// Whether the model key is held (this frame).
     on_models: bool,
-    /// Bricks' models made so far, kept across scenes.
+    /// Bricks' models made so far, kept across scenes, and spinners'.
     models: Option<Models>,
+    spinner_models: Option<SpinnerModels>,
     /// The line moved bricks turn about or slide along, and placing it.
     line_tool: LineTool,
     /// The moved brick hovered when the line key went down with a line placed: a drag of the key
     /// from there slides the bricks along the line.
     slide_from: Option<Hover>,
+    /// Whether the camera pivot's press was taken (see [`Self::pivot_click`]): then so is its
+    /// release.
+    pivot_taken: bool,
 }
 
 // SAFETY: object pointers are only used on the game thread (the mutex just satisfies statics).
@@ -522,6 +593,7 @@ impl Drag {
         match &self.action {
             Action::Resize(resizing) => resizing.resize.frame.point(resizing.resize.grab),
             Action::Move(moving) => moving.motion.point(moving.grab.point),
+            Action::Spinner(editing) => editing.dragging.grabbed(),
         }
     }
 }
@@ -536,8 +608,10 @@ impl State {
             drawn: false,
             on_models: false,
             models: None,
+            spinner_models: None,
             line_tool: LineTool::new(),
             slide_from: None,
+            pivot_taken: false,
         }
     }
 
@@ -577,7 +651,8 @@ impl State {
                 if let Some(wanted) = &wanted
                     && self.scene.is_none()
                 {
-                    self.scene = Some(gather(game, editor, wanted));
+                    let spinners = self.spinner_models.get_or_insert_with(Default::default);
+                    self.scene = Some(gather(game, editor, wanted, spinners));
                 }
                 self.gathered = wanted;
             }
@@ -695,11 +770,17 @@ impl State {
             let grip = (placed.scalable && !moving)
                 .then(|| Grip::of(pointed.piece, &placed.bounds, placed.model.as_ref()))
                 .flatten();
+            let spinner = (!moving)
+                .then(|| spinner_grip(placed, pointed.piece, pointed.point, view))
+                .flatten();
             Hover {
                 index: pointed.index,
                 piece: pointed.piece,
-                grabbable: moving || grip.is_some(),
+                grabbable: moving
+                    || grip.is_some()
+                    || spinner.is_some_and(|(_, grip)| grip.is_some()),
                 grip,
+                spinner,
                 point: pointed.point,
                 view: *view,
             }
@@ -743,6 +824,10 @@ impl State {
         let (Some(scene), Some(hover)) = (&self.scene, &self.hover) else {
             return false;
         };
+        if let Some((_, grip)) = hover.spinner {
+            // SAFETY: per the contract.
+            return grip.is_some_and(|grip| unsafe { self.press_spinner(game, grip) });
+        }
         let Some(grip) = hover.grip else {
             return false;
         };
@@ -799,6 +884,72 @@ impl State {
                     asked: size,
                     kept: math::widen(size),
                     bounds: placed.bounds,
+                }),
+            });
+        }
+        true
+    }
+
+    /// Starts changing the hovered spinner by `grip`; whether it did.
+    ///
+    /// # Safety
+    /// Game thread only.
+    unsafe fn press_spinner(&mut self, game: &Game, grip: spinner::Grip) -> bool {
+        let (Some(scene), Some(hover), Some((spinners, _))) =
+            (&self.scene, &self.hover, &game.spinners)
+        else {
+            return false;
+        };
+        let placed = scene.get(hover.index);
+        let (Some(object), Some(brick)) = (placed.object.get(), &placed.spinner) else {
+            return false;
+        };
+        if !game.spawn.known() {
+            LOG_NO_PLACES.call_once(|| {
+                log!("can't change spinners: where bricks keep their place wasn't found")
+            });
+            return false;
+        }
+        // SAFETY: per the contract; `object` is a live spinner in the editor.
+        unsafe {
+            let editor = game.bricks.editor_of(object);
+            let Some(edited_brick) = edited(game, object) else {
+                return false;
+            };
+            if editor.is_null() {
+                return false;
+            }
+            let counterpart = game.mirror.as_ref().and_then(|mirror| {
+                let axis = mirror.axis()?;
+                let other = game.code.mirrored_object(object)?;
+                spinners.is_spinner(other).then_some(())?;
+                Some((edited(game, other)?, axis))
+            });
+            let Some(dragging) =
+                spinner::Dragging::new(grip, placed.frame, brick.spinner, hover.point)
+            else {
+                return false;
+            };
+            LOG_SPINNER.call_once(|| {
+                log!(
+                    "changing a spinner by {} ({:?})",
+                    grip.describe(),
+                    brick.stored
+                )
+            });
+            self.drag = Some(Drag {
+                editor: WeakObject::new(editor),
+                pointer: Pointer::new(hover.view.mouse),
+                snapper: Snapper::default(),
+                snap_key: SnapKey::default(),
+                held_by: HeldBy::Select,
+                action: Action::Spinner(SpinnerEditing {
+                    brick: edited_brick,
+                    counterpart,
+                    dragging,
+                    grabbed: brick.clone(),
+                    edit: None,
+                    pressed_at: Some(hover.view.mouse),
                 }),
             });
         }
@@ -906,6 +1057,25 @@ impl State {
         self.line_tool.right_button(pressed, line_key)
     }
 
+    /// Takes the camera pivot's press by the middle button (not Space) while the resize key is held
+    /// or a drag goes on, and then its release: the camera would hide the cursor and hold it still,
+    /// while the button may be one of fast editing's keys. Whether it took it.
+    fn pivot_click(&mut self, click: Click) -> bool {
+        match click {
+            Click::Pressed => {
+                let dragging = self.drag.is_some();
+                let fast_editing = keybinds::RESIZE_BRICKS.is_held();
+                self.pivot_taken = keyboard::is_middle_button_down() && (dragging || fast_editing);
+                if self.pivot_taken {
+                    let why = if dragging { "dragging" } else { "fast editing" };
+                    log!("the middle button doesn't pivot the camera: {why}");
+                }
+                self.pivot_taken
+            }
+            Click::Released => core::mem::take(&mut self.pivot_taken),
+        }
+    }
+
     /// Ends dragging when the button is released; whether one was (or a drag of the line key, which
     /// took its press: see [`Self::press`]).
     ///
@@ -948,6 +1118,9 @@ impl State {
                 Action::Move(moving) => {
                     follow_move(game, editor, scene, moving, snapper, view, models)
                 }
+                Action::Spinner(editing) => {
+                    follow_spinner(game, scene, editing, snapper, view, models)
+                }
             }
         };
         if !going {
@@ -967,6 +1140,9 @@ impl State {
         let changed = match &drag.action {
             Action::Resize(resizing) => resizing.asked != math::narrow(resizing.resize.size),
             Action::Move(moving) => moving.motion != Motion::NONE,
+            Action::Spinner(editing) => editing
+                .edit
+                .is_some_and(|edit| edit != editing.dragging.unchanged()),
         };
         if !changed {
             // A click without a drag.
@@ -987,9 +1163,65 @@ impl State {
                 }
             )
         });
-        if let Action::Resize(resizing) = drag.action {
+        match drag.action {
             // SAFETY: per the contract.
-            unsafe { self.finish_resize(game, &drag.editor, resizing) };
+            Action::Resize(resizing) => unsafe { self.finish_resize(game, &drag.editor, resizing) },
+            // SAFETY: per the contract.
+            Action::Spinner(editing) => unsafe { self.finish_spinner(game, &drag.editor, editing) },
+            Action::Move(_) => {}
+        }
+    }
+
+    /// Finishes changing a spinner: the last change, as one editor operation (one undo step).
+    ///
+    /// # Safety
+    /// Game thread only.
+    unsafe fn finish_spinner(
+        &mut self,
+        game: &Game,
+        editor: &WeakObject,
+        mut editing: SpinnerEditing,
+    ) {
+        let (Some(editor), Some(object)) = (editor.get(), editing.brick.object.get()) else {
+            return;
+        };
+        // SAFETY: per the contract; the editor and the spinner are live.
+        unsafe {
+            game.editor.operation(editor, brick_editor::MOVED, || {
+                apply_spinner(game, &mut editing, false);
+            });
+            let counterpart = editing.counterpart.as_ref().map(|(other, _)| &other.object);
+            let objects: Vec<*mut UObjectBase> =
+                [Some(object), counterpart.and_then(WeakObject::get)]
+                    .into_iter()
+                    .flatten()
+                    .collect();
+            self.update_scene(game, &objects);
+        }
+    }
+
+    /// Finds again what's known of `objects` (changed bricks) in the scene.
+    ///
+    /// # Safety
+    /// `objects` must be live bricks. Game thread only.
+    unsafe fn update_scene(&mut self, game: &Game, objects: &[*mut UObjectBase]) {
+        let Some(scene) = &mut self.scene else {
+            return;
+        };
+        let spinners = self.spinner_models.get_or_insert_with(Default::default);
+        for &object in objects {
+            // SAFETY: per the contract.
+            unsafe {
+                if let Some(mut placed) = placed(game, object, spinners) {
+                    if scene.has_models()
+                        && placed.spinner.is_none()
+                        && let (Some(reader), Some(models)) = (&game.models, &mut self.models)
+                    {
+                        placed.model = model_of(reader, models, object, &placed);
+                    }
+                    scene.update(placed);
+                }
+            }
         }
     }
 
@@ -1007,27 +1239,16 @@ impl State {
             game.editor.operation(editor, brick_editor::MOVED, || {
                 apply(game, &mut resizing, size, false);
             });
-            if let Some(scene) = &mut self.scene {
-                let counterpart = resizing
-                    .counterpart
-                    .as_ref()
-                    .map(|(other, _)| &other.object);
-                for edited in [Some(&resizing.brick.object), counterpart]
-                    .into_iter()
-                    .flatten()
-                {
-                    if let Some(object) = edited.get()
-                        && let Some(mut placed) = placed(game, object)
-                    {
-                        if scene.has_models()
-                            && let (Some(reader), Some(models)) = (&game.models, &mut self.models)
-                        {
-                            placed.model = model_of(reader, models, object, &placed);
-                        }
-                        scene.update(placed);
-                    }
-                }
-            }
+            let counterpart = resizing
+                .counterpart
+                .as_ref()
+                .map(|(other, _)| &other.object);
+            let objects: Vec<*mut UObjectBase> = [Some(&resizing.brick.object), counterpart]
+                .into_iter()
+                .flatten()
+                .filter_map(WeakObject::get)
+                .collect();
+            self.update_scene(game, &objects);
         }
     }
 
@@ -1075,6 +1296,7 @@ impl State {
             match &drag.action {
                 Action::Resize(resizing) => draw_resizing(&mut drawing, resizing),
                 Action::Move(moving) => draw_moving(&mut drawing, moving),
+                Action::Spinner(editing) => draw_spinner_editing(&mut drawing, editing),
             }
             if let Some(snapped) = drag.snapper.snapped() {
                 // What lines up with the snap point, and how counterparts of moved bricks moved.
@@ -1090,6 +1312,8 @@ impl State {
                         moving.motion.point(moving.grab.point),
                         moving.mirror.map(|axis| moving.motion.mirrored(axis)),
                     ),
+                    // What's dragged goes through the point itself.
+                    Action::Spinner(_) => (snapped.target.point, None),
                 };
                 let snap = Snapped {
                     snapper: &drag.snapper,
@@ -1105,6 +1329,31 @@ impl State {
                 let grab = drag.grabbed_point();
                 let depth = geometry::length(geometry::sub(grab, view.ray.origin));
                 drawing.pointer(geometry::along(&view.ray, depth), draw::POINTER);
+            }
+        } else if let Some(hover) = &self.hover
+            && let Some(brick) = &scene.get(hover.index).spinner
+        {
+            let placed = scene.get(hover.index);
+            let frame = &placed.frame;
+            let editing = matches!(self.gathered, Some(Gathered::Editing));
+            spinner::draw_outline(
+                &mut drawing,
+                frame,
+                &brick.spinner,
+                brick,
+                draw::BOX,
+                editing,
+            );
+            let pen = if hover.grabbable {
+                draw::PART
+            } else {
+                draw::FIXED_PART
+            };
+            match hover.spinner {
+                Some((part, _)) => {
+                    spinner::draw_part(&mut drawing, frame, &brick.spinner, brick, part, pen)
+                }
+                None => draw_piece(&mut drawing, frame, placed, hover.piece, pen),
             }
         } else if let Some(hover) = &self.hover {
             let placed = scene.get(hover.index);
@@ -1194,6 +1443,55 @@ unsafe fn follow_resize(
     resizing.asked = size;
     // SAFETY: per the contract.
     unsafe { apply(game, resizing, size, true) }
+}
+
+/// Changes the spinner for the mouse, snapped with a `snapper` (while snapping, see [`SnapKey`]);
+/// false once it can't be.
+///
+/// # Safety
+/// Game thread only.
+unsafe fn follow_spinner(
+    game: &Game,
+    scene: &Scene,
+    editing: &mut SpinnerEditing,
+    snapper: Option<&mut Snapper>,
+    view: &View,
+    models: bool,
+) -> bool {
+    if let Some([x, y]) = editing.pressed_at {
+        if (view.mouse[0] - x).hypot(view.mouse[1] - y) < SPINNER_DRAG_PIXELS {
+            return true;
+        }
+        editing.pressed_at = None;
+    }
+    let edit = if let Some(snapper) = snapper {
+        // The changed spinners are left out: they change.
+        let counterpart = editing.counterpart.as_ref().map(|(other, _)| &other.object);
+        let changed: Vec<*mut UObjectBase> = [Some(&editing.brick.object), counterpart]
+            .into_iter()
+            .flatten()
+            .filter_map(WeakObject::get)
+            .collect();
+        let is_changed = |placed: &Placed| changed.iter().any(|&object| placed.object.is(object));
+        let started = Instant::now();
+        let snapped = snapper.snap(&snap::snapping(), scene, view, models, is_changed);
+        log_snap(snapped.map(|snapped| snapped.kind), started);
+        // A point it can't go through (the hub, for a side): it follows the mouse.
+        snapped
+            .and_then(|snapped| editing.dragging.snap(&snapped.target))
+            .or_else(|| editing.dragging.follow(view))
+    } else {
+        editing.dragging.follow(view)
+    };
+    let Some(edit) = edit else {
+        return true;
+    };
+    if editing.edit == Some(edit) {
+        return true;
+    }
+    editing.edit = Some(edit);
+    // SAFETY: per the contract.
+    unsafe { apply_spinner(game, editing, true) }
 }
 
 /// Moves the bricks of the move for the mouse, snapped with a `snapper` (while snapping, see
@@ -1413,6 +1711,38 @@ fn draw_resizing(drawing: &mut Drawing, resizing: &Resizing) {
     }
 }
 
+/// A spinner being changed: its outline as asked last, and what's dragged.
+fn draw_spinner_editing(drawing: &mut Drawing, editing: &SpinnerEditing) {
+    let dragging = &editing.dragging;
+    let edit = editing.edit.unwrap_or_else(|| dragging.unchanged());
+    let frame = spinner::moved_frame(&dragging.frame, &edit);
+    let brick = &editing.grabbed;
+    spinner::draw_outline(drawing, &frame, &edit.spinner, brick, draw::BOX, false);
+    dragging.draw(drawing, &edit, brick, draw::PART);
+}
+
+/// The piece of `placed` that `piece` (pointed at `point`, the mouse at `view`) is on if it's a
+/// spinner, and how dragging it changes it: a separator on the side under the mouse first (see
+/// [`spinner::Part::separator_under`]), else the piece.
+fn spinner_grip(
+    placed: &Placed,
+    piece: Piece,
+    point: Vec3,
+    view: &View,
+) -> Option<(spinner::Part, Option<spinner::Grip>)> {
+    let (Some(brick), Some(model), Piece::Model(element)) = (&placed.spinner, &placed.model, piece)
+    else {
+        return None;
+    };
+    let mut part = spinner::Part::of(brick, model, element, placed.frame.local(point));
+    if let spinner::Part::Side(_) = part
+        && let Some(separator) = spinner::Part::separator_under(brick, &placed.frame, view, point)
+    {
+        part = separator;
+    }
+    Some((part, part.grip(brick)))
+}
+
 /// The grabbed brick of a move where it's going: its box, and the piece grabbed; moving about a
 /// line, the circle the grabbed point goes round it on.
 fn draw_moving(drawing: &mut Drawing, moving: &Moving) {
@@ -1515,7 +1845,12 @@ unsafe fn is_selected(game: &Game, placed: &Placed) -> bool {
 ///
 /// # Safety
 /// `editor` must be a live editor, and a move's mode live. Game thread only.
-unsafe fn gather(game: &Game, editor: *mut UObjectBase, gathered: &Gathered) -> Scene {
+unsafe fn gather(
+    game: &Game,
+    editor: *mut UObjectBase,
+    gathered: &Gathered,
+    spinners: &mut SpinnerModels,
+) -> Scene {
     let started = Instant::now();
     // SAFETY: per the contract; the editor's objects are live (entries may be null).
     let (vehicle, bricks) = unsafe {
@@ -1535,7 +1870,7 @@ unsafe fn gather(game: &Game, editor: *mut UObjectBase, gathered: &Gathered) -> 
         let bricks: Vec<(*mut UObjectBase, Placed)> = bricks
             .into_iter()
             .filter_map(|object| {
-                let mut placed = placed(game, object)?;
+                let mut placed = placed(game, object, spinners)?;
                 if let Some(carry) = &carry {
                     if is_selected(game, &placed) {
                         placed.frame = carry.frame(&placed.frame);
@@ -1647,11 +1982,15 @@ unsafe fn carry(
     }
 }
 
-/// A brick's box in the vehicle, if it has one.
+/// A brick's box in the vehicle, if it has one; a spinner's shape too (made with `spinners`).
 ///
 /// # Safety
 /// `object` must be a live brick. Game thread only.
-unsafe fn placed(game: &Game, object: *mut UObjectBase) -> Option<Placed> {
+unsafe fn placed(
+    game: &Game,
+    object: *mut UObjectBase,
+    spinners: &mut SpinnerModels,
+) -> Option<Placed> {
     // SAFETY: per the contract.
     unsafe {
         let [a, b] = game.bounds.of(object)?.map(math::widen);
@@ -1664,16 +2003,71 @@ unsafe fn placed(game: &Game, object: *mut UObjectBase) -> Option<Placed> {
         if scalable {
             bounds = sized(bounds, math::widen(game.sizes.size(object)));
         }
+        let (spinner, model) = match spinner_brick(game, object, spinners, &bounds) {
+            Some((brick, model)) => (Some(brick), Some(model)),
+            None => (None, None),
+        };
         Some(Placed {
             object: WeakObject::new(object),
             frame: Frame::of_place(location, rotation),
             bounds,
             scalable,
             mirrored: core::array::from_fn(|axis| a[axis] > b[axis]),
-            model: None,
+            model,
+            spinner,
             moving: false,
             mirroring: false,
         })
+    }
+}
+
+/// How far a spinner's box worked out from its values may be from the one the game reports, per
+/// coordinate (cm, and as a share of the box's size): the game's is in `f32`.
+const SPINNER_BOX_MATCH: f64 = 0.01;
+const SPINNER_BOX_SHARE: f64 = 1e-4;
+
+/// `object`'s values and shape if it's a spinner, with its model (made with `spinners`), if its
+/// box `bounds` is the one its values give: else the game shapes spinners otherwise now, and it's
+/// handled as a box (logged once).
+///
+/// # Safety
+/// `object` must be a live brick. Game thread only.
+unsafe fn spinner_brick(
+    game: &Game,
+    object: *mut UObjectBase,
+    spinners: &mut SpinnerModels,
+    bounds: &Bounds,
+) -> Option<(SpinnerBrick, BrickModel)> {
+    let (reader, profiles) = game.spinners.as_ref()?;
+    // SAFETY: per the contract.
+    unsafe {
+        if !reader.is_spinner(object) {
+            return None;
+        }
+        let values = reader.read(object);
+        let Some((brick, model)) = spinners.brick(values, || profiles.of(object)) else {
+            LOG_SPINNER_SHAPE.call_once(|| {
+                log!("a spinner keeps its box: its cross-section wasn't read ({values:?})")
+            });
+            return None;
+        };
+        let [min, max] = brick.spinner.bounds();
+        let size = geometry::length(geometry::sub(max, min));
+        let tolerance = SPINNER_BOX_MATCH + SPINNER_BOX_SHARE * size;
+        let matches = (0..3).all(|axis| {
+            (min[axis] - bounds.min[axis]).abs() <= tolerance
+                && (max[axis] - bounds.max[axis]).abs() <= tolerance
+        });
+        if !matches {
+            LOG_SPINNER_BOX.call_once(|| {
+                log!(
+                    "a spinner keeps its box: the game's {bounds:?} isn't the one its values give, \
+                     {min:?}..{max:?} ({values:?})"
+                )
+            });
+            return None;
+        }
+        Some((brick, model))
     }
 }
 
@@ -1871,6 +2265,58 @@ unsafe fn edited(game: &Game, object: *mut UObjectBase) -> Option<Edited> {
         location: place.location,
         rotation: place.rotation,
     })
+}
+
+/// Gives the spinner the values the last change asked for, telling it about those its grip changes
+/// (`interactive`ly while dragging), then places it (and its counterpart, with the opposite angle)
+/// to keep what's not dragged in place. False if it's gone or can't be told.
+///
+/// # Safety
+/// Game thread only.
+unsafe fn apply_spinner(game: &Game, editing: &mut SpinnerEditing, interactive: bool) -> bool {
+    let (Some((spinners, _)), Some(edit), Some(object)) =
+        (&game.spinners, editing.edit, editing.brick.object.get())
+    else {
+        return false;
+    };
+    let values = spinner::values_of(&editing.grabbed.stored, &edit);
+    let changes = editing.dragging.grip.changes();
+    // SAFETY: per the contract; the spinner and its counterpart are live spinners.
+    unsafe {
+        let Some(kept) = spinners.write(object, &values, changes, interactive) else {
+            LOG_NO_INTERFACE
+                .call_once(|| log!("can't change spinners: bricks' property interface not found"));
+            return false;
+        };
+        let spawn = Frame::of_place(editing.brick.location, editing.brick.rotation);
+        let moved = spinner::moved_frame(&spawn, &edit);
+        let location = math::narrow(moved.origin);
+        let rotation = if edit.turn != 0.0 {
+            math::narrow(moved.rotation.to_rotator())
+        } else {
+            editing.brick.rotation
+        };
+        game.spawn.set(object, location, rotation);
+        if let (Some((other, axis)), Some(mirror)) = (&editing.counterpart, &game.mirror)
+            && let Some(counterpart) = other.object.get()
+        {
+            let mirrored = Values {
+                angle: -kept.angle,
+                ..kept
+            };
+            spinners.write(counterpart, &mirrored, changes, interactive);
+            let (location, rotation) = if edit.turn != 0.0 {
+                let (location, turned) = mirror.mirrored_place(object, location, rotation, *axis);
+                let rotation = math::Quat::widen(turned).to_rotator();
+                (location, math::narrow(rotation))
+            } else {
+                let location = mirror.mirrored_location(object, location, rotation, *axis);
+                (location, other.rotation)
+            };
+            game.spawn.set(counterpart, location, rotation);
+        }
+    }
+    true
 }
 
 /// Asks the dragged brick for `size`, then places it (and its counterpart) to keep the parts not

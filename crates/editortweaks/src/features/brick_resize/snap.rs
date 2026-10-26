@@ -1,6 +1,6 @@
 //! What a resize snaps to with the snap key held ([`super::keybinds::SNAP_RESIZE`]): points of
 //! other bricks near the mouse, like a CAD program's object snaps. Each kind is a setting
-//! ([`SETTINGS`], in the game's options under "Editor tweaks"):
+//! (`super::SETTINGS`, in the game's options under "Editor tweaks"):
 //!
 //! - boxes' corners and models' vertices;
 //! - halfway along edges (and thirds and quarters of them);
@@ -31,106 +31,159 @@ use super::model::{BrickModel, Element};
 use super::parts::{self, Part};
 use super::resize::Target;
 use super::scene::{Piece, Placed, Scene, View};
-use crate::framework::settings::{Setting, Toggle};
+use crate::framework::settings::{Alternative, Choice, Toggle};
 
-/// What snapping snaps to now: each kind a setting ([`SETTINGS`]).
+/// What snapping snaps to now: each kind a setting (see `super::SETTINGS`).
 pub fn snapping() -> Snapping {
+    let (corners, face_centers) = match POINTS.get() {
+        1 => (true, false),
+        2 => (false, true),
+        3 => (true, true),
+        _ => (false, false),
+    };
+    let (midpoints, thirds, quarters) = match EDGE_FRACTIONS.get() {
+        1 => (true, false, false),
+        2 => (true, true, false),
+        3 => (true, false, true),
+        4 => (true, true, true),
+        _ => (false, false, false),
+    };
+    let crossings = CROSSINGS.get();
+    let (edges, faces) = match ANYWHERE.get() {
+        1 => (true, false),
+        2 => (false, true),
+        3 => (true, true),
+        _ => (false, false),
+    };
     Snapping {
-        corners: CORNERS.get(),
-        midpoints: MIDPOINTS.get(),
-        thirds: THIRDS.get(),
-        quarters: QUARTERS.get(),
-        face_centers: FACE_CENTERS.get(),
-        edge_intersections: EDGE_INTERSECTIONS.get(),
-        face_intersections: FACE_INTERSECTIONS.get(),
-        between_intersections: BETWEEN_INTERSECTIONS.get(),
+        corners,
+        midpoints,
+        thirds,
+        quarters,
+        face_centers,
+        edge_intersections: crossings != 0,
+        face_intersections: crossings != 0,
+        between_intersections: crossings == 2,
         seams: SEAMS.get(),
-        edges: EDGES.get(),
-        faces: FACES.get(),
+        edges,
+        faces,
     }
 }
 
-/// The settings of what snapping snaps to, in the menu's order.
-pub static SETTINGS: [Setting; 11] = [
-    Setting::Toggle(&CORNERS),
-    Setting::Toggle(&MIDPOINTS),
-    Setting::Toggle(&THIRDS),
-    Setting::Toggle(&QUARTERS),
-    Setting::Toggle(&FACE_CENTERS),
-    Setting::Toggle(&EDGE_INTERSECTIONS),
-    Setting::Toggle(&FACE_INTERSECTIONS),
-    Setting::Toggle(&BETWEEN_INTERSECTIONS),
-    Setting::Toggle(&SEAMS),
-    Setting::Toggle(&EDGES),
-    Setting::Toggle(&FACES),
-];
+/// Which of boxes' corners and models' vertices, and faces' centers, snapping snaps to, a setting:
+/// the options of [`snapping`], in order.
+pub(super) static POINTS: Choice = Choice::new(
+    "SnapPoints",
+    "Snap to corners and centers",
+    "Snap to boxes' corners and models' vertices, and to the centers of faces.",
+    &[
+        Alternative {
+            key: "Off",
+            name: "Off",
+        },
+        Alternative {
+            key: "Corners",
+            name: "Corners",
+        },
+        Alternative {
+            key: "FaceCenters",
+            name: "Centers",
+        },
+        Alternative {
+            key: "Both",
+            name: "Both",
+        },
+    ],
+    3,
+);
 
-static CORNERS: Toggle = Toggle::new(
-    "SnapCorners",
-    "Corners",
-    "Snap to boxes' corners and models' vertices.",
-    true,
+/// Which shares of edges (and seams) snapping snaps to, a setting: the options of [`snapping`], in
+/// order.
+pub(super) static EDGE_FRACTIONS: Choice = Choice::new(
+    "SnapEdgeFractions",
+    "Snap along edges",
+    "Snap halfway along edges (and seams), and also a third or a quarter of the way along them, \
+     from either end.",
+    &[
+        Alternative {
+            key: "Off",
+            name: "Off",
+        },
+        Alternative {
+            key: "Halves",
+            name: "1/2",
+        },
+        Alternative {
+            key: "Thirds",
+            name: "1/2, 1/3",
+        },
+        Alternative {
+            key: "Quarters",
+            name: "1/2, 1/4",
+        },
+        Alternative {
+            key: "All",
+            name: "1/2, 1/3, 1/4",
+        },
+    ],
+    1,
 );
-static MIDPOINTS: Toggle = Toggle::new(
-    "SnapMidpoints",
-    "Midpoints",
-    "Snap halfway along edges (and seams).",
-    true,
+
+/// Which crossings snapping snaps to, a setting: the options of [`snapping`], in order.
+pub(super) static CROSSINGS: Choice = Choice::new(
+    "SnapCrossings",
+    "Snap where bricks cross",
+    "Snap where an edge crosses another brick's edge or goes through its face. With midpoints: \
+     also halfway between two of those along an edge, or between one and the edge's end.",
+    &[
+        Alternative {
+            key: "Off",
+            name: "Off",
+        },
+        Alternative {
+            key: "Crossings",
+            name: "On",
+        },
+        Alternative {
+            key: "Between",
+            name: "With midpoints",
+        },
+    ],
+    2,
 );
-static THIRDS: Toggle = Toggle::new(
-    "SnapThirds",
-    "Thirds",
-    "Snap a third of the way along edges (and seams), from either end.",
-    false,
-);
-static QUARTERS: Toggle = Toggle::new(
-    "SnapQuarters",
-    "Quarters",
-    "Snap a quarter of the way along edges (and seams), from either end.",
-    false,
-);
-static FACE_CENTERS: Toggle = Toggle::new(
-    "SnapFaceCenters",
-    "Face centers",
-    "Snap to the centers of faces (a model's face: the center of its area).",
-    true,
-);
-static EDGE_INTERSECTIONS: Toggle = Toggle::new(
-    "SnapEdgeCrossings",
-    "Edge crossings",
-    "Snap where two bricks' edges cross.",
-    true,
-);
-static FACE_INTERSECTIONS: Toggle = Toggle::new(
-    "SnapEdgesThroughFaces",
-    "Edges through faces",
-    "Snap where an edge goes through another brick's face.",
-    true,
-);
-static BETWEEN_INTERSECTIONS: Toggle = Toggle::new(
-    "SnapBetweenCrossings",
-    "Between crossings",
-    "Snap halfway between the points where other bricks cross an edge, or between one and the \
-     edge's end.",
-    true,
-);
-static SEAMS: Toggle = Toggle::new(
+
+pub(super) static SEAMS: Toggle = Toggle::new(
     "SnapSeams",
-    "Seams",
+    "Snap to seams",
     "Snap along the lines where two bricks' faces meet.",
     true,
 );
-static EDGES: Toggle = Toggle::new(
-    "SnapAlongEdges",
-    "Along edges",
-    "Snap anywhere along an edge: its point nearest the mouse.",
-    true,
-);
-static FACES: Toggle = Toggle::new(
-    "SnapOnFaces",
-    "On faces",
-    "Snap anywhere on a face, under the mouse.",
-    true,
+
+/// Where snapping snaps to anywhere on, a setting: the options of [`snapping`], in order.
+pub(super) static ANYWHERE: Choice = Choice::new(
+    "SnapAnywhere",
+    "Snap anywhere on",
+    "Snap anywhere along an edge (its point nearest the mouse) and anywhere on a face (under \
+     the mouse).",
+    &[
+        Alternative {
+            key: "Off",
+            name: "Off",
+        },
+        Alternative {
+            key: "Edges",
+            name: "Edges",
+        },
+        Alternative {
+            key: "Faces",
+            name: "Faces",
+        },
+        Alternative {
+            key: "Both",
+            name: "Both",
+        },
+    ],
+    3,
 );
 
 /// The kinds of points snapping snaps to (see [`snapping`]).
@@ -393,9 +446,9 @@ enum Look<'a> {
 
 impl<'a> Look<'a> {
     fn of(placed: &'a Placed, models: bool) -> Self {
-        match &placed.model {
-            Some(model) if models => Look::Model(model),
-            _ => Look::Box(&placed.bounds),
+        match placed.shown_model(models) {
+            Some(model) => Look::Model(model),
+            None => Look::Box(&placed.bounds),
         }
     }
 
@@ -875,6 +928,16 @@ impl Points<'_> {
                 for face in brick.look.faces() {
                     let on = [(brick.index, face.piece)];
                     self.add(Kind::FaceCenter, frame.point(face.center), &on, None);
+                }
+                // A spinner's hub and its caps' middles (where its connectors are).
+                if let Some(spinner) = &brick.placed.spinner {
+                    for (element, point) in spinner.snap_points() {
+                        let on: Vec<(usize, Piece)> = element
+                            .map(|element| (brick.index, Piece::Model(element)))
+                            .into_iter()
+                            .collect();
+                        self.add(Kind::FaceCenter, frame.point(point), &on, None);
+                    }
                 }
             }
         }

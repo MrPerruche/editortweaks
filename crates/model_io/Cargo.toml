@@ -12,6 +12,8 @@ publish.workspace = true
 # PNG decode and encode: the format reference images, model textures and the engine's texture
 # import all use. Only what the `png` crate needs by default (deflate in pure Rust).
 png = "0.18"
+# Zlib, for the game's pak files: the version `png` already uses.
+miniz_oxide = "0.8"
 # JPEG decode only.
 zune-jpeg = "0.5"
 # glTF's JSON; the glTF container and accessors are read by our own `readers/gltf.rs`.

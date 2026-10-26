@@ -1,16 +1,18 @@
 //! The map in the vehicle editor, to build "city covers" (vehicles that cover the map and are
 //! spawned at one garage, so they line up with it). Everything is off until asked for, in the
-//! editor's side panel with nothing selected ("Map", see [`panel`]):
+//! editor's side panel with nothing selected ("Show map", see [`panel`]):
 //!
-//! - A garage chosen in the list has its spawn point marked in the editor by a cross (forward red,
-//!   right green, up blue) in the vehicle's space, with the garage's spawn box and the vehicle's
-//!   bounding box: the game puts the bounding box's centre on the spawn point (see [`placement`]).
-//! - "Show map" (or [`keybinds::SHOW_MAP`]) shows the map around the vehicle, as it will be once
-//!   the vehicle is spawned at the selected garage (if none is selected, the one the editor was
-//!   opened from, else the first). The editor actor is teleported to where the vehicle will land,
-//!   and the game's hiding of the map is skipped (`game::hidden_components`); characters and
-//!   vehicles stay hidden from this player's view only (`game::hidden_actors`). The editor goes
-//!   back where it was when the map is hidden, and when the editor closes.
+//! - A garage chosen in the list (at its pinned spawn point, the default, or its normal one) has
+//!   its spawn point marked in the editor by a cross (forward red, right green, up blue) in the
+//!   vehicle's space, with the garage's spawn box and the vehicle's bounding box: the game puts
+//!   the bounding box's centre on the spawn point (see [`placement`]).
+//! - The map also shows around the vehicle, as it will be once the vehicle is spawned at the
+//!   selected garage. [`keybinds::SHOW_MAP`] goes to no garage and back to the last one (if none,
+//!   the one the editor was opened from, else the first). The editor actor is teleported to where
+//!   the vehicle will land, and the game's hiding of the map is skipped
+//!   (`game::hidden_components`); characters and vehicles stay hidden from this player's view only
+//!   (`game::hidden_actors`). The editor goes back where it was when the map is hidden, and when
+//!   the editor closes.
 //!
 //! The vehicle is never touched: only the local editor actor moves, so a vanilla player loading the
 //! same vehicle gets the same result. While the map shows, the editor and the world don't see each
@@ -41,7 +43,6 @@ use self::placement::{GaragePlace, Landing, Pose, VehicleBox};
 use super::editor_frame;
 use super::keybinds;
 use crate::framework::hook;
-use crate::framework::settings::{Section, Setting, Toggle};
 use crate::game::actor::{self, Actors};
 use crate::game::brick_editor::{self, BrickEditor};
 use crate::game::editor_camera::{self, EditorCamera};
@@ -70,22 +71,6 @@ const HIDE_REFRESH: Duration = Duration::from_millis(2000);
 
 /// How far the cross's axes reach, in cm.
 const CROSS: f64 = 200.0;
-
-/// The settings of this feature.
-pub static SETTINGS: [Section; 1] = [Section {
-    title: "Map",
-    settings: &[Setting::Toggle(&PINNED)],
-}];
-
-/// Whether the garage's pinned spawn point is the one to use: the game uses it when the vehicle
-/// browser's spawn option is Pinned, which city covers need (unpinned, they fall). Garages without
-/// one use the normal one either way. On by default, as `docs/city-cover-helper.md` planned.
-static PINNED: Toggle = Toggle::new(
-    "MapPinnedSpawn",
-    "Pinned spawn point",
-    "Place the vehicle where it lands when spawned with the vehicle browser's spawn option set to Pinned, as city covers are. Only garages with a pinned spawn point of their own differ. Turn off for vehicles you spawn normally.",
-    true,
-);
 
 pub struct MapInEditor;
 
@@ -165,7 +150,7 @@ impl Feature for MapInEditor {
         match engine_init() {
             Ok(()) => LOG_STARTED.call_once(|| {
                 log!(
-                    "active: the editor's side panel (Map, with nothing selected) marks a garage's \
+                    "active: the editor's side panel (Show map, with nothing selected) marks a garage's \
                      spawn point and shows the map, as does the map key (numpad zero){}",
                     match GAME.get() {
                         Some(game) if !game.can_show =>
@@ -351,7 +336,7 @@ struct State {
     held: bool,
     /// Whether any line of ours is drawn, to clear them once.
     drawn: bool,
-    /// Whether the pinned setting was on when the landing was worked out.
+    /// Whether the pinned spawn point was asked for when the landing was worked out.
     pinned: bool,
 }
 
@@ -493,14 +478,6 @@ unsafe fn tick(game: &Game, state: &mut State, editor: *mut UObjectBase) -> bool
         ..asked
     };
     let mut force = asked.asked;
-    if pressed {
-        controls.show_map = !controls.show_map;
-        force = true;
-    }
-    if PINNED.get() != state.pinned {
-        state.pinned = PINNED.get();
-        force = true;
-    }
 
     // A garage that's gone (or no garage) isn't selected any more.
     let mut garage = controls
@@ -510,11 +487,22 @@ unsafe fn tick(game: &Game, state: &mut State, editor: *mut UObjectBase) -> bool
         .and_then(|actor| unsafe { game.garages.read(actor) });
     if garage.is_none() && controls.garage.is_some() {
         controls.garage = None;
+        controls.show_map = false;
         force = true;
     }
-    if controls.show_map && garage.is_none() {
-        // SAFETY: per the contract.
-        garage = unsafe { select_default_garage(game, editor, &mut controls) };
+    // The map key goes to no garage, or back to the last one.
+    if pressed {
+        force = true;
+        if garage.is_some() {
+            controls.hide();
+            garage = None;
+        } else {
+            // SAFETY: per the contract.
+            garage = unsafe { select_last_garage(game, editor, &mut controls) };
+        }
+    }
+    if controls.pinned != state.pinned {
+        state.pinned = controls.pinned;
         force = true;
     }
 
@@ -572,7 +560,7 @@ unsafe fn tick(game: &Game, state: &mut State, editor: *mut UObjectBase) -> bool
     }
 
     *panel::controls() = controls;
-    (controls.garage, controls.show_map) != (asked.garage, asked.show_map)
+    (controls.garage, controls.pinned) != (asked.garage, asked.pinned)
 }
 
 /// The garage `editor` was opened from (its actor), if it was one.
@@ -591,8 +579,39 @@ unsafe fn entry_garage(game: &Game, editor: *mut UObjectBase) -> Option<*mut UOb
     }
 }
 
-/// Selects the garage the map shows at when none is: the one `editor` was opened from, else the
-/// first. If the map has none, the map isn't shown.
+/// Selects again the garage the map key last hid (or None in the list did), at the same spawn
+/// point, and asks for the map. Without one (still there), the default garage at its pinned point.
+///
+/// # Safety
+/// `editor` must be the live editor. Game thread only.
+unsafe fn select_last_garage(
+    game: &Game,
+    editor: *mut UObjectBase,
+    controls: &mut panel::Controls,
+) -> Option<Garage> {
+    let last = controls.last.and_then(|(weak, pinned)| {
+        // SAFETY: a live object.
+        let garage = unsafe { game.garages.read(weak.get()?) }?;
+        Some((weak, pinned, garage))
+    });
+    let garage = match last {
+        Some((weak, pinned, garage)) => {
+            controls.garage = Some(weak);
+            controls.pinned = pinned;
+            Some(garage)
+        }
+        None => {
+            controls.pinned = true;
+            // SAFETY: per the contract.
+            unsafe { select_default_garage(game, editor, controls) }
+        }
+    };
+    controls.show_map = garage.is_some();
+    garage
+}
+
+/// Selects the garage the map key shows the map at when there's no last one: the one `editor` was
+/// opened from, else the first. If the map has none, the map isn't shown.
 ///
 /// # Safety
 /// `editor` must be the live editor. Game thread only.
@@ -741,7 +760,7 @@ unsafe fn work_out_landing(game: &Game, state: &mut State, garage: &Garage, log_
             scale: math::widen(game.actors.scale(garage.actor)),
         }
     };
-    let landing = placement::land(garage, &place, PINNED.get(), &vehicle);
+    let landing = placement::land(garage, &place, state.pinned, &vehicle);
     if log_it {
         // Where the box's middle lands, to compare with a spawned vehicle's place.
         let middle = math::scale(math::add(vehicle.min, vehicle.max), 0.5);

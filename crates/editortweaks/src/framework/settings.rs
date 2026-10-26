@@ -163,14 +163,17 @@ impl Setting {
 pub struct Section {
     pub title: &'static str,
     pub settings: &'static [Setting],
+    /// Settings saved with these but not in the menu: each is changed elsewhere (a row of the
+    /// feature's own panel).
+    pub unlisted: &'static [Setting],
 }
 
-/// Every setting of `sections` (each feature's list of sections).
+/// Every setting of `sections` (each feature's list of sections), listed or not.
 pub fn all(sections: &[&[Section]]) -> impl Iterator<Item = Setting> {
     sections
         .iter()
         .flat_map(|sections| sections.iter())
-        .flat_map(|section| section.settings.iter().copied())
+        .flat_map(|section| section.settings.iter().chain(section.unlisted).copied())
 }
 
 /// The header line of `EditorTweaks.ini`'s only section.

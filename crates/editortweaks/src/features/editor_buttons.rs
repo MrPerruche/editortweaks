@@ -1,16 +1,17 @@
 //! The editor's mouse button actions, and its keys acting on the selection (Delete, Duplicate, Hide,
-//! Unhide all), shared by the features that take them over. Not a feature itself: the loader hooks a function only once, so the
-//! features can't each hook the handlers.
+//! Unhide all), shared by the features that take them over. Not a feature itself: the loader hooks
+//! a function only once, so the features can't each hook the handlers.
 //!
 //! The left button is the game's `Select` action and the right one its `MoveCamera` action (as
 //! bound; swapped by `click_swap`), handled by the editor input's reflected `Action_Select` and
 //! `Action_MoveCamera` (`game::editor_input::ButtonAction`), called on press and on release; Shift
-//! + the left button is `AddToSelection` instead of `Select`. The keys are `Action_DeleteSelection`
-//! (Delete), `Action_DuplicateSelection` (Ctrl + C), `Action_HideSelection` (H) and
-//! `Action_UnhideAll` (Alt + H), handlers of the same kind. Their exec thunks
-//! are hooked here on the first [`listen`] (`AddToSelection` and the keys only if found: the buttons
-//! work without them); each press or release goes to the listeners in the order they listened,
-//! until one takes it: then the game's handler doesn't run.
+//! + the left button is `AddToSelection` instead of `Select`, the middle button `PivotCamera`. The
+//! keys are `Action_DeleteSelection` (Delete), `Action_DuplicateSelection` (Ctrl + C),
+//! `Action_HideSelection` (H) and `Action_UnhideAll` (Alt + H), handlers of the same kind. Their
+//! exec thunks are hooked here on the first [`listen`] (`AddToSelection`, `PivotCamera` and the
+//! keys only if found: the left and right buttons work without them); each press or release goes
+//! to the listeners in the order they listened, until one takes it: then the game's handler doesn't
+//! run.
 
 use core::ffi::c_void;
 use std::sync::{Mutex, OnceLock, PoisonError};
@@ -33,6 +34,8 @@ pub enum Button {
     AddToSelection,
     /// `MoveCamera`: the right button.
     MoveCamera,
+    /// `PivotCamera`: the middle button (and Space).
+    PivotCamera,
     /// `DeleteSelection`: Delete.
     Delete,
     /// `DuplicateSelection`: Ctrl + C.
@@ -71,6 +74,7 @@ struct Actions {
     move_camera: ButtonAction,
     /// `None` if not found (logged).
     add_to_selection: Option<ButtonAction>,
+    pivot_camera: Option<ButtonAction>,
     delete: Option<ButtonAction>,
     duplicate: Option<ButtonAction>,
     hide: Option<ButtonAction>,
@@ -81,6 +85,7 @@ static ACTIONS: OnceLock<Actions> = OnceLock::new();
 static ORIGINAL_SELECT: OnceLock<NativeThunk> = OnceLock::new();
 static ORIGINAL_ADD_TO_SELECTION: OnceLock<NativeThunk> = OnceLock::new();
 static ORIGINAL_MOVE_CAMERA: OnceLock<NativeThunk> = OnceLock::new();
+static ORIGINAL_PIVOT_CAMERA: OnceLock<NativeThunk> = OnceLock::new();
 static ORIGINAL_DELETE: OnceLock<NativeThunk> = OnceLock::new();
 static ORIGINAL_DUPLICATE: OnceLock<NativeThunk> = OnceLock::new();
 static ORIGINAL_HIDE: OnceLock<NativeThunk> = OnceLock::new();
@@ -110,6 +115,7 @@ fn hook_handlers() -> Result<(), String> {
         select: editor_input::button_action(editor_input::SELECT)?,
         move_camera: editor_input::button_action(editor_input::MOVE_CAMERA)?,
         add_to_selection: optional(editor_input::ADD_TO_SELECTION),
+        pivot_camera: optional(editor_input::PIVOT_CAMERA),
         delete: optional(editor_input::DELETE_SELECTION),
         duplicate: optional(editor_input::DUPLICATE_SELECTION),
         hide: optional(editor_input::HIDE_SELECTION),
@@ -117,6 +123,7 @@ fn hook_handlers() -> Result<(), String> {
     };
     let (select, move_camera) = (actions.select.thunk, actions.move_camera.thunk);
     let add_to_selection = actions.add_to_selection.as_ref().map(|action| action.thunk);
+    let pivot_camera = actions.pivot_camera.as_ref().map(|action| action.thunk);
     let delete = actions.delete.as_ref().map(|action| action.thunk);
     let duplicate = actions.duplicate.as_ref().map(|action| action.thunk);
     let hide = actions.hide.as_ref().map(|action| action.thunk);
@@ -145,6 +152,16 @@ fn hook_handlers() -> Result<(), String> {
             )
         {
             log!("AddToSelection not taken over: {reason}");
+        }
+        if let Some(pivot_camera) = pivot_camera
+            && let Err(reason) = hook::install_typed(
+                "UEditorInputComponent::execAction_PivotCamera",
+                pivot_camera,
+                pivot_camera_detour as NativeThunk,
+                &ORIGINAL_PIVOT_CAMERA,
+            )
+        {
+            log!("PivotCamera not taken over: {reason}");
         }
         if let Some(delete) = delete
             && let Err(reason) = hook::install_typed(
@@ -220,6 +237,18 @@ unsafe extern "C" fn move_camera_detour(
     unsafe { handle(Button::MoveCamera, context, stack, result, original) }
 }
 
+unsafe extern "C" fn pivot_camera_detour(
+    context: *mut c_void,
+    stack: *mut c_void,
+    result: *mut c_void,
+) {
+    let original = *ORIGINAL_PIVOT_CAMERA
+        .get()
+        .expect("hook recorded before use");
+    // SAFETY: the thunk's own arguments, passed on.
+    unsafe { handle(Button::PivotCamera, context, stack, result, original) }
+}
+
 unsafe extern "C" fn delete_detour(context: *mut c_void, stack: *mut c_void, result: *mut c_void) {
     let original = *ORIGINAL_DELETE.get().expect("hook recorded before use");
     // SAFETY: the thunk's own arguments, passed on.
@@ -272,6 +301,7 @@ unsafe fn handle(
                 Button::Select => Some(&actions.select),
                 Button::AddToSelection => actions.add_to_selection.as_ref(),
                 Button::MoveCamera => Some(&actions.move_camera),
+                Button::PivotCamera => actions.pivot_camera.as_ref(),
                 Button::Delete => actions.delete.as_ref(),
                 Button::Duplicate => actions.duplicate.as_ref(),
                 Button::Hide => actions.hide.as_ref(),

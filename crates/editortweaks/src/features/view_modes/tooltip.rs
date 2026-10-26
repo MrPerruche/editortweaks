@@ -3,7 +3,7 @@
 //! ([`super::describe`]): "Strength", "Connections", "Reference fit", and the game's "Physics" (its
 //! centers, [`super::physics`]). Shown over the 3D view
 //! (`game::view_canvas`), worked out again only when the mouse, the camera or the editor changed.
-//! Off with the setting [`TOOLTIP`].
+//! Off with the setting [`TOOLTIPS`] (shared with the shot preview's tooltips).
 //!
 //! What's under the mouse is traced like the editor's clicks (`game::line_trace`), hidden bricks
 //! left out ([`Hover::point`]). [`Hover::line`] follows the line through every brick it crosses, as
@@ -18,7 +18,7 @@ use std::sync::{Mutex, OnceLock, PoisonError};
 use brickrust::ue::coreuobject::UObjectBase;
 
 use super::Editor;
-use crate::framework::settings::Toggle;
+use crate::framework::settings::{Alternative, Choice};
 use crate::game::brick_editor::{self, BrickEditor};
 use crate::game::collision::Collision;
 use crate::game::component_bounds::{self, ComponentBounds};
@@ -29,13 +29,41 @@ use crate::game::viewport::Ray;
 use crate::math;
 use crate::prelude::*;
 
-/// Whether our view modes show their tooltip.
-pub static TOOLTIP: Toggle = Toggle::new(
-    "ViewModeTooltip",
-    "View mode tooltip",
-    "In the Strength, Connections and Reference fit view modes, a tooltip next to the mouse tells about the brick under it: how much damage breaks it off (and the selection, if it's selected) and what it takes to shoot through the vehicle along that line, how big the part it holds together with is, or how far the reference model is from that point. In the Physics view mode, it tells which center is under the mouse (mass, lift or thrust) and where it is.",
-    true,
+/// Whether the shot preview and our view modes show their tooltips, a setting.
+pub static TOOLTIPS: Choice = Choice::new(
+    "Tooltips",
+    "Tooltips",
+    "Tooltips next to the mouse. Shot preview: on a gun, a shot's path or what it hits, its damage, penetration, range and speed (Shift for more). View modes: about the brick or center under the mouse.",
+    &[
+        Alternative {
+            key: "Off",
+            name: "Off",
+        },
+        Alternative {
+            key: "ShotPreview",
+            name: "Shot preview",
+        },
+        Alternative {
+            key: "ViewModes",
+            name: "View modes",
+        },
+        Alternative {
+            key: "Both",
+            name: "Both",
+        },
+    ],
+    3,
 );
+
+/// Whether the shot preview's tooltips show now ([`TOOLTIPS`]).
+pub fn shot_preview_shows() -> bool {
+    matches!(TOOLTIPS.get(), 1 | 3)
+}
+
+/// Whether our view modes' tooltips show now ([`TOOLTIPS`]).
+pub fn view_modes_show() -> bool {
+    matches!(TOOLTIPS.get(), 2 | 3)
+}
 
 /// How far the line looks for bricks, in cm.
 const REACH: f32 = 1.0e6;
@@ -325,7 +353,7 @@ pub fn after_tick(editor: *mut UObjectBase, _delta: f32) {
     let Some(code) = code() else { return };
     // SAFETY: on the game thread (the editor's tick), `editor` the live editor ticking.
     unsafe {
-        let shown = (TOOLTIP.get() && !crate::features::gun_preview::tooltip_shows())
+        let shown = (view_modes_show() && !crate::features::gun_preview::tooltip_shows())
             .then(|| state.update(code, editor))
             .flatten();
         if shown.is_none() {

@@ -15,9 +15,14 @@
 //! selected see-through reference gets a copy of each of its meshes drawing nothing but that
 //! ([`Shown::update_outline`]), and its pieces are outlined only while opaque.
 //!
+//! A reference's color multiplies its picture or its parts' colors. Most materials take it as a
+//! parameter, changed in place; lit textured parts have none, so their texture is multiplied and
+//! imported again ([`TEXTURE_INTERVAL`] apart at the most, while a color is dragged).
+//!
 //! The models' triangles, placed, are also what the "Reference fit" view mode measures bricks
 //! against ([`Scene::fit_triangles`]).
 
+use std::borrow::Cow;
 use std::collections::VecDeque;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
@@ -27,6 +32,7 @@ use std::time::{Duration, Instant};
 
 use brickrust::ue::coreuobject::UObjectBase;
 use model_io::Part;
+use model_io::image::{self, srgb_to_linear};
 use model_io::pick::{self, Ray, Shape};
 use model_io::plane::{self, PlaneLayout};
 use model_io::sidecar::{Kind, Reference};
@@ -44,6 +50,10 @@ use crate::prelude::*;
 
 /// How long model pieces may take to build per frame (at least one is built each frame).
 pub const BUILD_BUDGET: Duration = Duration::from_millis(4);
+
+/// The least time between two multiplications of a model's textures by a changing color: each
+/// decodes and imports them again.
+const TEXTURE_INTERVAL: Duration = Duration::from_millis(250);
 
 /// The color of model parts without a material.
 const DEFAULT_COLOR: [f32; 4] = [0.6, 0.6, 0.6, 1.0];
@@ -93,6 +103,17 @@ impl Wanted {
             size,
             visible: reference.visible && self.opacity() > 0.0 && self.shown,
         }
+    }
+
+    /// The color that multiplies the reference's colors: linear RGB, each 0 to 1.
+    fn tint(&self) -> [f32; 3] {
+        self.reference.color.map(|value| {
+            if value.is_nan() {
+                1.0
+            } else {
+                srgb_to_linear(value.clamp(0.0, 1.0))
+            }
+        })
     }
 
     /// The opacity, 0 to 1.
@@ -157,6 +178,10 @@ struct Shown {
     kind: Kind,
     placement: Placement,
     opacity: f32,
+    /// The color multiplying the reference's colors ([`Wanted::tint`]).
+    tint: [f32; 3],
+    /// When a model's textures were last multiplied by a color ([`TEXTURE_INTERVAL`]).
+    textured_at: Option<Instant>,
     /// Hidden by the Hide key ([`Wanted::hidden`]).
     hidden: bool,
     /// Shown by its own settings, whatever the Show references key says.
@@ -190,6 +215,9 @@ struct Material {
     picture: Option<WeakObject>,
     /// The material made, and its kind.
     made: Option<(WeakObject, Appearance)>,
+    /// The color the material made had its texture multiplied by (it has no color parameter if
+    /// lit and opaque).
+    textured_with: [f32; 3],
 }
 
 /// The kind of material a reference's part shows with.
@@ -303,6 +331,10 @@ impl Scene {
                     // SAFETY: per the contract.
                     unsafe { shown.set_opacity(code, looks, editor, wanted.opacity()) };
                 }
+                if shown.tint != wanted.tint() {
+                    // SAFETY: per the contract.
+                    unsafe { shown.set_tint(code, looks, editor, wanted.tint()) };
+                }
                 if shown.hidden != wanted.hidden {
                     shown.hidden = wanted.hidden;
                     // SAFETY: per the contract.
@@ -318,6 +350,8 @@ impl Scene {
                 kind: wanted.reference.kind,
                 placement: wanted.placement(0.0),
                 opacity: wanted.opacity(),
+                tint: wanted.tint(),
+                textured_at: None,
                 hidden: wanted.hidden,
                 own_visible: wanted.reference.visible,
                 built_width: 0.0,
@@ -407,6 +441,12 @@ impl Scene {
     /// # Safety
     /// `editor` must be the live editor. Game thread only.
     pub unsafe fn pump(&mut self, code: &Code, looks: &Looks, editor: *mut UObjectBase) {
+        for shown in &mut self.shown {
+            if shown.textures_outdated() {
+                // SAFETY: per the contract.
+                unsafe { shown.update_materials(code, looks, editor) };
+            }
+        }
         let started = Instant::now();
         while let Some(build) = self.builds.pop_front() {
             let Some(shown) = self
@@ -610,7 +650,7 @@ impl Shown {
         editor: *mut UObjectBase,
         index: usize,
     ) -> *mut UObjectBase {
-        let (kind, opacity, hidden) = (self.kind, self.opacity, self.hidden);
+        let (kind, opacity, hidden, tint) = (self.kind, self.opacity, self.hidden, self.tint);
         let Some(material) = self.materials.get_mut(index) else {
             return core::ptr::null_mut();
         };
@@ -625,13 +665,16 @@ impl Shown {
                 Kind::Image => {
                     let picture = material.picture.and_then(|picture| picture.get());
                     match picture {
-                        Some(picture) => looks.image(&code.textures, editor, picture, opacity),
+                        Some(picture) => {
+                            looks.image(&code.textures, editor, picture, tint, opacity)
+                        }
                         None => core::ptr::null_mut(),
                     }
                 }
-                Kind::Model => material.make_for_model(code, looks, editor, wanted, opacity),
+                Kind::Model => material.make_for_model(code, looks, editor, wanted, opacity, tint),
             }
         };
+        material.textured_with = tint;
         material.made = (!made.is_null()).then(|| {
             // SAFETY: a live material, just made.
             (unsafe { WeakObject::new(made) }, wanted)
@@ -658,7 +701,7 @@ impl Shown {
             {
                 code.components.set_custom_values(
                     component,
-                    &looks::see_through_data(material.see_through_color),
+                    &looks::see_through_data(tinted(material.see_through_color, self.tint)),
                 );
             }
             place_one(code, &self.placement, component);
@@ -707,7 +750,9 @@ impl Shown {
             let material = match (self.kind, self.materials.first()) {
                 (Kind::Image, Some(Material { picture, .. })) => {
                     match picture.and_then(|picture| picture.get()) {
-                        Some(picture) => looks.image(&code.textures, editor, picture, 1.0),
+                        Some(picture) => {
+                            looks.image(&code.textures, editor, picture, [1.0; 3], 1.0)
+                        }
                         None => core::ptr::null_mut(),
                     }
                 }
@@ -751,36 +796,98 @@ impl Shown {
         }
     }
 
+    /// Shows the reference multiplied by the color `tint` ([`Self::update_materials`]).
+    ///
+    /// # Safety
+    /// `editor` must be the live editor. Game thread only.
+    unsafe fn set_tint(
+        &mut self,
+        code: &Code,
+        looks: &Looks,
+        editor: *mut UObjectBase,
+        tint: [f32; 3],
+    ) {
+        self.tint = tint;
+        // SAFETY: per the contract; the components used are live (just checked).
+        unsafe {
+            if self.kind == Kind::Model {
+                for piece in &self.pieces {
+                    if let (Some(component), Some(material)) =
+                        (piece.component.get(), self.materials.get(piece.material))
+                    {
+                        let data =
+                            looks::see_through_data(tinted(material.see_through_color, tint));
+                        code.components.set_custom_values(component, &data);
+                    }
+                }
+            }
+            self.update_materials(code, looks, editor);
+        }
+    }
+
+    /// Whether some lit textured part still shows its texture multiplied by an older color, to be
+    /// made again once [`TEXTURE_INTERVAL`] has passed ([`Self::update_materials`]).
+    fn textures_outdated(&self) -> bool {
+        self.kind == Kind::Model
+            && self.materials.iter().any(|material| {
+                material.texture.is_some()
+                    && material.textured_with != self.tint
+                    && material.made_as(Appearance::Opaque).is_some()
+            })
+    }
+
     /// Gives the pieces the materials the reference's opacity and the settings ask for: a material
-    /// whose kind changed is made again and given to its pieces, the others get the opacity.
+    /// whose kind changed (or whose texture needs its color) is made again and given to its
+    /// pieces, the others get the opacity and color.
     ///
     /// # Safety
     /// `editor` must be the live editor. Game thread only.
     unsafe fn update_materials(&mut self, code: &Code, looks: &Looks, editor: *mut UObjectBase) {
-        let (kind, opacity, hidden) = (self.kind, self.opacity, self.hidden);
+        let (kind, opacity, hidden, tint) = (self.kind, self.opacity, self.hidden, self.tint);
         for index in 0..self.materials.len() {
             // Unused yet: made when a piece needs it.
             if !self.pieces.iter().any(|piece| piece.material == index) {
                 continue;
             }
             let wanted = self.materials[index].appearance(kind, opacity, hidden);
+            let color = tinted(self.materials[index].color, tint);
+            let textured = self.materials[index].texture.is_some();
             // SAFETY: per the contract; the materials and components used are live (just checked
             // or made).
             unsafe {
                 if let Some(made) = self.materials[index].made_as(wanted) {
                     match (kind, wanted) {
-                        (_, Appearance::Opaque | Appearance::Hidden) => {}
+                        (_, Appearance::Hidden) => continue,
                         (Kind::Image, _) | (Kind::Model, Appearance::UnlitTexture) => {
-                            looks.set_image_opacity(&code.textures, made, opacity)
+                            looks.set_image_tint(&code.textures, made, tint, opacity);
+                            continue;
+                        }
+                        (Kind::Model, Appearance::Opaque) if !textured => {
+                            Looks::set_plain_color(&code.textures, made, color);
+                            continue;
+                        }
+                        (Kind::Model, Appearance::Opaque) => {
+                            // The texture is multiplied, which takes a while: not at every step of
+                            // a color being dragged.
+                            let recent = self
+                                .textured_at
+                                .is_some_and(|at| at.elapsed() < TEXTURE_INTERVAL);
+                            if self.materials[index].textured_with == tint || recent {
+                                continue;
+                            }
+                            self.textured_at = Some(Instant::now());
                         }
                         (Kind::Model, Appearance::SeeThrough) => {
-                            Looks::set_see_through_opacity(&code.textures, made, opacity)
+                            Looks::set_see_through_opacity(&code.textures, made, opacity);
+                            continue;
                         }
                         (Kind::Model, Appearance::Dithered) => {
-                            Looks::set_dithered_opacity(&code.textures, made, opacity)
+                            Looks::set_dithered_opacity(&code.textures, made, opacity);
+                            Looks::set_dithered_color(&code.textures, made, color);
+                            continue;
                         }
                     }
-                    continue;
+                    self.materials[index].made = None;
                 }
                 let made = self.material(code, looks, editor, index);
                 for piece in self.pieces.iter().filter(|piece| piece.material == index) {
@@ -831,6 +938,7 @@ impl Material {
             texture,
             picture: None,
             made: None,
+            textured_with: [1.0; 3],
         }
     }
 
@@ -860,9 +968,9 @@ impl Material {
         (appearance == wanted).then(|| made.get()).flatten()
     }
 
-    /// A new material for a model part, of the kind `wanted`, at `opacity`: lit, its color or
-    /// texture when opaque; see-through dithered, lit in its color, or its texture unlit (the opaque
-    /// look if those can't be had).
+    /// A new material for a model part, of the kind `wanted`, at `opacity` and multiplied by the
+    /// color `tint`: lit, its color or texture when opaque; see-through dithered, lit in its color,
+    /// or its texture unlit (the opaque look if those can't be had).
     ///
     /// # Safety
     /// `editor` must be the live editor. Game thread only.
@@ -873,32 +981,64 @@ impl Material {
         editor: *mut UObjectBase,
         wanted: Appearance,
         opacity: f32,
+        tint: [f32; 3],
     ) -> *mut UObjectBase {
+        let color = tinted(self.color, tint);
         // SAFETY: per the contract.
         unsafe {
-            let texture = match &self.texture {
-                Some(png) => code.textures.import_buffer(editor, png),
-                None => core::ptr::null_mut(),
+            // The looks that take the color as a parameter show the texture as it is.
+            let texture = match (&self.texture, wanted) {
+                (Some(png), Appearance::Dithered | Appearance::UnlitTexture) => {
+                    code.textures.import_buffer(editor, png)
+                }
+                _ => core::ptr::null_mut(),
             };
             let made = match wanted {
                 Appearance::Opaque | Appearance::Hidden => core::ptr::null_mut(),
                 Appearance::Dithered => {
-                    looks.dithered(&code.textures, editor, texture, self.color, opacity)
+                    looks.dithered(&code.textures, editor, texture, color, opacity)
                 }
                 Appearance::SeeThrough => looks.see_through(&code.textures, editor, opacity),
                 Appearance::UnlitTexture if texture.is_null() => core::ptr::null_mut(),
-                Appearance::UnlitTexture => looks.image(&code.textures, editor, texture, opacity),
+                Appearance::UnlitTexture => {
+                    looks.image(&code.textures, editor, texture, tint, opacity)
+                }
             };
             if !made.is_null() {
                 return made;
             }
+            let texture = match &self.texture {
+                Some(png) => code.textures.import_buffer(editor, &tinted_png(png, tint)),
+                None => core::ptr::null_mut(),
+            };
             if texture.is_null() {
-                looks.plain(&code.textures, editor, self.color)
+                looks.plain(&code.textures, editor, color)
             } else {
                 looks.textured(&code.textures, editor, texture)
             }
         }
     }
+}
+
+/// `color` (linear RGBA) multiplied by `tint` (linear RGB); alpha kept.
+fn tinted(color: [f32; 4], tint: [f32; 3]) -> [f32; 4] {
+    [
+        color[0] * tint[0],
+        color[1] * tint[1],
+        color[2] * tint[2],
+        color[3],
+    ]
+}
+
+/// The PNG file `png` with its colors multiplied by `tint` (linear RGB): as it is for white or if
+/// it can't be read.
+fn tinted_png(png: &[u8], tint: [f32; 3]) -> Cow<'_, [u8]> {
+    if tint == [1.0; 3] {
+        return Cow::Borrowed(png);
+    }
+    image::decode(png)
+        .and_then(|picture| picture.tinted(tint).to_png())
+        .map_or(Cow::Borrowed(png), Cow::Owned)
 }
 
 /// The builder's triangles for `part`, which wants a UV per position.

@@ -27,14 +27,14 @@ use crate::prelude::log;
 pub type LinearColor = [f32; 4];
 
 /// A reflected call and where its parameters go.
-struct Call<const N: usize> {
-    function: Function,
-    parameters: [usize; N],
+pub struct Call<const N: usize> {
+    pub function: Function,
+    pub parameters: [usize; N],
 }
 
 impl<const N: usize> Call<N> {
     /// `name` of `class`, with its parameters `(name, kind, size)`.
-    fn find(
+    pub fn find(
         class: &'static str,
         name: &'static str,
         parameters: [(&'static str, &'static str, i32); N],
@@ -52,7 +52,7 @@ impl<const N: usize> Call<N> {
     }
 }
 
-const POINTER: i32 = size_of::<usize>() as i32;
+pub const POINTER: i32 = size_of::<usize>() as i32;
 
 /// Makes textures and material instances (after engine init).
 pub struct Textures {

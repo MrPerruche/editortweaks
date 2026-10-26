@@ -36,6 +36,11 @@ const HEADER: &str = "# Belongs to the editortweaks mod for Brick Rigs: lists th
 pub struct Sidecar {
     /// The format version of the file.
     pub version: u32,
+    /// Only in a folder the game reuses for other vehicles (its autosave of unsaved vehicles): the
+    /// vehicle file this sidecar was written for. It belongs to that vehicle only while the file
+    /// is unchanged ([`Mark::matches`]).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub vehicle: Option<Mark>,
     /// The references, in the order they were added (`[[reference]]` in the file).
     #[serde(rename = "reference")]
     pub references: Vec<Reference>,
@@ -45,9 +50,51 @@ impl Default for Sidecar {
     fn default() -> Self {
         Self {
             version: CURRENT_VERSION,
+            vehicle: None,
             references: Vec::new(),
         }
     }
+}
+
+/// A vehicle file as it was when the sidecar was written: its name in the vehicle's folder and a
+/// hash of its contents.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Mark {
+    pub file: String,
+    /// FNV-1a (64 bits) of the file's bytes, in hexadecimal.
+    pub hash: String,
+}
+
+impl Mark {
+    /// The mark of the file `file` in `folder` as it is now; `None` if it can't be read (or `file`
+    /// isn't a plain file name).
+    pub fn of(folder: &Path, file: &str) -> Option<Mark> {
+        // Read from disk: untrusted, it mustn't lead out of the folder.
+        if Path::new(file).file_name() != Some(file.as_ref()) {
+            return None;
+        }
+        let bytes = std::fs::read(folder.join(file)).ok()?;
+        Some(Mark {
+            file: file.to_owned(),
+            hash: format!("{:016x}", fnv1a(&bytes)),
+        })
+    }
+
+    /// Whether the marked file in `folder` is still the one marked.
+    pub fn matches(&self, folder: &Path) -> bool {
+        Mark::of(folder, &self.file).as_ref() == Some(self)
+    }
+}
+
+/// The 64-bit FNV-1a hash of `bytes`: stable from one build to the next (unlike the standard
+/// library's hasher), and enough to tell one vehicle file from another.
+fn fnv1a(bytes: &[u8]) -> u64 {
+    const OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+    const PRIME: u64 = 0x0000_0100_0000_01b3;
+    bytes.iter().fold(OFFSET, |hash, &byte| {
+        (hash ^ u64::from(byte)).wrapping_mul(PRIME)
+    })
 }
 
 /// What a reference shows.
@@ -148,6 +195,9 @@ pub struct Reference {
     /// Mirrored along X, Y, Z.
     pub mirror: [bool; 3],
     pub opacity: f32,
+    /// Red, green and blue (0 to 1, as color pickers show them: sRGB) that multiply the colors of
+    /// the picture or the model's parts. White leaves them as they are.
+    pub color: [f32; 3],
     pub show_in: ShowIn,
     /// Only for images (`Some` after [`Reference::new_image`] and [`Sidecar::read`]).
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -173,6 +223,7 @@ impl Default for Reference {
             scale: [1.0; 3],
             mirror: [false; 3],
             opacity: 0.5,
+            color: [1.0; 3],
             show_in: ShowIn::All,
             image: None,
             import: None,
@@ -601,6 +652,7 @@ mod tests {
         image.rotation = [0.0, 90.0, 0.0];
         image.mirror = [false, true, false];
         image.opacity = 0.75;
+        image.color = [1.0, 0.5, 0.25];
         image.show_in = ShowIn::Ortho;
         image.source.bytes = Some(1234);
         image.source.modified = Some(1_760_000_000);
@@ -655,6 +707,7 @@ mod tests {
         assert_eq!(sidecar.references[0], expected);
         assert!(expected.visible && expected.selectable && !expected.locked);
         assert_eq!(expected.opacity, 0.5);
+        assert_eq!(expected.color, [1.0; 3]);
         assert_eq!(expected.scale, [1.0; 3]);
         assert_eq!(expected.source.mode, SourceMode::Link);
     }
@@ -746,6 +799,37 @@ pivot = "bottom"
             original
         );
         assert!(!Sidecar::default().is_newer());
+    }
+
+    #[test]
+    fn vehicle_mark() {
+        let folder = TempFolder::new("mark");
+        assert_eq!(Mark::of(&folder.0, "Autosave.brv"), None);
+        std::fs::write(folder.0.join("Autosave.brv"), "one vehicle").unwrap();
+        let mark = Mark::of(&folder.0, "Autosave.brv").unwrap();
+        assert!(mark.matches(&folder.0));
+        // FNV-1a's known value for an empty input: the offset basis.
+        assert_eq!(fnv1a(b""), 0xcbf2_9ce4_8422_2325);
+        assert_eq!(fnv1a(b"a"), 0xaf63_dc4c_8601_ec8c);
+
+        let sidecar = Sidecar {
+            vehicle: Some(mark.clone()),
+            ..sidecar_with(vec![Reference::new_image("r1", Path::new("C:/a.png"))])
+        };
+        sidecar.write(&folder.0).unwrap();
+        let text = std::fs::read_to_string(folder.0.join(FILE_NAME)).unwrap();
+        assert!(text.contains("[vehicle]"), "{text}");
+        assert_eq!(Sidecar::read(&folder.0).unwrap().unwrap(), sidecar);
+
+        std::fs::write(folder.0.join("Autosave.brv"), "another vehicle").unwrap();
+        assert!(!mark.matches(&folder.0));
+        std::fs::remove_file(folder.0.join("Autosave.brv")).unwrap();
+        assert!(!mark.matches(&folder.0));
+
+        // Files outside the folder are never read.
+        for file in ["../Autosave.brv", "a/b.brv", "C:\\x.brv", "..", ""] {
+            assert_eq!(Mark::of(&folder.0, file), None, "{file}");
+        }
     }
 
     #[test]

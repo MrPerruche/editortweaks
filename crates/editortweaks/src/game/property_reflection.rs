@@ -5,13 +5,19 @@
 //! name ([`ADD_PROPERTY`]). Brick properties are small C++ objects (`{vtable, FProperty*, FName}`,
 //! shared through `TSharedRef`s) whose virtual functions read and write the value in the reflected
 //! object through the `FProperty`. Ours ([`Row`]) copy the game's tables for a bool (a check box),
-//! an enum (a list, its items side by side or a dropdown) and a number (one to three sliders that
-//! also take typed values) but replace every function touching a value with ours, which read and
-//! write a [`Value`] of ours instead: no game field is involved.
+//! an enum (a list, its items side by side or a dropdown), a number (one to three sliders that
+//! also take typed values) and a color (the color picker, see [`color`]) but replace every function
+//! touching a value with ours, which read and write a [`Value`] of ours instead: no game field is
+//! involved.
 //!
-//! Found in game 1.11.7 (build 25831956); see `docs/re/settings-menu.md` and, for numbers,
-//! `docs/re/property-panel.md`.
+//! Found in game 1.11.7 (build 25831956); see `docs/re/settings-menu.md` and, for numbers and
+//! colors, `docs/re/property-panel.md`.
 
+mod color;
+
+pub use color::Color;
+
+use core::cell::Cell;
 use core::ffi::c_void;
 use std::sync::{Once, OnceLock};
 
@@ -22,6 +28,7 @@ use brickrust::ue::tarray::TArray;
 use crate::framework::settings::{Choice, Setting, Toggle};
 use crate::framework::sig::{CodeShape, FunctionSig, StringRefSig, VtableSig};
 use crate::game::kismet::{self, Texts};
+use crate::game::numeric_property::NumericValue;
 use crate::game::slider_text::{FString, OwnedFString};
 use crate::game::text::Text;
 use crate::prelude::log;
@@ -35,6 +42,8 @@ pub enum Value {
     List(&'static dyn List),
     /// Numbers, each a slider taking typed values too.
     Number(&'static dyn Number),
+    /// A color, shown as the game's color picker, like a brick's.
+    Color(&'static dyn Color),
 }
 
 /// One to three numbers shown as sliders side by side, like a brick's position. Its functions run
@@ -43,12 +52,32 @@ pub enum Value {
 pub trait Number: Sync {
     /// The values shown, one per slider (1 to 3; more are left out).
     fn values(&self) -> Vec<f32>;
-    /// Sets the values (as many as [`Self::values`] gives), within [`Self::range`].
+    /// Sets the values (as many as [`Self::values`] gives), within [`Self::limit`].
     fn set_values(&self, values: &[f32]);
     /// The smallest and largest values, the sliders' ends.
     fn range(&self) -> (f32, f32);
+    /// The sliders' ends of the value `index`, if they differ by value (like an axis' bounds).
+    fn component_range(&self, _index: usize) -> (f32, f32) {
+        self.range()
+    }
+    /// The smallest and largest values that can be set at all, typed ones too: the sliders'
+    /// ends unless the row lets typed values go past them (like bricks').
+    fn limit(&self) -> (f32, f32) {
+        self.range()
+    }
     /// How the values are shown.
     fn unit(&self) -> Unit;
+    /// How the value `index` is shown, if it differs by value (like a time next to a percentage).
+    /// Only shown so while the panel's `UpdateValue` is hooked (`features::number_rows`); otherwise
+    /// every slider shows [`Self::unit`].
+    fn component_unit(&self, _index: usize) -> Unit {
+        self.unit()
+    }
+    /// Whether the values are alike, like a size's axes: then the row has the game's lock and our
+    /// value order button. Unlike values (a time and a percentage) have neither.
+    fn alike(&self) -> bool {
+        true
+    }
 }
 
 /// How a number row shows its values: the game's `ENumericValueType`s.
@@ -59,6 +88,8 @@ pub enum Unit {
     Percent = 2,
     /// Degrees.
     Angle = 3,
+    /// Hours, shown and typed as `h:m` (the game's `TimeOfDay`).
+    TimeOfDay = 9,
     /// A distance in cm, shown in the user's units (`DistanceAutoOrBrickUnits`, like bricks'
     /// positions).
     Distance = 18,
@@ -175,17 +206,20 @@ type AddCategoryFn = unsafe extern "C" fn(reflection: *mut Reflection, name: *co
 /// `FBrickPropertyReflection::AddProperty(const TSharedRef<FBrickProperty>&, const FString& Name,
 /// const FText& DisplayName)` (our name; game 0xCCCFB0): adds a row to the current category and
 /// returns its `FBrickPropertyEditInfo`, whose description the caller may set
-/// ([`EDIT_INFO_DESCRIPTION`]).
-const ADD_PROPERTY: FunctionSig = FunctionSig {
+/// ([`EDIT_INFO_DESCRIPTION`]). `Name` is the edited field's name (`"EditorMirrorAxis"`, a
+/// struct's `"SunAngle"`). Hooked by `features::settings_list` to rework the game's rows.
+pub const ADD_PROPERTY: FunctionSig = FunctionSig {
     name: "FBrickPropertyReflection::AddProperty",
     // The property's instance made with the reflection's path (+0x78), then its edit info with the
     // reflection's objects (+8) and filter (+0x18).
     pattern: "49 8b d9 48 8b e9 4c 8d 49 78 48 8d 4c 24 20 e8 ?? ?? ?? ?? 4c 8d 4d 08 48 8b d3 4c 8d 45 18",
 };
 
-type AddPropertyFn = unsafe extern "C" fn(
+/// [`ADD_PROPERTY`]; `property` is a `TSharedRef<FBrickProperty>`, the result the row's edit info
+/// (null if none was made).
+pub type AddPropertyFn = unsafe extern "C" fn(
     reflection: *mut Reflection,
-    property: *const SharedRef,
+    property: *const c_void,
     name: *const FString,
     display_name: *const Text,
 ) -> *mut u8;
@@ -337,6 +371,8 @@ pub struct Rows {
     enum_table: &'static [*const c_void],
     /// `None` if not found (logged).
     number_table: Option<&'static [*const c_void]>,
+    /// `None` if not found or not hooked (logged).
+    color_table: Option<&'static [*const c_void]>,
 }
 
 // SAFETY: code pointers and tables that live for the whole game; only used on the game thread.
@@ -393,6 +429,10 @@ impl Rows {
         )
         .map_err(|reason| log!("no number rows: {reason}"))
         .ok();
+        // Without it, only color rows are missing.
+        let color_table = color::table(&shared)
+            .map_err(|reason| log!("no color rows: {reason}"))
+            .ok();
         // SAFETY: the functions found have these signatures (see their declarations).
         unsafe {
             Ok(Self {
@@ -401,6 +441,7 @@ impl Rows {
                 bool_table,
                 enum_table,
                 number_table,
+                color_table,
             })
         }
     }
@@ -428,18 +469,45 @@ impl Rows {
         value: Value,
         changed: fn(),
     ) -> Result<Row, String> {
+        self.row_named(
+            &format!("EditorTweaks_{key}"),
+            name,
+            description,
+            value,
+            changed,
+        )
+    }
+
+    /// [`Self::row`] whose property is called exactly `property` (the name of the field it would
+    /// edit): a row standing in for one of the game's, under its name, so that the game reacts to
+    /// it changing as to its own row (the event a panel sends after a change names the property).
+    pub fn row_named(
+        &self,
+        property: &str,
+        name: &str,
+        description: &str,
+        value: Value,
+        changed: fn(),
+    ) -> Result<Row, String> {
         let texts = texts()?;
         let table = match value {
             Value::Check(_) => self.bool_table,
             Value::List(_) => self.enum_table,
             Value::Number(_) => self.number_table.ok_or("number rows aren't available")?,
+            Value::Color(_) => self.color_table.ok_or("color rows aren't available")?,
         };
         let mut fields = [0; FIELDS_SIZE];
-        if let Value::Number(number) = value {
-            fields[NUMBER_UNIT] = number.unit() as u8;
-            fields[NUMBER_UNIT_SET] = 1;
+        match value {
+            Value::Number(number) => {
+                fields[NUMBER_UNIT] = number.unit() as u8;
+                fields[NUMBER_UNIT_SET] = 1;
+            }
+            Value::Color(color) => {
+                fields[color::ALPHA] = u8::from(color.has_alpha());
+                fields[color::ALPHA_SET] = 1;
+            }
+            Value::Check(_) | Value::List(_) => {}
         }
-        let key = format!("EditorTweaks_{key}");
         let shared = Box::into_raw(Box::new(Shared {
             controller: Controller {
                 vtable: &KEPT,
@@ -450,7 +518,7 @@ impl Rows {
             property: Property {
                 vtable: table.as_ptr(),
                 field: core::ptr::null(),
-                name: kismet::string_to_name(&key)?,
+                name: kismet::string_to_name(property)?,
                 fields: Fields(fields),
                 value,
                 changed,
@@ -461,7 +529,7 @@ impl Rows {
         // Kept for the whole game: the game holds references to it.
         Ok(Row {
             shared,
-            key: OwnedFString::new(&key),
+            key: OwnedFString::new(property),
             name: texts.text(name),
             description: texts.text(description),
             when: None,
@@ -477,40 +545,59 @@ impl Rows {
         unsafe { (self.add_category)(reflection, title) };
     }
 
-    /// Adds `row` to the current category of `reflection`.
+    /// Adds `row` to the current category of `reflection`, and returns its edit info (null if the
+    /// game made none).
     ///
     /// # Safety
     /// As for [`Self::add_category`].
-    pub unsafe fn add_row(&self, reflection: *mut Reflection, row: &Row) {
+    pub unsafe fn add_row(&self, reflection: *mut Reflection, row: &Row) -> *mut u8 {
         // SAFETY: per the contract; the row's property lives for the whole game. The game copies the
-        // reference (counting it), the name and the display name, and returns the row's edit info,
-        // whose description is an `FText`.
+        // reference (counting it), the name and the display name, and returns the row's edit info.
         unsafe {
             let shared = SharedRef {
                 object: &raw mut (*row.shared).property,
                 controller: &raw mut (*row.shared).controller,
             };
-            let info = (self.add_property)(reflection, &shared, row.key.as_ptr(), &row.name);
+            let info = (self.add_property)(
+                reflection,
+                (&raw const shared).cast(),
+                row.key.as_ptr(),
+                &row.name,
+            );
             if info.is_null() {
-                return;
+                return info;
             }
-            row.description
-                .assign_to(info.add(EDIT_INFO_DESCRIPTION).cast());
+            describe(info, row);
             if matches!((*row.shared).property.value, Value::List(list) if list.dropdown()) {
                 show_as_dropdown(info);
             }
+            info
         }
     }
+}
+
+/// Gives the row whose edit info is `info` the description of `row` (its tooltip), e.g. again
+/// after the game wrote its own there.
+///
+/// # Safety
+/// `info` must be a live edit info, as `AddProperty` returns it. Game thread only.
+pub unsafe fn describe(info: *mut u8, row: &Row) {
+    // SAFETY: per the contract; the description is an `FText` at this offset.
+    unsafe {
+        row.description
+            .assign_to(info.add(EDIT_INFO_DESCRIPTION).cast())
+    };
 }
 
 /// Has the list whose edit info is `info` shown as a dropdown, as the siren brick's type does
 /// (`MaxListItems` 0, BRMK 0x178E08). Only if the edit info holds what `AddProperty` gives
 /// it, so that a game update moving the fields can't have us write over another one: the list then
-/// shows its items side by side, and the log says so once.
+/// shows its items side by side, and the log says so once. The game's own lists may set how many
+/// items go in a row of buttons (+0xB8, e.g. the view mode's 3), which a dropdown ignores.
 ///
 /// # Safety
-/// `info` must be the edit info `AddProperty` just returned. Game thread only.
-unsafe fn show_as_dropdown(info: *mut u8) {
+/// `info` must be a live list's edit info, as `AddProperty` returns it. Game thread only.
+pub unsafe fn show_as_dropdown(info: *mut u8) {
     static MOVED: Once = Once::new();
     // SAFETY: per the contract; the edit info (0xD8 bytes, 8-aligned) holds a flag and an `int32`
     // at these offsets.
@@ -832,6 +919,26 @@ unsafe extern "C" fn compare_numbers(
     unsafe { *a == *b }
 }
 
+thread_local! {
+    /// While a numeric row updates on this thread ([`noting_number_shown`]): our number it shows,
+    /// once its value was read. `None` outside of an update.
+    static NUMBER_SHOWN: Cell<Option<Option<&'static dyn Number>>> = const { Cell::new(None) };
+}
+
+/// Runs `update`, a numeric row's `UpdateValue` (`UNumericPropertyWidget`), and returns which of our
+/// number rows it showed, if one: the row reads its value through our getter first thing.
+pub fn noting_number_shown(update: impl FnOnce()) -> Option<&'static dyn Number> {
+    let previous = NUMBER_SHOWN.replace(Some(None));
+    update();
+    NUMBER_SHOWN.replace(previous).flatten()
+}
+
+/// During [`noting_number_shown`]'s update, once the row read its value: our number it shows, if
+/// it's one of ours. E.g. while the row's Blueprint adds its buttons.
+pub fn number_shown() -> Option<&'static dyn Number> {
+    NUMBER_SHOWN.get().flatten()
+}
+
 unsafe extern "C" fn get_numbers(
     this: *const Property,
     _container: *const c_void,
@@ -842,6 +949,9 @@ unsafe extern "C" fn get_numbers(
         let Value::Number(number) = (*this).value else {
             return false;
         };
+        if NUMBER_SHOWN.get().is_some() {
+            NUMBER_SHOWN.set(Some(Some(number)));
+        }
         let values = number.values();
         let mut numbers = Numbers {
             data: [0.0; MAX_COMPONENTS],
@@ -855,9 +965,26 @@ unsafe extern "C" fn get_numbers(
     true
 }
 
+/// What a number row of ours stores instead of a value a panel writes to it (`None`: the value as
+/// written), called with the row's property and container like a game property's `ClampValue`.
+/// Features rewrite the values the game's numeric properties store from `property_limits`' hook of
+/// `ClampValue`, which our rows don't call.
+pub type NumbersRewrite = unsafe fn(
+    property: *const c_void,
+    container: *const c_void,
+    written: &NumericValue,
+) -> Option<NumericValue>;
+
+static NUMBERS_REWRITE: OnceLock<NumbersRewrite> = OnceLock::new();
+
+/// Makes number rows of ours store what `rewrite` gives for the values written to them. Once.
+pub fn rewrite_written_numbers(rewrite: NumbersRewrite) {
+    let _ = NUMBERS_REWRITE.set(rewrite);
+}
+
 unsafe extern "C" fn set_numbers(
     this: *const Property,
-    _container: *const c_void,
+    container: *const c_void,
     value: *const Numbers,
 ) -> bool {
     // SAFETY: `this` is one of our properties, `value` a value of its type.
@@ -865,7 +992,22 @@ unsafe extern "C" fn set_numbers(
     let Value::Number(number) = property.value else {
         return false;
     };
-    let (min, max) = number.range();
+    let written = NumericValue {
+        data: value.data,
+        num_used: value.count,
+    };
+    // SAFETY: the property and container of this setter call, as the rewrite takes them.
+    let value = match NUMBERS_REWRITE
+        .get()
+        .and_then(|rewrite| unsafe { rewrite(this.cast(), container, &written) })
+    {
+        Some(rewritten) => Numbers {
+            data: rewritten.data,
+            count: rewritten.num_used,
+        },
+        None => value,
+    };
+    let (min, max) = number.limit();
     let count = usize::from(value.count).min(MAX_COMPONENTS);
     let values: Vec<f32> = value.data[..count]
         .iter()
@@ -889,17 +1031,18 @@ unsafe extern "C" fn numbers_range(
 ) -> *mut NumbersRange {
     // SAFETY: `this` is one of our properties, `out` room for a range.
     unsafe {
-        let (min, max) = match (*this).value {
-            Value::Number(number) => number.range(),
+        let ends = |index| match (*this).value {
+            Value::Number(number) => number.component_range(index),
             _ => (0.0, 1.0),
         };
-        let ends = |value| Numbers {
-            data: [value; MAX_COMPONENTS],
+        let ranges: [(f32, f32); MAX_COMPONENTS] = core::array::from_fn(ends);
+        let side = |pick: fn(&(f32, f32)) -> f32| Numbers {
+            data: ranges.each_ref().map(pick),
             count: MAX_COMPONENTS as u8,
         };
         out.write(NumbersRange {
-            min: ends(min),
-            max: ends(max),
+            min: side(|&(min, _)| min),
+            max: side(|&(_, max)| max),
         });
     }
     out

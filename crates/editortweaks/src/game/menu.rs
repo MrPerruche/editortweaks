@@ -17,10 +17,12 @@
 use brickrust::ue::coreuobject::UObjectBase;
 use brickrust::ue::fname::FName;
 use brickrust::ue::tarray::TArray;
+use brickrust::ue::uclass::UStruct;
 
 use crate::framework::sig;
 use crate::game::reflection::{self, Function, Parameters};
 use crate::game::text::Text;
+use crate::game::world;
 
 /// `UMenuWidget::OpenMenu(FName InMenu)`, the C++ function: opens a context.
 pub type OpenMenuFn = unsafe extern "C" fn(menu: *mut UObjectBase, context: FName);
@@ -37,7 +39,7 @@ pub type AddPropertiesFn = unsafe extern "C" fn(page: *mut UObjectBase);
 /// `TSoftObjectPtr` and `TSoftClassPtr` (0x28 bytes): a weak pointer to the object once found, and
 /// its path. Made from a path alone, it finds the object (or loads it) when used.
 #[repr(C)]
-struct SoftPointer {
+pub struct SoftPointer {
     /// `FWeakObjectPtr`: no object yet (`INDEX_NONE`).
     object_index: i32,
     serial_number: i32,
@@ -52,7 +54,7 @@ const _: () = assert!(size_of::<SoftPointer>() == 0x28);
 const _: () = assert!(core::mem::offset_of!(SoftPointer, path) == 0x10);
 
 impl SoftPointer {
-    fn new(path: FName) -> Self {
+    pub fn new(path: FName) -> Self {
         Self {
             object_index: -1,
             serial_number: 0,
@@ -64,120 +66,45 @@ impl SoftPointer {
     }
 }
 
-/// The menu functions and fields we use.
-pub struct Menus {
-    /// `UMenuWidget::OpenMenu`'s C++ function (game 0xEEBF30), to hook: the reflected one's thunk
-    /// (game 0xFE6590) reads the context and calls it last.
-    pub open_menu: *const u8,
-    /// `UMenuButtonPanelWidget::RemoveUnusedButtons` (game 0xEF3F00), to hook.
-    pub remove_unused_buttons: *const u8,
+/// Button panels (`UMenuButtonPanelWidget`): a menu's buttons, and the small buttons of a property
+/// row (lock, units, context menu; `UPropertyContainerWidget::GetMenuButtonPanelWidget`). Both make
+/// their buttons the same way, pooling the widgets: a panel reuses its button widgets for the next
+/// buttons it makes.
+pub struct ButtonPanels {
     /// `UMenuButtonWidget::OnClicked` (game 0xEE7120), to hook.
     pub on_clicked: *const u8,
-    /// `UMenuSettingsPageWidget::AddProperties_Implementation`, to hook.
-    pub add_properties: *const u8,
-    /// The reflected `UMenuWidget::OpenMenu(InMenu)`, to open a context as the game's buttons do.
-    open: Function,
-    open_context: usize,
     /// `UMenuButtonPanelWidget::CreateButton(DisplayText, IconTexture, Delegate)`.
     create_button: Function,
     button_text: usize,
     button_icon: usize,
     button_made: usize,
-    /// `UMenuWidget::ShowMenuPage(WidgetClass, TitleText)`.
-    show_page: Function,
-    page_class: usize,
-    page_title: usize,
-    /// Offset of `UMainWidgetBase::ButtonPanel` in a menu.
-    button_panel: usize,
     /// Offset of `UMenuButtonPanelWidget::Buttons`, the buttons in use (`TArray`).
     buttons: usize,
-    /// Offset of `UMenuWidget::CurrentMenuPage`.
-    current_page: usize,
-    /// Offset of `UMenuSettingsPageWidget::SettingsCategories` (`FGameplayTagContainer`).
-    categories: usize,
 }
 
 // SAFETY: code pointers and reflection records that live for the whole game; only used on the
 // game thread.
-unsafe impl Send for Menus {}
-unsafe impl Sync for Menus {}
+unsafe impl Send for ButtonPanels {}
+unsafe impl Sync for ButtonPanels {}
 
-impl Menus {
+impl ButtonPanels {
     /// Finds everything. After engine init (reflection).
     pub fn find() -> Result<Self, String> {
         let class = |name| reflection::find_class(name).ok_or(format!("class {name} not found"));
-        let menu = class("MenuWidget")?;
         let panel = class("MenuButtonPanelWidget")?;
         let button = class("MenuButtonWidget")?;
-        let page = class("MenuSettingsPageWidget")?;
-
-        let open_menu_thunk =
-            reflection::native_thunk(reflection::find_function(menu, "OpenMenu")?)
-                .map_err(|reason| format!("OpenMenu: {reason}"))?;
-        let open_menu = *sig::direct_calls(open_menu_thunk)
-            .last()
-            .filter(|&&target| sig::is_function_start(target))
-            .ok_or("OpenMenu's thunk calls no function last")?;
-        let parameterless = |class, name| {
-            reflection::find_function(class, name)
-                .and_then(reflection::parameterless_native)
-                .map_err(|reason| format!("{name}: {reason}"))
-        };
-        let add_properties = reflection::find_function(page, "AddProperties")
-            .and_then(|function| reflection::parameterless_virtual(page, function))
-            .map_err(|reason| format!("AddProperties: {reason}"))?;
-
-        let open = Function::find(menu, "OpenMenu")?;
+        let on_clicked = reflection::find_function(button, "OnClicked")
+            .and_then(reflection::parameterless_native)
+            .map_err(|reason| format!("OnClicked: {reason}"))?;
         let create_button = Function::find(panel, "CreateButton")?;
-        let show_page = Function::find(menu, "ShowMenuPage")?;
         Ok(Self {
-            open_menu,
-            remove_unused_buttons: parameterless(panel, "RemoveUnusedButtons")?,
-            on_clicked: parameterless(button, "OnClicked")?,
-            add_properties,
-            open_context: open.parameter("InMenu", "NameProperty", 8)?,
-            open,
+            on_clicked,
             button_text: create_button.parameter("DisplayText", "TextProperty", 0x18)?,
             button_icon: create_button.parameter("IconTexture", "SoftObjectProperty", 0x28)?,
             button_made: create_button.parameter("ReturnValue", "ObjectProperty", 8)?,
             create_button,
-            page_class: show_page.parameter("WidgetClass", "SoftClassProperty", 0x28)?,
-            page_title: show_page.parameter("TitleText", "TextProperty", 0x18)?,
-            show_page,
-            button_panel: reflection::field_offset(menu, "ButtonPanel", "ObjectProperty", 8)?,
             buttons: reflection::field_offset(panel, "Buttons", "ArrayProperty", 0x10)?,
-            current_page: reflection::field_offset(menu, "CurrentMenuPage", "ObjectProperty", 8)?,
-            categories: reflection::field_offset(
-                page,
-                "SettingsCategories",
-                "StructProperty",
-                0x20,
-            )?,
         })
-    }
-
-    /// Opens the context `context` in `menu`, as the game's buttons do (a sub-context of the current
-    /// one unless it starts with the root).
-    ///
-    /// # Safety
-    /// `menu` must be a live menu. Game thread only.
-    pub unsafe fn open(&self, menu: *mut UObjectBase, context: FName) {
-        let mut parameters = Parameters::new();
-        // SAFETY: per the contract; the name is written at its reflected offset.
-        unsafe {
-            reflection::put(&mut parameters, self.open_context, context);
-            self.open.call(menu, &mut parameters);
-        }
-    }
-
-    /// The panel of `menu`'s buttons.
-    ///
-    /// # Safety
-    /// `menu` must be a live menu. Game thread only.
-    pub unsafe fn button_panel(&self, menu: *mut UObjectBase) -> Option<*mut UObjectBase> {
-        // SAFETY: per the contract; the field is an object pointer of the menu's class.
-        let panel = unsafe { field::<*mut UObjectBase>(menu, self.button_panel) };
-        (!panel.is_null()).then_some(panel)
     }
 
     /// The buttons `panel` shows, in order.
@@ -208,7 +135,7 @@ impl Menus {
     }
 
     /// Adds a button showing `text` and the icon at `icon` (a texture's path) to `panel`, with no
-    /// delegate: its clicks are told by [`Self::on_clicked`]. The button, if made.
+    /// delegate: its clicks are told by `OnClicked` (see [`Self::on_clicked`]). The button, if made.
     ///
     /// # Safety
     /// `panel` must be a live button panel. Game thread only.
@@ -229,6 +156,122 @@ impl Menus {
             let made = reflection::take::<*mut UObjectBase>(&parameters, self.button_made);
             (!made.is_null()).then_some(made)
         }
+    }
+}
+
+/// The menu functions and fields we use.
+pub struct Menus {
+    /// `UMenuWidget::OpenMenu`'s C++ function (game 0xEEBF30), to hook: the reflected one's thunk
+    /// (game 0xFE6590) reads the context and calls it last.
+    pub open_menu: *const u8,
+    /// `UMenuButtonPanelWidget::RemoveUnusedButtons` (game 0xEF3F00), to hook.
+    pub remove_unused_buttons: *const u8,
+    /// `UMenuSettingsPageWidget::AddProperties_Implementation`, to hook.
+    pub add_properties: *const u8,
+    /// The menus' button panels.
+    pub panels: ButtonPanels,
+    /// The reflected `UMenuWidget::OpenMenu(InMenu)`, to open a context as the game's buttons do.
+    open: Function,
+    open_context: usize,
+    /// `UMenuWidget::CloseMenu()`: closes the menu, as its close button does.
+    close: Function,
+    /// `UMenuWidget::ShowMenuPage(WidgetClass, TitleText)`.
+    show_page: Function,
+    page_class: usize,
+    page_title: usize,
+    /// Offset of `UMainWidgetBase::ButtonPanel` in a menu.
+    button_panel: usize,
+    /// Offset of `UMenuWidget::CurrentMenuPage`.
+    current_page: usize,
+    /// Offset of `UMenuSettingsPageWidget::SettingsCategories` (`FGameplayTagContainer`).
+    categories: usize,
+}
+
+// SAFETY: code pointers and reflection records that live for the whole game; only used on the
+// game thread.
+unsafe impl Send for Menus {}
+unsafe impl Sync for Menus {}
+
+impl Menus {
+    /// Finds everything. After engine init (reflection).
+    pub fn find() -> Result<Self, String> {
+        let class = |name| reflection::find_class(name).ok_or(format!("class {name} not found"));
+        let menu = class("MenuWidget")?;
+        let panel = class("MenuButtonPanelWidget")?;
+        let page = class("MenuSettingsPageWidget")?;
+
+        let open_menu_thunk =
+            reflection::native_thunk(reflection::find_function(menu, "OpenMenu")?)
+                .map_err(|reason| format!("OpenMenu: {reason}"))?;
+        let open_menu = *sig::direct_calls(open_menu_thunk)
+            .last()
+            .filter(|&&target| sig::is_function_start(target))
+            .ok_or("OpenMenu's thunk calls no function last")?;
+        let parameterless = |class, name| {
+            reflection::find_function(class, name)
+                .and_then(reflection::parameterless_native)
+                .map_err(|reason| format!("{name}: {reason}"))
+        };
+        let add_properties = reflection::find_function(page, "AddProperties")
+            .and_then(|function| reflection::parameterless_virtual(page, function))
+            .map_err(|reason| format!("AddProperties: {reason}"))?;
+
+        let open = Function::find(menu, "OpenMenu")?;
+        let show_page = Function::find(menu, "ShowMenuPage")?;
+        Ok(Self {
+            open_menu,
+            remove_unused_buttons: parameterless(panel, "RemoveUnusedButtons")?,
+            add_properties,
+            panels: ButtonPanels::find()?,
+            open_context: open.parameter("InMenu", "NameProperty", 8)?,
+            open,
+            close: Function::find(menu, "CloseMenu")?,
+            page_class: show_page.parameter("WidgetClass", "SoftClassProperty", 0x28)?,
+            page_title: show_page.parameter("TitleText", "TextProperty", 0x18)?,
+            show_page,
+            button_panel: reflection::field_offset(menu, "ButtonPanel", "ObjectProperty", 8)?,
+            current_page: reflection::field_offset(menu, "CurrentMenuPage", "ObjectProperty", 8)?,
+            categories: reflection::field_offset(
+                page,
+                "SettingsCategories",
+                "StructProperty",
+                0x20,
+            )?,
+        })
+    }
+
+    /// Opens the context `context` in `menu`, as the game's buttons do (a sub-context of the current
+    /// one unless it starts with the root).
+    ///
+    /// # Safety
+    /// `menu` must be a live menu. Game thread only.
+    pub unsafe fn open(&self, menu: *mut UObjectBase, context: FName) {
+        let mut parameters = Parameters::new();
+        // SAFETY: per the contract; the name is written at its reflected offset.
+        unsafe {
+            reflection::put(&mut parameters, self.open_context, context);
+            self.open.call(menu, &mut parameters);
+        }
+    }
+
+    /// Closes `menu`.
+    ///
+    /// # Safety
+    /// `menu` must be a live menu. Game thread only.
+    pub unsafe fn close(&self, menu: *mut UObjectBase) {
+        let mut parameters = Parameters::new();
+        // SAFETY: per the contract; the function has no parameters.
+        unsafe { self.close.call(menu, &mut parameters) };
+    }
+
+    /// The panel of `menu`'s buttons.
+    ///
+    /// # Safety
+    /// `menu` must be a live menu. Game thread only.
+    pub unsafe fn button_panel(&self, menu: *mut UObjectBase) -> Option<*mut UObjectBase> {
+        // SAFETY: per the contract; the field is an object pointer of the menu's class.
+        let panel = unsafe { field::<*mut UObjectBase>(menu, self.button_panel) };
+        (!panel.is_null()).then_some(panel)
     }
 
     /// Shows the page of class `class` (a path) in `menu`, titled `title`.
@@ -272,6 +315,82 @@ impl Menus {
                 }
                 _ => &mut [],
             }
+        }
+    }
+}
+
+/// Opening the menu as Escape does: `UWindowManagerWidget::SetMenuOpen(true)` (reflected; BRMK
+/// 0x450D70: if `CanOpenOrCloseMenu`, sets the flag and `UpdateActiveWidget`, which makes the menu
+/// the active widget). The window manager is `UWorld::OwningGameInstance`'s `WindowManagerWidget`
+/// (reflected on `UBrickGameInstance`, as `game::zoom_notification` finds it). The menu widget's
+/// `NativeConstruct` (BRMK 0x3D3E20) then opens its root context (`InGameMenu`, or `MainMenu` in
+/// the main menu) with `OpenMenu`.
+pub struct WindowManager {
+    game_instance: usize,
+    brick_game_instance: *const UStruct,
+    window_manager: usize,
+    set_menu_open: Function,
+    open_value: usize,
+}
+
+// SAFETY: reflection records that live for the whole game; only used on the game thread.
+unsafe impl Send for WindowManager {}
+unsafe impl Sync for WindowManager {}
+
+impl WindowManager {
+    /// Finds everything. After engine init (reflection).
+    pub fn find() -> Result<Self, String> {
+        let class = |name| reflection::find_class(name).ok_or(format!("class {name} not found"));
+        let object = |class, name| reflection::field_offset(class, name, "ObjectProperty", 8);
+        let brick_game_instance = class("BrickGameInstance")?;
+        let window_manager = class("WindowManagerWidget")?;
+        let set_menu_open = Function::find(window_manager, "SetMenuOpen")?;
+        // Its one parameter, a bool, whatever it's called.
+        let function = reflection::find_function(window_manager, "SetMenuOpen")?;
+        // SAFETY: a live function record; its properties are its parameters.
+        let open_value = unsafe {
+            let mut parameters = reflection::properties(function.cast());
+            match (parameters.next(), parameters.next()) {
+                (Some(open), None) if reflection::is_kind(open, "BoolProperty") => {
+                    (*open).offset_internal as usize
+                }
+                _ => return Err("SetMenuOpen: unexpected parameters".into()),
+            }
+        };
+        Ok(Self {
+            game_instance: object(class("World")?, "OwningGameInstance")?,
+            brick_game_instance: brick_game_instance.cast(),
+            window_manager: object(brick_game_instance, "WindowManagerWidget")?,
+            open_value,
+            set_menu_open,
+        })
+    }
+
+    /// Opens the menu; whether there was a window manager to ask (the game may still refuse).
+    ///
+    /// # Safety
+    /// Game thread only.
+    pub unsafe fn open_menu(&self) -> bool {
+        // SAFETY: on the game thread; each object comes from a reflected object property of the
+        // one before (the game instance's class checked), and the parameter is written at its
+        // reflected offset.
+        unsafe {
+            let world = world::current();
+            if world.is_null() {
+                return false;
+            }
+            let instance = field::<*mut UObjectBase>(world, self.game_instance);
+            if instance.is_null() || !reflection::is_a(instance, self.brick_game_instance) {
+                return false;
+            }
+            let manager = field::<*mut UObjectBase>(instance, self.window_manager);
+            if manager.is_null() {
+                return false;
+            }
+            let mut parameters = Parameters::new();
+            reflection::put(&mut parameters, self.open_value, true);
+            self.set_menu_open.call(manager, &mut parameters);
+            true
         }
     }
 }

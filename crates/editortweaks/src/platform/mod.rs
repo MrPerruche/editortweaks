@@ -2,5 +2,6 @@
 
 pub mod file_dialog;
 pub mod keyboard;
+pub mod memory;
 pub mod timer;
 pub mod window;

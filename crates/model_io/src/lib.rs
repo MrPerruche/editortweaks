@@ -7,6 +7,8 @@
 //! [`ImportSettings`].
 
 pub mod companions;
+pub mod cooked;
+pub mod export;
 pub mod fit;
 pub mod image;
 pub mod loft;
@@ -16,6 +18,7 @@ pub mod plane;
 pub mod readers;
 pub mod sidecar;
 pub mod space;
+pub mod spinner;
 
 pub use image::Image;
 pub use model::{Material, Model, Part};

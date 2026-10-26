@@ -29,6 +29,7 @@ pub const DEFAULT_HIGHLIGHT: [f32; 4] = [0.791, 0.258, 0.03, 1.0];
 /// Styles by name, looked up in the reflected enum.
 #[derive(Clone, Copy, Debug)]
 pub struct ColorStyleValues {
+    pub default: u8,
     pub highlight: u8,
     pub negative: u8,
 }
@@ -39,22 +40,72 @@ pub fn color_style_values() -> Result<ColorStyleValues, String> {
         u8::try_from(value).map_err(|_| format!("{entry} is {value}"))
     };
     Ok(ColorStyleValues {
+        default: value("EBrickUIColorStyle::Default")?,
         highlight: value("EBrickUIColorStyle::Highlight")?,
         negative: value("EBrickUIColorStyle::Negative")?,
     })
 }
 
-/// A button's color style: the reflected `ColorStyle` field and `SetColorStyle` function.
-pub struct ButtonColorStyle {
-    field: usize,
-    set: *const UFunction,
-    /// Offset of `SetColorStyle`'s parameter.
+/// A class's reflected `SetColorStyle(EBrickUIColorStyle)`, e.g. `UButtonWidgetBase`'s or
+/// `UMenuButtonWidget`'s (a menu button isn't a `UButtonWidgetBase`, it holds one).
+pub struct SetColorStyle {
+    function: *const UFunction,
+    /// Offset of its parameter.
     parameter: usize,
 }
 
 // SAFETY: reflection records live as long as the game; only used on the game thread.
-unsafe impl Send for ButtonColorStyle {}
-unsafe impl Sync for ButtonColorStyle {}
+unsafe impl Send for SetColorStyle {}
+unsafe impl Sync for SetColorStyle {}
+
+impl SetColorStyle {
+    pub fn find(class: *const UClass) -> Result<Self, String> {
+        let function = reflection::find_function(class, "SetColorStyle")?;
+        // SAFETY: a live function record; its only parameter is the new style.
+        let parameter = unsafe {
+            let mut parameters = reflection::properties(function.cast());
+            match (parameters.next(), parameters.next()) {
+                (Some(style), None)
+                    if (reflection::is_kind(style, "EnumProperty")
+                        || reflection::is_kind(style, "ByteProperty"))
+                        && (*style).element_size == 1
+                        && Parameters::fit(function) =>
+                {
+                    (*style).offset_internal as usize
+                }
+                _ => return Err("SetColorStyle: unexpected parameters".into()),
+            }
+        };
+        Ok(Self {
+            function,
+            parameter,
+        })
+    }
+
+    /// Restyles `object`.
+    ///
+    /// # Safety
+    /// `object` must be a live object of the class (or a subclass) this was found on. Game thread
+    /// only.
+    pub unsafe fn call(&self, object: *mut c_void, style: u8) {
+        let mut parameters = Parameters::new();
+        // SAFETY: per the contract; the one-byte parameter lies within the checked parameter size.
+        unsafe {
+            parameters.as_mut_ptr().add(self.parameter).write(style);
+            reflection::call(
+                object.cast::<UObjectBase>(),
+                self.function,
+                parameters.as_mut_ptr(),
+            );
+        }
+    }
+}
+
+/// A button's color style: the reflected `ColorStyle` field and `SetColorStyle` function.
+pub struct ButtonColorStyle {
+    field: usize,
+    set: SetColorStyle,
+}
 
 pub fn button_color_style() -> Result<ButtonColorStyle, String> {
     let class =
@@ -62,26 +113,9 @@ pub fn button_color_style() -> Result<ButtonColorStyle, String> {
     // An enum field is an EnumProperty, or a ByteProperty for the older `TEnumAsByte`.
     let field = reflection::field_offset(class, "ColorStyle", "EnumProperty", 1)
         .or_else(|_| reflection::field_offset(class, "ColorStyle", "ByteProperty", 1))?;
-    let set = reflection::find_function(class, "SetColorStyle")?;
-    // SAFETY: a live function record; its only parameter is the new style.
-    let parameter = unsafe {
-        let mut parameters = reflection::properties(set.cast());
-        match (parameters.next(), parameters.next()) {
-            (Some(style), None)
-                if (reflection::is_kind(style, "EnumProperty")
-                    || reflection::is_kind(style, "ByteProperty"))
-                    && (*style).element_size == 1
-                    && Parameters::fit(set) =>
-            {
-                (*style).offset_internal as usize
-            }
-            _ => return Err("SetColorStyle: unexpected parameters".into()),
-        }
-    };
     Ok(ButtonColorStyle {
         field,
-        set,
-        parameter,
+        set: SetColorStyle::find(class)?,
     })
 }
 
@@ -100,17 +134,8 @@ impl ButtonColorStyle {
     /// # Safety
     /// `button` must be a live `UButtonWidgetBase`. Game thread only.
     pub unsafe fn set(&self, button: *mut c_void, style: u8) {
-        let mut parameters = Parameters::new();
-        // SAFETY: per the contract; `SetColorStyle` is a function of the button's class, and its
-        // one-byte parameter lies within the checked parameter size.
-        unsafe {
-            parameters.as_mut_ptr().add(self.parameter).write(style);
-            reflection::call(
-                button.cast::<UObjectBase>(),
-                self.set,
-                parameters.as_mut_ptr(),
-            );
-        }
+        // SAFETY: per the contract; `SetColorStyle` was found on `UButtonWidgetBase`.
+        unsafe { self.set.call(button, style) }
     }
 }
 

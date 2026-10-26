@@ -21,11 +21,11 @@ use super::geometry::{self, Frame, Vec3};
 use super::hinge::Line;
 use super::scene::{Scene, View};
 use super::snap::{self, Snapper};
-use crate::framework::settings::{Alternative, Choice, Setting};
+use crate::framework::settings::{Alternative, Choice};
 use crate::prelude::*;
 
-/// How long a line lasts, a setting ([`SETTINGS`]): the options of [`LineLasts`], in order.
-static LINE_LASTS: Choice = Choice::new(
+/// How long a line lasts, a setting: the options of [`LineLasts`], in order.
+pub(super) static LINE_LASTS: Choice = Choice::new(
     "LineLasts",
     "Line lasts",
     "How long a line placed to move bricks about lasts. Cleared or replaced, it's gone in any \
@@ -37,18 +37,15 @@ static LINE_LASTS: Choice = Choice::new(
         },
         Alternative {
             key: "UntilMoveEnds",
-            name: "Until the move ends",
+            name: "This move",
         },
         Alternative {
             key: "ForOneDrag",
-            name: "For one drag",
+            name: "One drag",
         },
     ],
     0,
 );
-
-/// The settings of lines, in the menu's order.
-pub static SETTINGS: [Setting; 1] = [Setting::Choice(&LINE_LASTS)];
 
 /// How long a line lasts now.
 fn line_lasts() -> LineLasts {

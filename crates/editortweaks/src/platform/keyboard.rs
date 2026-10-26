@@ -72,6 +72,11 @@ pub fn is_mouse_button_down() -> bool {
     is_down(VK_LBUTTON) || is_down(VK_RBUTTON)
 }
 
+/// Whether the middle mouse button is held right now.
+pub fn is_middle_button_down() -> bool {
+    is_down(VK_MBUTTON)
+}
+
 /// Whether the key Unreal calls `name` (an `FKey` name, e.g. `LeftAlt`, `G`, `Ampersand`) is held
 /// right now, in the sense of the module's doc; `None` for keys Windows can't tell (gamepad
 /// buttons, the mouse wheel, ...).

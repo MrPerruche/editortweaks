@@ -75,6 +75,19 @@ impl Feature for EditorBounds {
     }
 }
 
+/// How far from the vehicle's origin the editor lets things go along each axis right now, in cm
+/// (half the box): what bricks' position sliders span. `None` if the bounds weren't found.
+/// Game thread only.
+pub fn bounds() -> Option<[f32; 3]> {
+    let field = FIELD.get()?;
+    let raised = RAISED.lock().unwrap_or_else(PoisonError::into_inner);
+    raised.iter().find_map(|record| {
+        let info = record.info.get()?;
+        // SAFETY: a live static settings object (just checked), on the game thread.
+        Some(unsafe { field.get(info) })
+    })
+}
+
 /// Has the game's brick snapping run with the game's bounds, unless it already does.
 fn guard_snapping() {
     if SNAPPING_SAFE.load(Ordering::Relaxed) {

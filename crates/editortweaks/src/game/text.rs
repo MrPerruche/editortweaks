@@ -75,6 +75,21 @@ struct ReferenceControllerVTable {
 }
 
 impl Text {
+    /// A new reference to the live `FText` at `source` (how the game copies texts).
+    ///
+    /// # Safety
+    /// `source` must point to a live `FText`. Game thread only.
+    pub unsafe fn copy_of(source: *const Text) -> Text {
+        // SAFETY: per the contract; the bitwise copy is made a reference of its own by counting it.
+        unsafe {
+            let copy = source.read();
+            if !copy.controller.is_null() {
+                counter(&raw mut (*copy.controller).shared).fetch_add(1, Ordering::AcqRel);
+            }
+            copy
+        }
+    }
+
     /// Makes the live `FText` at `target` another reference to this text, releasing its old one
     /// (how the game copies texts, e.g. game 0xDBF0C8).
     ///

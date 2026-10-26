@@ -28,6 +28,28 @@ pub fn resolve(pointer: FWeakObjectPtr) -> Option<*mut UObjectBase> {
     }
 }
 
+/// A game `FWeakObjectPtr` to `object`, for game code taking one, if the object has a serial number
+/// (given the first time the game makes a weak pointer to it; `None` if it never did).
+///
+/// # Safety
+/// `object` must be a live object. Game thread only.
+pub unsafe fn game_pointer(object: *mut UObjectBase) -> Option<FWeakObjectPtr> {
+    // SAFETY: per the contract, so its index is a slot of the object array, which lives as long as
+    // the game; only the slot is read.
+    unsafe {
+        let index = (*object).internal_index;
+        let array = &GObjects().array;
+        if !(0..array.Count()).contains(&index) {
+            return None;
+        }
+        let item = &*array.Get(index);
+        (item.object.cast() == object && item.serial != 0).then_some(FWeakObjectPtr {
+            object_index: index,
+            object_serial_number: item.serial,
+        })
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct WeakObject {
     object: *mut UObjectBase,

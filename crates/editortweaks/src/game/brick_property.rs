@@ -135,6 +135,21 @@ impl ChangedEvent {
     /// dragging: more changes follow) or not. The event names no objects and no source: an edit
     /// started on the object itself.
     pub fn with_property(property: FName, interactive: bool, f: impl FnOnce(&mut Self)) {
+        Self::with(property, &mut [], interactive, f);
+    }
+
+    /// Runs `f` with an event telling that `property` of `object` changed for good, naming it as
+    /// the edited object, like the panel's events to the editor (`OnAnyPropertyModified`).
+    pub fn with_object(property: FName, object: FWeakObjectPtr, f: impl FnOnce(&mut Self)) {
+        Self::with(property, &mut [object], false, f);
+    }
+
+    fn with(
+        property: FName,
+        objects: &mut [FWeakObjectPtr],
+        interactive: bool,
+        f: impl FnOnce(&mut Self),
+    ) {
         /// The event, with room for fields beyond those known, zeroed like the known unused ones.
         #[repr(C)]
         struct Padded {
@@ -142,6 +157,7 @@ impl ChangedEvent {
             _rest: [u8; 0x40],
         }
         let mut path = [property];
+        let count = objects.len() as i32;
         let mut padded = Padded {
             event: ChangedEvent {
                 _unknown: [0; 0x18],
@@ -152,9 +168,13 @@ impl ChangedEvent {
                 },
                 level: 0,
                 objects: TArray {
-                    data: core::ptr::null_mut(),
-                    num: 0,
-                    max: 0,
+                    data: if objects.is_empty() {
+                        core::ptr::null_mut()
+                    } else {
+                        objects.as_mut_ptr()
+                    },
+                    num: count,
+                    max: count,
                 },
                 source: FWeakObjectPtr {
                     object_index: 0,

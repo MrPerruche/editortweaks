@@ -24,6 +24,7 @@ use brickrust::ue::tarray::TArray;
 use brickrust::ue::uclass::{UClass, UStruct};
 
 use crate::framework::sig::{self, FunctionSig};
+use crate::game::menu::SoftPointer;
 use crate::game::player_input::Chord;
 use crate::game::reflection::{self, BoolField};
 use crate::game::text::Text;
@@ -90,6 +91,10 @@ pub struct Action<'a> {
     pub keys: &'a [Chord],
     /// Its place among the category's actions (`SortPriority`).
     pub order: i32,
+    /// For an action of the mod's editor menu (`features::editor_menu`): the path of its icon
+    /// there (a texture's, like the game's actions'). Menu actions are clickable and close the menu
+    /// when clicked.
+    pub menu_icon: Option<FName>,
 }
 
 /// The input tables' reflected layout and the virtual functions that fill them (after engine
@@ -119,6 +124,8 @@ struct RowLayout {
     ustruct: *const UStruct,
     /// `PrimaryDisplayInfo.Name` (`FText`).
     label: usize,
+    /// `PrimaryDisplayInfo.IconTexture` (`TSoftObjectPtr<UTexture2D>`).
+    icon: usize,
     /// `PrimaryActionDescription` (`FText`).
     description: usize,
     /// `Type` (`EInputRowType`, a byte).
@@ -136,6 +143,7 @@ struct RowLayout {
     can_be_rebound: BoolField,
     hide_from_input_help: BoolField,
     clickable: BoolField,
+    close_input_help: BoolField,
     display_action_index: BoolField,
     mapping: MappingLayout,
 }
@@ -157,6 +165,8 @@ struct CategoryLayout {
     class: *const UClass,
     /// `DisplayInfo.Name` (`FText`).
     label: usize,
+    /// `DisplayInfo.IconTexture` (`TSoftObjectPtr<UTexture2D>`).
+    icon: usize,
     /// `ParentCategory` (`UInputCategory*`).
     parent: usize,
     /// `SortPriority` (`int32`): where a subcategory's section goes among its parent's.
@@ -178,6 +188,9 @@ impl InputTables {
         let row = script_struct("InputTableRow")?;
         let text =
             |ustruct, name| reflection::struct_field_offset(ustruct, name, "TextProperty", 0x18);
+        let icon = |ustruct| {
+            reflection::struct_field_offset(ustruct, "IconTexture", "SoftObjectProperty", 0x28)
+        };
         let bool_field = |name| reflection::bool_field(row, name);
 
         let (primary, display_info) = nested(row, "PrimaryDisplayInfo")?;
@@ -208,6 +221,7 @@ impl InputTables {
             row: RowLayout {
                 ustruct: row,
                 label: primary + text(display_info, "Name")?,
+                icon: primary + icon(display_info)?,
                 description: text(row, "PrimaryActionDescription")?,
                 kind: reflection::struct_field_offset(row, "Type", "EnumProperty", 1)?,
                 press_release: u8::try_from(press_release)
@@ -224,6 +238,7 @@ impl InputTables {
                 can_be_rebound: bool_field("bCanBeRebound")?,
                 hide_from_input_help: bool_field("bHideFromInputHelp")?,
                 clickable: bool_field("bIsClickable")?,
+                close_input_help: bool_field("bCloseInputHelp")?,
                 display_action_index: bool_field("bDisplayActionIndex")?,
                 mapping: MappingLayout {
                     ustruct: mapping,
@@ -239,6 +254,7 @@ impl InputTables {
             category: CategoryLayout {
                 class: category_class,
                 label: category_info + text(category_display_info, "Name")?,
+                icon: category_info + icon(category_display_info)?,
                 parent: reflection::field_offset(
                     category_class,
                     "ParentCategory",
@@ -303,9 +319,10 @@ impl InputTables {
         }
     }
 
-    /// A new input category called `name` inside `outer`, shown as `label`, inside the category
-    /// `parent` (null: a top category) at place `order` among its subcategories, kept for the whole
-    /// game.
+    /// A new input category called `name` inside `outer`, shown as `label` (with the texture at the
+    /// path `icon`, if any, where the game shows categories with icons: its top bar's menus), inside
+    /// the category `parent` (null: a top category) at place `order` among its subcategories, kept
+    /// for the whole game.
     ///
     /// # Safety
     /// `outer` must be a live object without anything called `name` inside, `parent` null or a live
@@ -315,6 +332,7 @@ impl InputTables {
         outer: *mut UObjectBase,
         name: FName,
         label: &Text,
+        icon: Option<FName>,
         parent: *mut UObjectBase,
         order: i32,
     ) -> Result<*mut UObjectBase, String> {
@@ -327,6 +345,11 @@ impl InputTables {
             }
             let base = category.cast::<u8>();
             label.assign_to(base.add(self.category.label).cast());
+            if let Some(icon) = icon {
+                base.add(self.category.icon)
+                    .cast::<SoftPointer>()
+                    .write_unaligned(SoftPointer::new(icon));
+            }
             base.add(self.category.parent)
                 .cast::<*mut UObjectBase>()
                 .write(parent);
@@ -336,7 +359,8 @@ impl InputTables {
         }
     }
 
-    /// Adds `action` to our `table`, in `category`: rebindable, out of the in-game input help.
+    /// Adds `action` to our `table`, in `category`: rebindable, out of the in-game input help unless
+    /// it's a menu action.
     ///
     /// # Safety
     /// `table` must come from [`Self::new_table`] and not have the action yet, `category` must be a
@@ -369,9 +393,16 @@ impl InputTables {
                 .cast::<*mut UObjectBase>()
                 .write_unaligned(category);
             row.can_be_rebound.set(base, true);
-            row.hide_from_input_help.set(base, true);
-            row.clickable.set(base, false);
+            let in_menu = action.menu_icon.is_some();
+            row.hide_from_input_help.set(base, !in_menu);
+            row.clickable.set(base, in_menu);
+            row.close_input_help.set(base, in_menu);
             row.display_action_index.set(base, false);
+            if let Some(icon) = action.menu_icon {
+                base.add(row.icon)
+                    .cast::<SoftPointer>()
+                    .write_unaligned(SoftPointer::new(icon));
+            }
             if !action.keys.is_empty() {
                 let mapping = &row.mapping;
                 let elements = self.new_structs(mapping.ustruct, action.keys.len())?;

@@ -190,6 +190,7 @@ dependencies = [
 name = "model_io"
 version = "0.1.0"
 dependencies = [
+ "miniz_oxide 0.8.9",
  "png",
  "serde",
  "serde_json",

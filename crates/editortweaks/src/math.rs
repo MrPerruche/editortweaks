@@ -174,6 +174,26 @@ impl Quat {
         [pitch, yaw, roll].map(normalize_angle)
     }
 
+    /// [`Self::to_rotator`], or the other rotator of the same rotation (pitch `180° - p`, yaw and
+    /// roll half a turn on) if that one is nearer `reference`. Pitch beyond ±90° (the camera upside
+    /// down) is a rotator of its own: `to_rotator` always gives the one within ±90°, which would
+    /// turn a view that keeps going over the top back the other way.
+    pub fn to_rotator_near(self, reference: Vec3) -> Vec3 {
+        let [pitch, yaw, roll] = self.to_rotator();
+        let other = [180.0 - pitch, yaw + 180.0, roll + 180.0].map(normalize_angle);
+        let gap = |rotator: Vec3| {
+            (0..3)
+                .map(|axis| normalize_angle(rotator[axis] - reference[axis]).abs())
+                .sum::<f64>()
+        };
+        let first = [pitch, yaw, roll];
+        if gap(other) < gap(first) {
+            other
+        } else {
+            first
+        }
+    }
+
     /// The opposite rotation.
     pub fn inverse(self) -> Self {
         Self {
