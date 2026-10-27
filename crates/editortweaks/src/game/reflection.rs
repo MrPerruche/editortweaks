@@ -924,6 +924,33 @@ impl Function {
         parameter_offset(self.function, self.name, parameter, kind, size)
     }
 
+    /// The offset of the function's one parameter, whatever it is called, checked to be a property
+    /// of one of `kinds` and `size` bytes. For a function whose parameter name is unknown.
+    pub fn only_parameter(&self, kinds: &[&'static str], size: i32) -> Result<usize, String> {
+        // SAFETY: a live function record; its property records live as long as it.
+        unsafe {
+            let mut parameters = properties(self.function.cast());
+            match (parameters.next(), parameters.next()) {
+                (Some(parameter), None)
+                    if kinds.iter().any(|kind| is_kind(parameter, kind))
+                        && (*parameter).element_size == size =>
+                {
+                    Ok((*parameter).offset_internal as usize)
+                }
+                _ => {
+                    let found: Vec<String> = properties(self.function.cast())
+                        .map(|property| name_text(&(*property).field.name_private))
+                        .collect();
+                    Err(format!(
+                        "{}: expected one parameter of {kinds:?}, it has [{}]",
+                        self.name,
+                        found.join(", ")
+                    ))
+                }
+            }
+        }
+    }
+
     /// Calls the function on `object` with `parameters`, which receives the return value and out
     /// parameters.
     ///
@@ -979,6 +1006,21 @@ impl SingleCall {
         let function = Function::find(class, name)?;
         Ok(Self {
             value: function.parameter(parameter, kind, size)?,
+            function,
+        })
+    }
+
+    /// Like [`SingleCall::find`] for a function whose parameter's name isn't known: its one
+    /// parameter, a property of one of `kinds` of `size` bytes.
+    pub fn find_only(
+        class: *const UClass,
+        name: &'static str,
+        kinds: &[&'static str],
+        size: i32,
+    ) -> Result<Self, String> {
+        let function = Function::find(class, name)?;
+        Ok(Self {
+            value: function.only_parameter(kinds, size)?,
             function,
         })
     }

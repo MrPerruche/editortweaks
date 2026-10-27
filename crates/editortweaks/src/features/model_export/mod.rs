@@ -8,7 +8,7 @@
 //! What's in it: the bricks [`BRICKS`] picks, each an object of its own named like the editor
 //! names it (or one object per material, [`JOIN`]), with its shape as [`SHAPES`] says (see
 //! [`shapes`]) and a material for its colour and brick material, textured like the game draws it
-//! if [`EXPORT_TEXTURES`] is on (see [`looks`]), not its pattern; wheels' tyres in rubber
+//! if [`EXPORT_TEXTURES`] is on (see [`looks`]), with its pattern; wheels' tyres in rubber
 //! (`game::tyres`); text bricks' text (see [`text`]).
 //! Collision has no materials or text. The model's origin is the middle of the vehicle's bottom.
 //! glTF (`.glb`) and OBJ files are +Y up with the vehicle's front towards +Z, STL files +Z up with
@@ -37,7 +37,7 @@ use super::keybinds;
 use super::settings_menu::{self, Dialog};
 use crate::framework::settings::{Alternative, Choice, Section, Setting, Toggle};
 use crate::game::brick_editor;
-use crate::game::brick_looks::BrickLooks;
+use crate::game::brick_looks::{BrickLooks, BrickPatterns};
 use crate::game::brick_model::BrickModels;
 use crate::game::collision::Collision;
 use crate::game::display_name::{self, DisplayNames};
@@ -52,7 +52,7 @@ use crate::game::texture_readback::Readback;
 use crate::game::tyres::Tyres;
 use crate::math;
 use crate::prelude::*;
-use looks::Materials;
+use looks::{Materials, Projection};
 use shapes::{Kind, Shapes, Source, SpinnerLooks};
 use text::TextParts;
 
@@ -69,8 +69,9 @@ pub static SHOW_EXPORTED: Toggle = Toggle::new(
 pub static EXPORT_TEXTURES: Toggle = Toggle::new(
     "ExportModelTextures",
     "Export textures",
-    "Give exported models the brick materials' textures (wood grain, metal, normal maps) and \
-     text bricks' text. The first export of a game takes a moment longer while they're read.",
+    "Give exported models the brick materials' textures (wood grain, metal, normal maps), bricks' \
+     patterns and text bricks' text. The first export of a game takes a moment longer while \
+     they're read.",
     true,
 );
 
@@ -316,6 +317,8 @@ struct Game {
     bounds: LocalBounds,
     world: WorldTransforms,
     looks: BrickLooks,
+    /// Bricks' patterns (else they're left out).
+    patterns: Option<BrickPatterns>,
     /// Bricks' meshes (else bricks are boxes).
     models: Option<BrickModels>,
     /// Spinners' collision pieces (else they're boxes), for those without [`Self::spinners`].
@@ -365,6 +368,10 @@ fn engine_init() -> Result<(), String> {
         bounds: LocalBounds::find()?,
         world: WorldTransforms::find()?,
         looks: BrickLooks::find()?,
+        patterns: optional(
+            BrickPatterns::find(),
+            "models are exported without patterns",
+        ),
         models: optional(BrickModels::find(), "bricks are exported as boxes"),
         collision: optional(Collision::find(), "spinners are exported as boxes"),
         spinners: optional(
@@ -611,7 +618,7 @@ unsafe fn gather(game: &Game, editor: *mut UObjectBase) -> (Export, String) {
         .filter(|_| readback.is_some())
         .map(TextParts::new);
     let (mut meshes, mut swept, mut pieces, mut boxes, mut with_text) = (0, 0, 0, 0, 0);
-    let mut with_tyres = 0;
+    let (mut with_tyres, mut patterned) = (0, 0);
     // The rubber texture, found with the first tyre.
     let mut rubber = None;
     let (mut collision, mut without_collision) = (0, 0);
@@ -680,9 +687,15 @@ unsafe fn gather(game: &Game, editor: *mut UObjectBase) -> (Export, String) {
             }
             part.split_sharp_edges(SMOOTH_ANGLE);
             if looks {
-                let (look, tiling) = materials.brick(&mut export, &game.looks.of(brick));
-                if let Some(tiling) = tiling {
-                    model_io::export::box_uvs(&mut part, tiling);
+                let pattern = game
+                    .patterns
+                    .as_ref()
+                    .and_then(|patterns| patterns.of(brick));
+                let (look, projection) =
+                    materials.brick(&mut export, &game.looks.of(brick), pattern.as_ref());
+                if let Some(projection) = projection {
+                    patterned += usize::from(matches!(projection, Projection::Pattern { .. }));
+                    projection.apply(&mut part);
                 }
                 part.material = Some(export.look_index(look));
             }
@@ -735,7 +748,8 @@ unsafe fn gather(game: &Game, editor: *mut UObjectBase) -> (Export, String) {
     };
     let (refitted, misplaced) = texts.map_or((0, 0), |texts| (texts.refitted, texts.misplaced));
     let summary = format!(
-        "{} bricks ({shapes}), {with_tyres} with tyres, {with_text} with text{}{}, {} images{}",
+        "{} bricks ({shapes}), {patterned} with patterns, {with_tyres} with tyres, {with_text} \
+         with text{}{}, {} images{}",
         export.objects.len(),
         if refitted > 0 {
             format!(" ({refitted} sized unlike their text component)")

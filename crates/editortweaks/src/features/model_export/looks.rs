@@ -12,7 +12,14 @@
 //!
 //! All textures repeat every `1 / BaseTiling` cm of a box projection ([`export::box_uvs`]). Fully
 //! painted bricks (most) show their colour only, so the diffuse texture is only used (baked with
-//! the colour, one image per colour) where paint doesn't cover it. Patterns aren't exported.
+//! the colour, one image per colour) where paint doesn't cover it.
+//!
+//! A pattern `P` multiplies the paint (`C.rgb * P.rgb` above, and the emissive once more), on a
+//! projection of its own ([`export::pattern_uvs`]). A part has one set of UVs, so a patterned
+//! brick's are the pattern's: its base colour is the pattern painted (one image per pattern,
+//! colour and diffuse texture), and the textures made for the material's projection are left out
+//! or averaged instead: the diffuse texture under the paint, MRAO, emissive; the normal map is left
+//! out.
 //!
 //! Textures are read back from the GPU ([`Readback`]) once per game, at most [`LARGEST`] pixels.
 
@@ -21,10 +28,11 @@ use std::sync::{Arc, Mutex, PoisonError};
 
 use brickrust::ue::coreuobject::UObjectBase;
 
-use model_io::export::{Export, Look};
+use model_io::export::{self, Export, Look};
 use model_io::image::{Image, linear_to_srgb, srgb_to_linear};
+use model_io::model::Part;
 
-use crate::game::brick_looks::Looks;
+use crate::game::brick_looks::{Looks, Pattern};
 use crate::game::texture_readback::{Read, Readback};
 use crate::game::tyres::Tyre;
 use crate::game::weak_object::WeakObject;
@@ -68,6 +76,53 @@ enum Source {
     Emissive(usize),
     /// A font's page, its distance field as alpha.
     Glyphs(usize),
+    /// A pattern painted a colour over a diffuse texture's average (0 for none).
+    Pattern(usize, usize, [u8; 4]),
+    /// A pattern times itself: what it does to the emissive.
+    PatternGlow(usize),
+}
+
+/// How a look's textures lie on a brick: the UVs its parts need.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Projection {
+    /// The brick material's, repeating this often per cm ([`export::box_uvs`]).
+    Material(f32),
+    /// The brick's pattern's ([`export::pattern_uvs`]).
+    Pattern {
+        scale: [f32; 2],
+        offset: [f32; 2],
+        /// Radians.
+        rotation: f32,
+    },
+}
+
+impl Projection {
+    /// Gives `part` the UVs of this projection.
+    pub fn apply(self, part: &mut Part) {
+        match self {
+            Self::Material(tiling) => export::box_uvs(part, tiling),
+            Self::Pattern {
+                scale,
+                offset,
+                rotation,
+            } => export::pattern_uvs(part, scale, offset, rotation),
+        }
+    }
+
+    /// The projection of `pattern`, as `UBrick::UpdatePrimitiveData` hands it to the material:
+    /// `1 / (Tiling * PatternScale)` repeats per cm; `None` if that isn't a number (a scale or
+    /// tiling of 0).
+    fn of(pattern: &Pattern) -> Option<Self> {
+        let scale = pattern.scale.map(|scale| 1.0 / (pattern.tiling * scale));
+        scale
+            .iter()
+            .all(|scale| scale.is_finite())
+            .then(|| Self::Pattern {
+                scale,
+                offset: pattern.offset,
+                rotation: pattern.rotation.to_radians(),
+            })
+    }
 }
 
 /// Makes the looks of one export, adding the images they need to it.
@@ -76,6 +131,8 @@ pub struct Materials<'a> {
     /// A live actor in the editor's world, for the engine's drawing.
     context: *mut UObjectBase,
     images: HashMap<Source, Option<usize>>,
+    /// Textures' average linear colours, by texture; `None` if one can't be read.
+    averages: HashMap<usize, Option<[f32; 4]>>,
     /// How many textures couldn't be read.
     pub unread: usize,
 }
@@ -86,48 +143,43 @@ impl<'a> Materials<'a> {
             readback,
             context,
             images: HashMap::new(),
+            averages: HashMap::new(),
             unread: 0,
         }
     }
 
-    /// The look of a brick with `looks`, and the tiling its UVs need if it has textures.
+    /// The look of a brick with `looks` and `pattern`, and the UVs it needs if it has textures.
     ///
     /// # Safety
-    /// The textures in `looks` must be live (or null). Game thread only.
-    pub unsafe fn brick(&mut self, export: &mut Export, looks: &Looks) -> (Look, Option<f32>) {
-        let [red, green, blue, alpha] = looks.color;
-        let rgb = [red, green, blue].map(|channel| srgb_to_linear(f32::from(channel) / 255.0));
-        let paint = f32::from(alpha) / 255.0;
+    /// The textures in `looks` and `pattern` must be live (or null). Game thread only.
+    pub unsafe fn brick(
+        &mut self,
+        export: &mut Export,
+        looks: &Looks,
+        pattern: Option<&Pattern>,
+    ) -> (Look, Option<Projection>) {
+        if let Some(pattern) = pattern
+            && let Some(projection) = Projection::of(pattern)
+            // SAFETY: per the contract.
+            && let Some(look) = unsafe { self.patterned(export, looks, pattern) }
+        {
+            return (look, Some(projection));
+        }
+        // SAFETY: per the contract.
+        let (look, tiling) = unsafe { self.plain(export, looks) };
+        (look, tiling.map(Projection::Material))
+    }
+
+    /// The look of a brick with `looks` and no pattern, and the tiling its UVs need if it has
+    /// textures.
+    ///
+    /// # Safety
+    /// As for [`Self::brick`].
+    unsafe fn plain(&mut self, export: &mut Export, looks: &Looks) -> (Look, Option<f32>) {
         let textures = looks.textures;
         let with_mrao = !textures.mrao.is_null();
-        let metallic_alpha = if looks.paint_metallic_alpha > 0.0 {
-            1.0 - looks.paint_metallic_alpha
-        } else {
-            1.0
-        };
-        let metallic = if with_mrao { 1.0 } else { looks.metallic };
-        let roughness = if with_mrao { 1.0 } else { looks.roughness };
-        let glow = looks.brightness.clamp(0.0, 1.0);
-        let mut look = Look {
-            name: format!(
-                "{} #{red:02X}{green:02X}{blue:02X}{}",
-                if looks.material.is_empty() {
-                    "Brick"
-                } else {
-                    &looks.material
-                },
-                if alpha < 255 {
-                    format!(" {}%", (paint * 100.0).round())
-                } else {
-                    String::new()
-                }
-            ),
-            color: [rgb[0], rgb[1], rgb[2], looks.opacity.clamp(0.0, 1.0)],
-            metallic: (metallic * (1.0 - paint * metallic_alpha)).clamp(0.0, 1.0),
-            roughness: roughness.clamp(0.0, 1.0),
-            emissive: rgb.map(|channel| channel * glow),
-            ..Look::default()
-        };
+        let glow = glow(looks);
+        let mut look = untextured(looks);
         // SAFETY: per the contract.
         unsafe {
             if !textures.diffuse.is_null()
@@ -168,6 +220,85 @@ impl<'a> Materials<'a> {
         }
         let textured = look.textures.used().next().is_some();
         (look, textured.then_some(looks.base_tiling))
+    }
+
+    /// The look of a brick with `looks` and `pattern`: the pattern painted as its base colour, the
+    /// material's textures averaged (see the module's description); `None` if the pattern can't
+    /// be read.
+    ///
+    /// # Safety
+    /// As for [`Self::brick`].
+    unsafe fn patterned(
+        &mut self,
+        export: &mut Export,
+        looks: &Looks,
+        pattern: &Pattern,
+    ) -> Option<Look> {
+        self.readback?;
+        let textures = looks.textures;
+        // SAFETY: per the contract.
+        let [under, mrao, emissive] = [textures.diffuse, textures.mrao, textures.emissive]
+            .map(|texture| unsafe { self.average(texture) });
+        let source = Source::Pattern(
+            pattern.texture as usize,
+            textures.diffuse as usize,
+            looks.color,
+        );
+        // SAFETY: per the contract.
+        let base_color = unsafe {
+            self.image(export, source, pattern.texture, |read| {
+                Some(patterned(read, looks.color, under.unwrap_or([1.0; 4])))
+            })?
+        };
+        let mut look = untextured(looks);
+        look.name = format!("{} {}", look.name, pattern_name(&pattern.name));
+        look.color[..3].fill(1.0);
+        look.textures.base_color = Some(base_color);
+        if let Some([metallic, roughness, ..]) = mrao {
+            look.metallic = (look.metallic * metallic).clamp(0.0, 1.0);
+            look.roughness = (look.roughness * roughness).clamp(0.0, 1.0);
+        }
+        if glow(looks) > 0.0 {
+            if let Some(average) = emissive {
+                for (channel, average) in look.emissive.iter_mut().zip(average) {
+                    *channel *= average;
+                }
+            }
+            // SAFETY: per the contract.
+            look.textures.emissive = unsafe {
+                self.image(
+                    export,
+                    Source::PatternGlow(pattern.texture as usize),
+                    pattern.texture,
+                    |read| Some(squared(read)),
+                )
+            };
+        }
+        Some(look)
+    }
+
+    /// The average linear colour of `texture` (sRGB ones made linear); `None` if it's null or
+    /// can't be read.
+    ///
+    /// # Safety
+    /// `texture` must be null or a live texture. Game thread only.
+    unsafe fn average(&mut self, texture: *mut UObjectBase) -> Option<[f32; 4]> {
+        if texture.is_null() {
+            return None;
+        }
+        if let Some(known) = self.averages.get(&(texture as usize)) {
+            return *known;
+        }
+        // SAFETY: per the contract.
+        let average = match unsafe { self.read(texture) } {
+            Ok(read) => Some(average(&read)),
+            Err(_) => {
+                self.unread += 1;
+                None
+            }
+        };
+        self.averages.insert(texture as usize, average);
+        average
     }
 
     /// The image of a font's page `texture`: white, its distance field as alpha; `None` if it
@@ -333,6 +464,109 @@ impl<'a> Materials<'a> {
     }
 }
 
+/// The look of a brick with `looks` before textures: named after its material and colour, with
+/// the material's numbers (1 for metallic and roughness with an MRAO texture, which scales them).
+fn untextured(looks: &Looks) -> Look {
+    let [red, green, blue, alpha] = looks.color;
+    let rgb = [red, green, blue].map(|channel| srgb_to_linear(f32::from(channel) / 255.0));
+    let paint = f32::from(alpha) / 255.0;
+    let with_mrao = !looks.textures.mrao.is_null();
+    let metallic_alpha = if looks.paint_metallic_alpha > 0.0 {
+        1.0 - looks.paint_metallic_alpha
+    } else {
+        1.0
+    };
+    let metallic = if with_mrao { 1.0 } else { looks.metallic };
+    let roughness = if with_mrao { 1.0 } else { looks.roughness };
+    let glow = glow(looks);
+    Look {
+        name: format!(
+            "{} #{red:02X}{green:02X}{blue:02X}{}",
+            if looks.material.is_empty() {
+                "Brick"
+            } else {
+                &looks.material
+            },
+            if alpha < 255 {
+                format!(" {}%", (paint * 100.0).round())
+            } else {
+                String::new()
+            }
+        ),
+        color: [rgb[0], rgb[1], rgb[2], looks.opacity.clamp(0.0, 1.0)],
+        metallic: (metallic * (1.0 - paint * metallic_alpha)).clamp(0.0, 1.0),
+        roughness: roughness.clamp(0.0, 1.0),
+        emissive: rgb.map(|channel| channel * glow),
+        ..Look::default()
+    }
+}
+
+/// How much a brick with `looks` glows, 0 to 1.
+fn glow(looks: &Looks) -> f32 {
+    looks.brightness.clamp(0.0, 1.0)
+}
+
+/// A pattern's name for its look's: its class's without the Blueprint suffix (`C_Army_C` is
+/// `C_Army`).
+fn pattern_name(class: &str) -> &str {
+    class.strip_suffix("_C").unwrap_or(class)
+}
+
+/// A pattern with `color` painted over it as the brick material blends them (see the module's
+/// description), over `under` (a linear colour: the diffuse texture's average, white without one)
+/// where the paint doesn't cover.
+fn patterned(read: &Read, color: [u8; 4], under: [f32; 4]) -> Image {
+    let share = under[3] * f32::from(color[3]) / 255.0;
+    let paint_rgb =
+        [color[0], color[1], color[2]].map(|channel| srgb_to_linear(f32::from(channel) / 255.0));
+    let mut image = read.image.clone();
+    for pixel in image.rgba.as_chunks_mut::<4>().0 {
+        for ((channel, painted), below) in pixel[..3].iter_mut().zip(paint_rgb).zip(under) {
+            let pattern = linear(*channel, read.srgb);
+            let above = painted * pattern;
+            *channel = to_byte(linear_to_srgb(below + (above - below) * share));
+        }
+        pixel[3] = 255;
+    }
+    image
+}
+
+/// A pattern times itself, as sRGB: the emissive takes the pattern twice (once in the base
+/// colour).
+fn squared(read: &Read) -> Image {
+    let mut image = read.image.clone();
+    for pixel in image.rgba.as_chunks_mut::<4>().0 {
+        for channel in &mut pixel[..3] {
+            let value = linear(*channel, read.srgb);
+            *channel = to_byte(linear_to_srgb(value * value));
+        }
+        pixel[3] = 255;
+    }
+    image
+}
+
+/// The average linear colour and alpha of a texture read back.
+fn average(read: &Read) -> [f32; 4] {
+    let pixels = read.image.rgba.as_chunks::<4>().0;
+    if pixels.is_empty() {
+        return [1.0; 4];
+    }
+    let mut sums = [0.0f64; 4];
+    for pixel in pixels {
+        for (channel, sum) in sums.iter_mut().enumerate() {
+            let srgb = read.srgb && channel < 3;
+            *sum += f64::from(linear(pixel[channel], srgb));
+        }
+    }
+    sums.map(|sum| (sum / pixels.len() as f64) as f32)
+}
+
+/// A texture's byte as a linear value, 0 to 1 (made linear if the texture is sRGB).
+fn linear(byte: u8, srgb: bool) -> f32 {
+    let value = f32::from(byte) / 255.0;
+    if srgb { srgb_to_linear(value) } else { value }
+}
+
 /// A diffuse texture with `color` painted over it, or `None` if the paint covers it all (the
 /// colour alone shows).
 fn painted(read: &Read, color: [u8; 4]) -> Option<Image> {
@@ -342,10 +576,6 @@ fn painted(read: &Read, color: [u8; 4]) -> Option<Image> {
     if pixels.iter().all(|pixel| covered(pixel[3])) {
         return None;
     }
-    let linear = |byte: u8, srgb: bool| {
-        let value = f32::from(byte) / 255.0;
-        if srgb { srgb_to_linear(value) } else { value }
-    };
     let paint_rgb = [color[0], color[1], color[2]].map(|channel| linear(channel, true));
     let mut image = read.image.clone();
     for pixel in image.rgba.as_chunks_mut::<4>().0 {

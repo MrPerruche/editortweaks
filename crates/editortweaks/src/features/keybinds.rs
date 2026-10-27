@@ -192,6 +192,14 @@ pub static SHOW_REFERENCES: Keybind = Keybind::new(
     &["Two"],
 );
 
+/// Flips the "Disable lighting in the editor" setting (`editor_lighting`).
+pub static LIGHTING: Keybind = Keybind::new(
+    "EditorTweaks_Lighting",
+    "Toggle lighting",
+    "Press in the editor to turn the editor's lighting off (everything fully bright, no shadows), and again to turn it back on (the same as the Disable lighting in the editor setting).",
+    &["Three"],
+);
+
 /// Keeps a dragged slider's value changing while held (`slider_drag`).
 pub static KEEP_DRAGGING_SLIDERS: Keybind = Keybind::new(
     "EditorTweaks_KeepDraggingSliders",
@@ -254,7 +262,7 @@ static SECTIONS: [Section; 6] = [
     Section {
         name: "IC_EditorTweaks_References",
         title: "References",
-        keybinds: &[&SHOW_MAP, &SHOW_REFERENCES],
+        keybinds: &[&SHOW_MAP, &SHOW_REFERENCES, &LIGHTING],
     },
     Section {
         name: "IC_EditorTweaks_Tools",

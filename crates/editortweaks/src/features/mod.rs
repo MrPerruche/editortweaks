@@ -18,7 +18,9 @@ mod drag_select;
 mod editor_bounds;
 /// Shared hooks of the editor's mouse button actions (not a feature).
 mod editor_buttons;
+mod editor_floor;
 mod editor_frame;
+mod editor_lighting;
 mod editor_menu;
 mod free_pitch;
 mod gun_preview;
@@ -44,6 +46,7 @@ mod settings_list;
 mod settings_menu;
 mod slider_drag;
 mod slider_formulas;
+mod spawn_mode;
 mod suspension_arrows;
 mod view_modes;
 
@@ -61,6 +64,8 @@ pub static ALL: &[&dyn Feature] = &[
     &editor_frame::EditorFrame,
     &ortho_view::OrthoView,
     &editor_bounds::EditorBounds,
+    &editor_floor::EditorFloor,
+    &editor_lighting::EditorLighting,
     &move_slowdown::MoveSlowdown,
     &precise_moves::PreciseMoves,
     &view_modes::ViewModes,
@@ -76,6 +81,7 @@ pub static ALL: &[&dyn Feature] = &[
     &map_in_editor::MapInEditor,
     &references::References,
     &compact_panel::CompactPanel,
+    &spawn_mode::SpawnMode,
     &settings_menu::SettingsMenu,
     &model_export::ModelExport,
     &editor_menu::EditorMenu,
@@ -104,7 +110,11 @@ static EDITOR: [Section; 1] = [Section {
         Setting::Toggle(&axis_permutations::ORDER_BUTTON),
         Setting::Choice(&compact_panel::COMPACT_PANEL),
     ],
-    unlisted: &[],
+    // The side panel's "Spawn mode" and "Disable lighting" rows set them.
+    unlisted: &[
+        Setting::Choice(&spawn_mode::SPAWN_MODE),
+        Setting::Toggle(&editor_lighting::NO_LIGHTING),
+    ],
 }];
 
 /// The settings of what the editor previews: where shots go, the tooltips of the shot preview and

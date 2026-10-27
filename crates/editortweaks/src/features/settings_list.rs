@@ -13,12 +13,13 @@
 //! Sections titled alike show as one, whichever listings add them: the game puts rows under an
 //! earlier section only if its title is the very same text (`AddCategory` compares them with
 //! `FText::IdenticalTo`, game 0x10A18B0: the same text data or display string, not equal strings),
-//! so each title is made once ([`title`]).
+//! so each title is made once ([`title`]). A section titled `""` adds no category: its rows end the
+//! last one the game listed.
 //!
 //! The game's own rows can be reworked too ([`rework`]): while the game lists its rows for a tag
 //! asked for, each row it adds (`AddProperty`, hooked then) can stay, show its list as a dropdown,
-//! give its place to a row of ours ([`row_named`], under the game's name), or go, its value shown by
-//! a row of ours placed before. A row going hands the game the edit info of the row showing its
+//! give its place to a row of ours ([`row_named`], under the game's name), have a row of ours
+//! placed before it, or go, its value shown by a row of ours placed before. A row going hands the game the edit info of the row showing its
 //! value: callers only write the row's description there (or nothing), which is put back after.
 //!
 //! Our number rows can show each value in its own unit (`Number::component_unit`): after such a
@@ -91,6 +92,8 @@ pub enum Rework {
     Keep,
     /// The game's row, its list shown as a dropdown.
     Dropdown,
+    /// The game's row, with a row of ours (if it is listed) placed before it.
+    Before(&'static Row),
     /// A row of ours in its place.
     Replace(&'static Row),
     /// No row: the row of ours given, placed before (by [`Rework::Replace`]), shows its value. If
@@ -370,13 +373,33 @@ unsafe extern "C" fn add_property(
     };
     // SAFETY: the game passes the field's name as a live string.
     let field = unsafe { (*name).to_string() };
-    let rework = reworks
+    let wanted: Vec<Rework> = reworks
         .iter()
         .map(|rework| rework(&field))
-        .find(|rework| !matches!(rework, Rework::Keep))
+        .filter(|rework| !matches!(rework, Rework::Keep))
+        .collect();
+    // Every row asked to go before the game's goes there, in the order asked; the first other
+    // rework is the game's row's.
+    for row in wanted.iter().filter_map(|rework| match rework {
+        Rework::Before(row) => Some(*row),
+        _ => None,
+    }) {
+        if let Ok(rows) = rows()
+            && row.is_listed()
+        {
+            // Our row goes through this hook too, under its own name: not reworked again.
+            let state = REWORKING.take();
+            // SAFETY: the reflection the game is filling, in its current category.
+            unsafe { rows.add_row(reflection, row) };
+            REWORKING.set(state);
+        }
+    }
+    let rework = wanted
+        .into_iter()
+        .find(|rework| !matches!(rework, Rework::Before(_)))
         .unwrap_or(Rework::Keep);
     match rework {
-        Rework::Keep => add(),
+        Rework::Keep | Rework::Before(_) => add(),
         Rework::Dropdown => {
             let info = add();
             if !info.is_null() {
@@ -468,7 +491,10 @@ unsafe fn list(rows: &Rows, reflection: *mut Reflection, listing: &Listing) {
         }
         // SAFETY: per the contract.
         unsafe {
-            rows.add_category(reflection, &title.text);
+            // An untitled section's rows go under the category the list ended with.
+            if !title.name.is_empty() {
+                rows.add_category(reflection, &title.text);
+            }
             for row in listed {
                 rows.add_row(reflection, row);
             }

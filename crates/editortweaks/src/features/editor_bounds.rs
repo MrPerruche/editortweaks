@@ -88,6 +88,16 @@ pub fn bounds() -> Option<[f32; 3]> {
     })
 }
 
+/// The bounds the game itself uses (before [`raise`]), in cm: half the box along each axis.
+/// `None` until the static settings were found. Game thread only.
+pub fn game_bounds() -> Option<[f32; 3]> {
+    let raised = RAISED.lock().unwrap_or_else(PoisonError::into_inner);
+    raised
+        .iter()
+        .find(|record| record.info.get().is_some())
+        .map(|record| record.game)
+}
+
 /// Has the game's brick snapping run with the game's bounds, unless it already does.
 fn guard_snapping() {
     if SNAPPING_SAFE.load(Ordering::Relaxed) {

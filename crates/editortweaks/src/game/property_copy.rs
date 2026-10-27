@@ -1,17 +1,44 @@
-//! Copying a reflected property's value from one object to another that has it: only for values
-//! that are plain data (numbers, enums, colors, names, plain structs), object references, which
-//! need no constructing, freeing or counting (Unreal's own `FProperty::CopyCompleteValue` copies
-//! these byte for byte), and bools, bit for bit.
+//! Copying a reflected property's value from one object to another that has it, of any type
+//! (numbers, bools, strings, texts, structs, arrays, ...): the property's own virtual functions
+//! compare and copy it, as Unreal's `FProperty::Identical_InContainer` and `CopyCompleteValue` do.
+//!
+//! UE 4.27 `FProperty` virtual function table slots (`brickrust::ue::fproperty::FPropertyVTable`,
+//! the same in BRMK 1.11.6's `FStrProperty` table, `??_7FStrProperty@@6B@`, see
+//! `docs/re/editor-operations.md`):
+//!
+//! - 17 `bool Identical(const void* A, const void* B, uint32 PortFlags) const`: one element.
+//! - 23 `void CopyValuesInternal(void* Dest, const void* Src, int32 Count) const`: `Count`
+//!   elements, constructing nothing (both hold values already); `CopyCompleteValue` calls it for
+//!   all but plain data, which it copies with `memcpy`.
+
+use core::ffi::c_void;
 
 use brickrust::ue::coreuobject::UObjectBase;
 use brickrust::ue::fname::FName;
 use brickrust::ue::fproperty::FProperty;
 use brickrust::ue::uclass::UStruct;
 
-use crate::game::reflection::{self, BoolField};
+use crate::game::reflection;
 
 /// `EPropertyFlags::CPF_IsPlainOldData`: the value can be copied with `memcpy`.
 const PLAIN_OLD_DATA: u64 = 0x4000_0000;
+
+/// The virtual function slots used (see the module documentation).
+const IDENTICAL_SLOT: usize = 17;
+const COPY_VALUES_SLOT: usize = 23;
+
+type IdenticalFn = unsafe extern "C" fn(
+    property: *const FProperty,
+    a: *const c_void,
+    b: *const c_void,
+    port_flags: u32,
+) -> bool;
+type CopyValuesFn = unsafe extern "C" fn(
+    property: *const FProperty,
+    dest: *mut c_void,
+    src: *const c_void,
+    count: i32,
+);
 
 /// One property of a class, to copy between objects having it.
 #[derive(Clone, Copy)]
@@ -20,20 +47,11 @@ pub struct CopiedProperty {
     pub name: FName,
     /// The class declaring it: the objects having it are of it.
     owner: *const UStruct,
-    value: Value,
-}
-
-/// Where an object holds a [`CopiedProperty`]'s value.
-#[derive(Clone, Copy)]
-enum Value {
-    /// `size` bytes at `offset`.
-    Bytes { offset: usize, size: usize },
-    /// A bool, maybe one bit of a byte shared with others.
-    Bool(BoolField),
+    property: *const FProperty,
 }
 
 impl CopiedProperty {
-    /// The property `name` of `class` (or its parents), if its values can be copied.
+    /// The property `name` of `class` (or its parents).
     ///
     /// # Safety
     /// `class` must be a live, linked class.
@@ -48,10 +66,11 @@ impl CopiedProperty {
         }
     }
 
-    /// `property`, a class' own, if its values can be copied.
+    /// `property`, a class' own.
     ///
     /// # Safety
-    /// `property` must be a live property record of a class.
+    /// `property` must be a live property record of a class, living as long as the game (those of
+    /// native classes do).
     pub unsafe fn of(property: *const FProperty) -> Result<Self, String> {
         // SAFETY: per the contract.
         unsafe {
@@ -60,23 +79,14 @@ impl CopiedProperty {
             if owner.is_null() || !reflection::is_class(owner) {
                 return Err(format!("{} isn't a class'", reflection::name_text(&name)));
             }
-            let value = if reflection::is_kind(property, "BoolProperty") {
-                Value::Bool(BoolField::of(property).ok_or_else(|| {
-                    format!("{} isn't a bool as expected", reflection::name_text(&name))
-                })?)
-            } else if (*property).property_flags & PLAIN_OLD_DATA != 0
-                || reflection::is_kind(property, "ObjectProperty")
-            {
-                let size = (*property).element_size * (*property).array_dim;
-                Value::Bytes {
-                    offset: (*property).offset_internal as usize,
-                    size: usize::try_from(size)
-                        .map_err(|_| format!("{} has no size", reflection::name_text(&name)))?,
-                }
-            } else {
-                return Err(format!("{} isn't plain data", reflection::name_text(&name)));
-            };
-            Ok(Self { name, owner, value })
+            if (*property).vtbl.is_null() || (*property).element_size <= 0 {
+                return Err(format!("{} isn't a property", reflection::name_text(&name)));
+            }
+            Ok(Self {
+                name,
+                owner,
+                property,
+            })
         }
     }
 
@@ -94,22 +104,25 @@ impl CopiedProperty {
         unsafe { reflection::is_a(object, self.owner) }
     }
 
-    /// Whether `from` and `to` hold different values.
+    /// Whether `from` and `to` hold different values (any element of a fixed size array).
     ///
     /// # Safety
     /// `from` and `to` must be live objects having the property. Game thread only.
     pub unsafe fn differs(&self, from: *const UObjectBase, to: *const UObjectBase) -> bool {
-        // SAFETY: per the contract, both objects hold the value where the property says.
+        // SAFETY: per the contract, both objects hold the value where the property says; slot 17
+        // is `Identical` (see the module documentation).
         unsafe {
-            match self.value {
-                Value::Bytes { offset, size } => {
-                    let bytes = |object: *const UObjectBase| {
-                        core::slice::from_raw_parts(object.cast::<u8>().add(offset), size)
-                    };
-                    bytes(from) != bytes(to)
-                }
-                Value::Bool(field) => field.get(from.cast()) != field.get(to.cast()),
-            }
+            let identical: IdenticalFn = core::mem::transmute(self.slot(IDENTICAL_SLOT));
+            let size = (*self.property).element_size as usize;
+            (0..(*self.property).array_dim.max(1) as usize).any(|index| {
+                let at = self.offset() + index * size;
+                !identical(
+                    self.property,
+                    from.cast::<u8>().add(at).cast(),
+                    to.cast::<u8>().add(at).cast(),
+                    0,
+                )
+            })
         }
     }
 
@@ -122,16 +135,35 @@ impl CopiedProperty {
             return;
         }
         // SAFETY: per the contract, both objects hold the value where the property says, and two
-        // objects don't overlap.
+        // objects don't overlap; slot 23 is `CopyValuesInternal` (see the module documentation).
         unsafe {
-            match self.value {
-                Value::Bytes { offset, size } => core::ptr::copy_nonoverlapping(
-                    from.cast::<u8>().add(offset),
-                    to.cast::<u8>().add(offset),
-                    size,
-                ),
-                Value::Bool(field) => field.set(to.cast(), field.get(from.cast())),
+            let (source, target) = (
+                from.cast::<u8>().add(self.offset()),
+                to.cast::<u8>().add(self.offset()),
+            );
+            let count = (*self.property).array_dim.max(1);
+            if (*self.property).property_flags & PLAIN_OLD_DATA != 0 {
+                let size = (*self.property).element_size as usize * count as usize;
+                core::ptr::copy_nonoverlapping(source, target, size);
+            } else {
+                let copy_values: CopyValuesFn = core::mem::transmute(self.slot(COPY_VALUES_SLOT));
+                copy_values(self.property, target.cast(), source.cast(), count);
             }
         }
+    }
+
+    /// Where objects hold the value.
+    fn offset(&self) -> usize {
+        // SAFETY: the record lives as long as the game (see `of`).
+        unsafe { (*self.property).offset_internal as usize }
+    }
+
+    /// The property's virtual function in `slot`.
+    ///
+    /// # Safety
+    /// `slot` must be one of its table.
+    unsafe fn slot(&self, slot: usize) -> *const c_void {
+        // SAFETY: per the contract; the record and its table live as long as the game.
+        unsafe { *(*self.property).vtbl.cast::<*const c_void>().add(slot) }
     }
 }

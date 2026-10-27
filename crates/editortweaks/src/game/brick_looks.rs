@@ -10,8 +10,14 @@
 //!   `PaintMetallicAlpha`, and the textures the game's material blends with them
 //!   (`DiffuseTexture`, `NormalTexture`, `MRAOTexture`, `EmissiveTexture`, `UTexture2D*`s, null
 //!   when unused).
+//! - Patterns ([`BrickPatterns`]): `UBrick::BrickPattern` (a `UBrickPattern` class, e.g.
+//!   `/Game/BrickRigs/Bricks/Patterns/C_Army`; null without one), whose default object holds
+//!   `Texture` (`UTexture2D*`) and `Tiling` (cm per repeat); the brick's `PatternOffset` and
+//!   `PatternScale` (`FVector2D`s) and `PatternRotation` (degrees). `UBrick::UpdatePrimitiveData`
+//!   hands the material the offset, `1 / PatternScale` and the rotation in radians.
 
 use brickrust::ue::coreuobject::UObjectBase;
+use brickrust::ue::uclass::UClass;
 
 use crate::game::reflection;
 
@@ -141,6 +147,93 @@ impl BrickLooks {
                 };
             }
             looks
+        }
+    }
+}
+
+/// A brick's pattern, as the brick material draws it over the colour.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Pattern {
+    /// Its class's name, e.g. `"C_Army_C"`.
+    pub name: String,
+    /// A live texture.
+    pub texture: *mut UObjectBase,
+    /// The pattern's `Tiling`: cm per repeat.
+    pub tiling: f32,
+    /// The brick's `PatternOffset`, in repeats.
+    pub offset: [f32; 2],
+    /// The brick's `PatternScale`.
+    pub scale: [f32; 2],
+    /// The brick's `PatternRotation`, in degrees.
+    pub rotation: f32,
+}
+
+/// Reads bricks' patterns (after engine init).
+pub struct BrickPatterns {
+    /// `UBrickPattern`, to check the pattern classes' default objects against.
+    class: *const UClass,
+    /// Offsets of `UBrick`'s `BrickPattern`, `PatternOffset`, `PatternScale`, `PatternRotation`.
+    pattern: usize,
+    offset: usize,
+    scale: usize,
+    rotation: usize,
+    /// Offsets of `UBrickPattern`'s `Texture` and `Tiling`.
+    texture: usize,
+    tiling: usize,
+}
+
+// SAFETY: class records live as long as the game; only used on the game thread.
+unsafe impl Send for BrickPatterns {}
+// SAFETY: as above.
+unsafe impl Sync for BrickPatterns {}
+
+impl BrickPatterns {
+    pub fn find() -> Result<Self, String> {
+        let class = |name| reflection::find_class(name).ok_or(format!("class {name} not found"));
+        let brick = class("Brick")?;
+        let pattern = class("BrickPattern")?;
+        Ok(Self {
+            class: pattern,
+            pattern: reflection::field_offset(brick, "BrickPattern", "ClassProperty", 8)?,
+            offset: reflection::field_offset(brick, "PatternOffset", "StructProperty", 8)?,
+            scale: reflection::field_offset(brick, "PatternScale", "StructProperty", 8)?,
+            rotation: reflection::field_offset(brick, "PatternRotation", "FloatProperty", 4)?,
+            texture: reflection::field_offset(pattern, "Texture", "ObjectProperty", 8)?,
+            tiling: reflection::field_offset(pattern, "Tiling", "FloatProperty", 4)?,
+        })
+    }
+
+    /// The pattern of `brick`, `None` if it has none (or one without a texture).
+    ///
+    /// # Safety
+    /// `brick` must be a live brick (a `UBrick`). Game thread only.
+    pub unsafe fn of(&self, brick: *mut UObjectBase) -> Option<Pattern> {
+        // SAFETY: per the contract; the offsets come from reflection, the brick's pattern class is
+        // null or a live class (bricks hold theirs), and its default object is checked to be a
+        // `UBrickPattern` before its fields are read.
+        unsafe {
+            let base = brick.cast::<u8>();
+            let class = base.add(self.pattern).cast::<*const UClass>().read();
+            if class.is_null() {
+                return None;
+            }
+            let defaults = reflection::default_object(class)?;
+            if !reflection::is_a(defaults, self.class.cast()) {
+                return None;
+            }
+            let fields = defaults.cast::<u8>();
+            let texture = fields.add(self.texture).cast::<*mut UObjectBase>().read();
+            if texture.is_null() {
+                return None;
+            }
+            Some(Pattern {
+                name: reflection::name_text(reflection::struct_name(class.cast())),
+                texture,
+                tiling: fields.add(self.tiling).cast::<f32>().read(),
+                offset: base.add(self.offset).cast::<[f32; 2]>().read(),
+                scale: base.add(self.scale).cast::<[f32; 2]>().read(),
+                rotation: base.add(self.rotation).cast::<f32>().read(),
+            })
         }
     }
 }

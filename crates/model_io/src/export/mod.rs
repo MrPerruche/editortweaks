@@ -205,6 +205,22 @@ pub fn vertex_normals(part: &Part) -> Vec<[f32; 3]> {
 /// (`MF_CheapTriplanarProjection`: X wins ties, then Y), times `tiling` (textures per cm). The game
 /// picks the axis per pixel: a triangle whose corners pick different ones is smeared here.
 pub fn box_uvs(part: &mut Part, tiling: f32) {
+    projected_uvs(part, |uv| uv.map(|value| value * tiling));
+}
+
+/// Gives `part` the UVs the game's brick materials draw a brick's pattern with: the projection
+/// [`box_uvs`] makes, times `scale` (patterns per cm, per axis), moved by `offset`, then turned
+/// counter-clockwise by `rotation` radians around the UVs' origin (`MF_RotateVector2D`).
+pub fn pattern_uvs(part: &mut Part, scale: [f32; 2], offset: [f32; 2], rotation: f32) {
+    let (sin, cos) = rotation.sin_cos();
+    projected_uvs(part, |[u, v]| {
+        let [x, y] = [u * scale[0] + offset[0], v * scale[1] + offset[1]];
+        [x * cos - y * sin, x * sin + y * cos]
+    });
+}
+
+/// Gives `part` the box projection [`box_uvs`] describes, in cm, made UVs by `place`.
+fn projected_uvs(part: &mut Part, place: impl Fn([f32; 2]) -> [f32; 2]) {
     const TOLERANCE: f32 = 0.01;
     let normals = vertex_normals(part);
     part.uvs = part
@@ -220,7 +236,7 @@ pub fn box_uvs(part: &mut Part, tiling: f32) {
             } else {
                 [x, y]
             };
-            uv.map(|value| value * tiling)
+            place(uv)
         })
         .collect();
 }
@@ -334,6 +350,23 @@ mod tests {
         let before = part.corners.clone();
         face_outward(&mut part);
         assert_eq!(part.corners, before);
+    }
+
+    #[test]
+    fn pattern_uvs_scale_move_then_turn() {
+        let mut part = box_part([0.0; 3], [100.0, 200.0, 300.0]);
+        let mut boxed = part.clone();
+        box_uvs(&mut boxed, 1.0);
+        let quarter = core::f32::consts::FRAC_PI_2;
+        pattern_uvs(&mut part, [0.5, 0.25], [1.0, 2.0], quarter);
+        for (uv, [u, v]) in part.uvs.iter().zip(&boxed.uvs) {
+            // Scaled and moved: (u / 2 + 1, v / 4 + 2); a quarter turn takes (x, y) to (-y, x).
+            let expected = [-(v * 0.25 + 2.0), u * 0.5 + 1.0];
+            assert!(
+                (uv[0] - expected[0]).abs() < 1e-3 && (uv[1] - expected[1]).abs() < 1e-3,
+                "{uv:?} {expected:?}"
+            );
+        }
     }
 
     #[test]

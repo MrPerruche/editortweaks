@@ -81,7 +81,7 @@
 //! the engine holds the cursor still ([`Drag::point`]). The middle button's camera pivot
 //! (`Action_PivotCamera`) is taken while the resize key is held or a drag goes on: it would hide the
 //! cursor and hold it still, and the button may be one of the keys above (e.g. the model key, or
-//! `copy_properties`' keys, which copy the brick [`hovered_brick`] tells). Each change writes
+//! `copy_properties`' keys, which copy the brick [`nearest_hovered_brick`] tells). Each change writes
 //! `BrickSize` and tells the
 //! brick like the editor's panel does (`game::scalable_brick::BrickSizes`), then moves the brick
 //! like a committed move (`game::editor_object::SpawnTransforms`); the last one runs as an editor
@@ -319,15 +319,16 @@ fn on_button(press: &Press) -> bool {
     }
 }
 
-/// The brick fast editing points at now (its box or model shows), unless something is dragged.
-/// Game thread only.
-pub fn hovered_brick() -> Option<*mut UObjectBase> {
+/// The brick nearest along the mouse's ray while fast editing points at one, selected or not (the
+/// one it points at may be a selected brick behind it), unless something is dragged. Game thread
+/// only.
+pub fn nearest_hovered_brick() -> Option<*mut UObjectBase> {
     let state = STATE.lock().unwrap_or_else(PoisonError::into_inner);
     if state.drag.is_some() {
         return None;
     }
     let (scene, hover) = (state.scene.as_ref()?, state.hover.as_ref()?);
-    scene.get(hover.index).object.get_live()
+    scene.get(hover.nearest).object.get_live()
 }
 
 /// Whether fast editing drags something now (a resize, a move, a spinner's handle). Game thread
@@ -368,6 +369,8 @@ fn take_movement(movement: &Movement) -> Handling {
 struct Hover {
     /// The brick (see [`Scene::get`]).
     index: usize,
+    /// The brick nearest along the ray, selected or not: `index` puts selected bricks first.
+    nearest: usize,
     piece: Piece,
     /// Whether dragging it does anything: resizes the brick (see [`Self::grip`]), or moves the
     /// bricks being moved.
@@ -756,17 +759,28 @@ impl State {
         };
         let moving = matches!(self.gathered, Some(Gathered::Moving { .. }));
         let vehicle = scene.vehicle;
+        let pick = |preferred: &dyn Fn(&Placed) -> bool| {
+            // SAFETY: per the contract.
+            scene.pick(
+                view,
+                self.on_models,
+                |placed| moving && !placed.moving,
+                preferred,
+                0,
+                |point| unsafe { project(game, editor, &vehicle, point) },
+            )
+        };
         // SAFETY: per the contract.
-        let pointed = scene.pick(
-            view,
-            self.on_models,
-            |placed| moving && !placed.moving,
-            |placed| unsafe { is_selected(game, placed) },
-            0,
-            |point| unsafe { project(game, editor, &vehicle, point) },
-        );
+        let selected = |placed: &Placed| unsafe { is_selected(game, placed) };
+        let pointed = pick(&selected);
         self.hover = pointed.map(|pointed| {
             let placed = scene.get(pointed.index);
+            // Picked again without preferring selected bricks only if a selected one came first.
+            let nearest = if selected(placed) {
+                pick(&|_| false).map_or(pointed.index, |nearest| nearest.index)
+            } else {
+                pointed.index
+            };
             let grip = (placed.scalable && !moving)
                 .then(|| Grip::of(pointed.piece, &placed.bounds, placed.model.as_ref()))
                 .flatten();
@@ -775,6 +789,7 @@ impl State {
                 .flatten();
             Hover {
                 index: pointed.index,
+                nearest,
                 piece: pointed.piece,
                 grabbable: moving
                     || grip.is_some()

@@ -1,6 +1,7 @@
 //! Copying a brick's properties while fast editing: with [`keybinds::RESIZE_BRICKS`] held, a click
-//! on a brick (the one fast editing points at, `brick_resize::hovered_brick`) gives the selected
-//! bricks its properties, as one step to undo:
+//! on a brick (the nearest under the mouse, `brick_resize::nearest_hovered_brick`: fast editing
+//! itself points at selected bricks behind others first) gives the selected bricks its properties,
+//! as one step to undo:
 //!
 //! - [`keybinds::COPY_LOOKS`] (the middle mouse button by default): its looks, the color, material,
 //!   pattern and the pattern's scale, rotation and offset ([`LOOKS`]).
@@ -229,7 +230,7 @@ impl State<'_> {
     /// # Safety
     /// Game thread only.
     unsafe fn press(&self, mouse: Option<[f32; 2]>) -> Key {
-        // SAFETY: per the contract; `hovered_brick` returns a live object.
+        // SAFETY: per the contract; `nearest_hovered_brick` returns a live object.
         unsafe {
             if !keybinds::RESIZE_BRICKS.is_held() || !self.can_click() {
                 return Key::Ignored;
@@ -239,7 +240,7 @@ impl State<'_> {
             } else {
                 Copied::Looks
             };
-            match (mouse, brick_resize::hovered_brick()) {
+            match (mouse, brick_resize::nearest_hovered_brick()) {
                 (Some(at), Some(brick)) if self.game.properties.is_brick(brick) => Key::Down {
                     brick: WeakObject::new(brick),
                     copied,
@@ -356,8 +357,8 @@ impl State<'_> {
 
     /// The brick properties of `brick` that can be copied: those its native classes from `UBrick`
     /// on declare editable and saved (see [`EDIT`]), but [`NOT_BRICK_PROPERTIES`]. They're those
-    /// the panel lists (checked against BRMK 1.11.6's brick classes), but for texts (seat names,
-    /// ...), which aren't plain data. Logs what it leaves out.
+    /// the panel lists (checked against BRMK 1.11.6's brick classes), of any type (texts like
+    /// seat names included). Logs what it leaves out.
     ///
     /// # Safety
     /// `brick` must be a live brick. Game thread only.
@@ -385,13 +386,13 @@ impl State<'_> {
                 }
                 match CopiedProperty::of(property) {
                     Ok(property) => copied.push(property),
-                    Err(_) => left_out.push(reflection::name_text(name)),
+                    Err(reason) => left_out.push(reason),
                 }
             }
         }
         if !left_out.is_empty() {
             log!(
-                "{} brick properties copied; not {} (not plain data)",
+                "{} brick properties copied; not: {}",
                 copied.len(),
                 left_out.join(", ")
             );
