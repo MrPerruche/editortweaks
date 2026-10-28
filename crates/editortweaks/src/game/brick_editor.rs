@@ -114,6 +114,19 @@ pub const MOVED: u32 = 0x1 | 0x4 | 0x10;
 /// one, game 0xEB43D0: `1 << 5`, or `1 << 6` for `FObjectOrderBrickProperty`).
 pub const PROPERTY_CHANGED: u32 = 0x20;
 
+/// An operation's bit that makes `PostModify` take no undo step for it (and so its snapshot is
+/// dropped), as undo and redo do themselves: `test byte [op+0x14], 1` (game 0xCF3CA2,
+/// `docs/re/coop/change-hooks.md`, section 5).
+/// Only coop uses it.
+#[cfg(feature = "coop")]
+pub const NO_UNDO_STEP: u8 = 1;
+
+/// An operation's bit that keeps `PostModify` from marking the vehicle modified (`test byte
+/// [op+0x14], 2` at game 0xCF39DC). Loading a whole vehicle sets it (game 0xCEF44F, see
+/// `game::vehicle_changes::keeping_selection`). Only coop uses it.
+#[cfg(feature = "coop")]
+pub const UNMODIFIED: u8 = 2;
+
 type PostModifyFn = unsafe extern "C" fn(editor: *mut UObjectBase, operation: *const Operation);
 
 /// `PostModify` as hooked (or why not), see [`BrickEditor::after_modify`].
@@ -204,6 +217,21 @@ impl BrickEditor {
     /// # Safety
     /// `editor` must be a live `ABrickEditor`. Game thread only.
     pub unsafe fn operation(&self, editor: *mut UObjectBase, flags: u32, change: impl FnOnce()) {
+        // SAFETY: per the contract.
+        unsafe { self.operation_with(editor, flags, 0, change) }
+    }
+
+    /// [`Self::operation`] with `bits` (e.g. [`NO_UNDO_STEP`]) set on the outermost operation.
+    ///
+    /// # Safety
+    /// As for [`Self::operation`].
+    pub unsafe fn operation_with(
+        &self,
+        editor: *mut UObjectBase,
+        flags: u32,
+        bits: u8,
+        change: impl FnOnce(),
+    ) {
         let mut operation = Operation {
             editor,
             outermost: core::ptr::null_mut(),
@@ -224,12 +252,33 @@ impl BrickEditor {
             }
             (*this).outermost = open.read();
             (*(*this).outermost).flags |= flags;
+            (*(*this).outermost).bits |= bits;
             change();
             if open.read() == this {
                 open.write(core::ptr::null_mut());
                 let vtable = (*editor).vtable.cast::<u8>();
                 let post_modify = vtable.add(self.post_modify).cast::<PostModifyFn>().read();
                 post_modify(editor, this);
+            }
+        }
+    }
+
+    /// Clears `bits` (e.g. [`UNMODIFIED`]) of `editor`'s open operation, if one is open.
+    ///
+    /// # Safety
+    /// As for [`Self::operation`].
+    #[cfg(feature = "coop")]
+    pub unsafe fn clear_open_bits(&self, editor: *mut UObjectBase, bits: u8) {
+        // SAFETY: per the contract; the open operation is the outermost one, live on the stack of
+        // whoever opened it until `PostModify` (see `operation_with`).
+        unsafe {
+            let open = editor
+                .cast::<u8>()
+                .add(self.open_operation)
+                .cast::<*mut Operation>()
+                .read();
+            if !open.is_null() {
+                (*open).bits &= !bits;
             }
         }
     }

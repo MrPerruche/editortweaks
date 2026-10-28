@@ -50,6 +50,58 @@ pub unsafe fn game_pointer(object: *mut UObjectBase) -> Option<FWeakObjectPtr> {
     }
 }
 
+/// `int32 FUObjectArray::AllocateSerialNumber(int32 Index)` (game 1.11.7 RVA 0x135CF00; BRMK
+/// 1.11.6 exports it from CoreUObject): the object's serial number, given now if it has none, as
+/// `FWeakObjectPtr::operator=(const UObject*)` (game 0x137FD40, its only caller) does before
+/// storing it. Found by its fatal message.
+#[cfg(feature = "coop")]
+const ALLOCATE_SERIAL: crate::framework::sig::StringRefSig = crate::framework::sig::StringRefSig {
+    name: "FUObjectArray::AllocateSerialNumber",
+    text: "UObject serial numbers overflowed (trying to allocate serial number %d).",
+};
+
+#[cfg(feature = "coop")]
+type AllocateSerialFn =
+    unsafe extern "C" fn(array: *mut brickrust::ue::coreuobject::FUObjectArray, index: i32) -> i32;
+
+/// A game `FWeakObjectPtr` to `object`, giving it a serial number if it has none yet, as the
+/// game's own weak pointers do (see [`ALLOCATE_SERIAL`]); otherwise why not.
+///
+/// # Safety
+/// `object` must be a live object. Game thread only.
+#[cfg(feature = "coop")]
+pub unsafe fn new_game_pointer(object: *mut UObjectBase) -> Result<FWeakObjectPtr, String> {
+    use std::sync::OnceLock;
+    static ALLOCATE: OnceLock<Result<usize, String>> = OnceLock::new();
+    // SAFETY: per the contract.
+    if let Some(pointer) = unsafe { game_pointer(object) } {
+        return Ok(pointer);
+    }
+    let allocate = ALLOCATE
+        .get_or_init(|| ALLOCATE_SERIAL.resolve().map(|function| function as usize))
+        .clone()?;
+    // SAFETY: per the contract, the object's index is a slot of the object array (checked again
+    // below), which `GObjects` is; the function was found by its own message.
+    unsafe {
+        let index = (*object).internal_index;
+        let array = GObjects();
+        if !(0..array.array.Count()).contains(&index)
+            || (*array.array.Get(index)).object.cast() != object
+        {
+            return Err("an object outside the object array".into());
+        }
+        let allocate: AllocateSerialFn = core::mem::transmute(allocate);
+        let serial = allocate(array, index);
+        if serial == 0 {
+            return Err("no serial number given".into());
+        }
+        Ok(FWeakObjectPtr {
+            object_index: index,
+            object_serial_number: serial,
+        })
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct WeakObject {
     object: *mut UObjectBase,
@@ -65,6 +117,13 @@ impl WeakObject {
             // SAFETY: per the contract.
             index: unsafe { (*object).internal_index },
         }
+    }
+
+    /// `object`, last seen at slot `index` of the object array (its `internal_index`), alive or
+    /// not: nothing is read.
+    #[cfg(feature = "coop")]
+    pub fn at(object: *mut UObjectBase, index: i32) -> Self {
+        Self { object, index }
     }
 
     /// The object, unless it was destroyed since. Game thread only.

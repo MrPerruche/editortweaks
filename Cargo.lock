@@ -73,6 +73,13 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4e7648175b45a9a48536d676f68d918270699102aa8dab5496df06904c914600"
 
 [[package]]
+name = "coop"
+version = "0.1.0"
+dependencies = [
+ "miniz_oxide 0.8.9",
+]
+
+[[package]]
 name = "crc32fast"
 version = "1.5.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -87,6 +94,7 @@ version = "0.1.0"
 dependencies = [
  "brickrust",
  "brickworks",
+ "coop",
  "model_io",
  "windows-sys",
 ]

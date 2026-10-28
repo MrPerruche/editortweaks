@@ -13,6 +13,9 @@ mod camera_speed;
 mod click_swap;
 mod compact_panel;
 mod connector_markers;
+/// Coop building, only in builds with the `coop` cargo feature.
+#[cfg(feature = "coop")]
+mod coop;
 mod copy_properties;
 mod drag_select;
 mod editor_bounds;
@@ -85,6 +88,8 @@ pub static ALL: &[&dyn Feature] = &[
     &settings_menu::SettingsMenu,
     &model_export::ModelExport,
     &editor_menu::EditorMenu,
+    #[cfg(feature = "coop")]
+    &coop::Coop,
 ];
 
 /// Every feature's settings, by section of the menu, in the menu's order (see `settings_menu`).
@@ -94,6 +99,8 @@ pub static SETTINGS: &[&[Section]] = &[
     &references::SETTINGS,
     &model_export::SETTINGS,
     &PREVIEWS,
+    #[cfg(feature = "coop")]
+    &coop::SETTINGS,
 ];
 
 /// The settings of the editor itself: which buttons select, the camera's pitch, what a box picks,

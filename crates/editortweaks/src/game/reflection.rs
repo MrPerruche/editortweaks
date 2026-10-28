@@ -293,6 +293,15 @@ impl BoolField {
         })
     }
 
+    /// The same field in a struct `by` bytes into another (where the struct is a field).
+    #[cfg(feature = "coop")]
+    pub fn shifted(self, by: usize) -> Self {
+        Self {
+            offset: self.offset + by,
+            ..self
+        }
+    }
+
     /// The field's value in the struct at `base`.
     ///
     /// # Safety

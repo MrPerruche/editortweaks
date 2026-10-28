@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import os
 import shutil
 import subprocess
 import sys
@@ -51,7 +52,7 @@ def cmd_setup(args: argparse.Namespace) -> None:
 
 
 def cmd_build(args: argparse.Namespace) -> None:
-    toolchain.cargo("build", *([] if args.debug else ["--release"]))
+    toolchain.cargo("build", *([] if args.debug else ["--release"]), *(["--features", "coop"] if args.coop else []))
     print(f"Built {paths.build_output(profile_of(args))}")
 
 
@@ -117,7 +118,8 @@ def cmd_status(args: argparse.Namespace) -> None:
 
 
 def cmd_log(args: argparse.Namespace) -> None:
-    log = paths.find_game().log
+    game = paths.find_game()
+    log = game.coop_log(args.coop) if args.coop else game.log
     if not log.exists():
         raise SystemExit(f"{log} doesn't exist yet (it's created when the game starts).")
     with open(log, encoding="utf-8", errors="replace") as f:
@@ -130,6 +132,22 @@ def cmd_log(args: argparse.Namespace) -> None:
                 print(line, end="", flush=True)
             else:
                 time.sleep(0.25)
+
+
+def cmd_second(args: argparse.Namespace) -> None:
+    """Starts another game instance beside the running one (coop's local test, `testing.md`).
+
+    Steam refuses a second launch from the library, so this starts the game's launcher directly, with
+    the app id Steam would pass (without it the game can't reach Steam). Both instances share the
+    Steam account, `brickworks.txt` and `EditorTweaks.ini`.
+    """
+    game = paths.find_game()
+    if not game_running():
+        print("The game isn't running: start it from Steam first, then run this for the second one.")
+    env = dict(os.environ, SteamAppId=paths.BRICK_RIGS_APP_ID, SteamGameId=paths.BRICK_RIGS_APP_ID)
+    flags = subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP
+    subprocess.Popen([str(game.launcher)], cwd=game.root, env=env, creationflags=flags, close_fds=True)
+    print(f"Started {game.launcher.name}. Coop logs: et.py log --coop host / --coop member")
 
 
 def cmd_crashes(args: argparse.Namespace) -> None:
@@ -305,11 +323,13 @@ def main() -> None:
 
     p = sub.add_parser("build", help="build the mod DLL")
     p.add_argument("--debug", action="store_true", help="debug profile instead of release")
+    p.add_argument("--coop", action="store_true", help="with coop building (work in progress, off in releases)")
     p.set_defaults(func=cmd_build)
 
     p = sub.add_parser("install", help="build and copy the DLL into <game>/brickworks/")
     p.add_argument("--debug", action="store_true", help="install the debug build")
     p.add_argument("--no-build", action="store_true", help="install the existing build as-is")
+    p.add_argument("--coop", action="store_true", help="build with coop building (work in progress)")
     p.set_defaults(func=cmd_install)
 
     sub.add_parser("uninstall", help="remove the DLL from the game").set_defaults(func=cmd_uninstall)
@@ -318,7 +338,11 @@ def main() -> None:
     p = sub.add_parser("log", help="print brickworks.txt (the loader + mod log)")
     p.add_argument("-n", "--lines", type=int, default=0, help="only the last N lines")
     p.add_argument("-f", "--follow", action="store_true", help="keep printing new lines")
+    p.add_argument("--coop", choices=["host", "member"],
+                   help="that instance's coop log instead (coop builds, local test)")
     p.set_defaults(func=cmd_log)
+
+    sub.add_parser("second", help="start a second game instance (coop's local test)").set_defaults(func=cmd_second)
 
     p = sub.add_parser("crashes", help="summarize recent game crash reports")
     p.add_argument("-n", "--count", type=int, default=3)

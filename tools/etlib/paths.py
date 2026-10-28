@@ -56,6 +56,15 @@ class Game:
         """Loader log, rewritten on every launch."""
         return self.root / "brickworks.txt"
 
+    def coop_log(self, role: str) -> Path:
+        """Coop's own log of the instance in `role` ("host" or "member"), coop builds only."""
+        return self.root / f"editortweaks-coop-{role}.txt"
+
+    @property
+    def launcher(self) -> Path:
+        """What Steam starts: it starts the exe in `win64`."""
+        return self.root / "BrickRigs.exe"
+
     @property
     def blueprint_mods(self) -> Path:
         return self.root / "BrickRigs" / "Mods"

@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/editortweaks", "crates/model_io"]
+members = ["crates/coop", "crates/editortweaks", "crates/model_io"]
 # Vendored upstream code: used as path dependencies, but not formatted/linted as our own.
 exclude = ["third_party"]
 

@@ -226,6 +226,22 @@ pub static EXPORT_MODEL: Keybind = Keybind::menu(
     "/Game/BrickRigs/UI/Textures/Icons/T_SaveFileAs.T_SaveFileAs",
 );
 
+/// Coop builds only: makes this member's vehicle differ from the coop session's on purpose, to test
+/// that it's noticed and mended (`coop`'s `drift`).
+#[cfg(feature = "coop")]
+pub static COOP_DRIFT: Keybind = Keybind::new(
+    "EditorTweaks_CoopDrift",
+    "Coop test: drift on purpose",
+    "Coop test builds only. Press in the second game of the local coop test to make its vehicle differ from the first's without telling it (moves, regroups, reorders or deletes a brick, in turn): within seconds it should notice and fix it.",
+    &["Ctrl+F8"],
+);
+
+/// The Tools section's keybinds (with the coop test's, in coop builds).
+#[cfg(feature = "coop")]
+const TOOLS: &[&Keybind] = &[&EXPORT_MODEL, &COOP_DRIFT];
+#[cfg(not(feature = "coop"))]
+const TOOLS: &[&Keybind] = &[&EXPORT_MODEL];
+
 /// Every keybind, by section, in the order the settings list them. The sections are the
 /// changelog's headers (those having keys).
 static SECTIONS: [Section; 6] = [
@@ -267,7 +283,7 @@ static SECTIONS: [Section; 6] = [
     Section {
         name: "IC_EditorTweaks_Tools",
         title: "Tools",
-        keybinds: &[&EXPORT_MODEL],
+        keybinds: TOOLS,
     },
 ];
 

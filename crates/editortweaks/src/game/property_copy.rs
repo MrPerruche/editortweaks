@@ -40,6 +40,35 @@ type CopyValuesFn = unsafe extern "C" fn(
     count: i32,
 );
 
+/// Copies `count` elements of `property`'s type from `source` to `target`, as `CopyCompleteValue`
+/// does: `memcpy` for plain data, otherwise the property's own `CopyValuesInternal` (allocating
+/// what `target` needs with the game's allocator, only reading `source`).
+///
+/// # Safety
+/// `property` must be a live property record; `source` and `target` must each hold `count` valid
+/// values of its type, and not overlap. Game thread only.
+pub unsafe fn copy_values(
+    property: *const FProperty,
+    target: *mut u8,
+    source: *const u8,
+    count: i32,
+) {
+    // SAFETY: per the contract; slot 23 is `CopyValuesInternal` (see the module documentation).
+    unsafe {
+        if (*property).property_flags & PLAIN_OLD_DATA != 0 {
+            let size = (*property).element_size as usize * count as usize;
+            core::ptr::copy_nonoverlapping(source, target, size);
+        } else {
+            let slot = *(*property)
+                .vtbl
+                .cast::<*const c_void>()
+                .add(COPY_VALUES_SLOT);
+            let copy_values: CopyValuesFn = core::mem::transmute(slot);
+            copy_values(property, target.cast(), source.cast(), count);
+        }
+    }
+}
+
 /// One property of a class, to copy between objects having it.
 #[derive(Clone, Copy)]
 pub struct CopiedProperty {
@@ -142,13 +171,7 @@ impl CopiedProperty {
                 to.cast::<u8>().add(self.offset()),
             );
             let count = (*self.property).array_dim.max(1);
-            if (*self.property).property_flags & PLAIN_OLD_DATA != 0 {
-                let size = (*self.property).element_size as usize * count as usize;
-                core::ptr::copy_nonoverlapping(source, target, size);
-            } else {
-                let copy_values: CopyValuesFn = core::mem::transmute(self.slot(COPY_VALUES_SLOT));
-                copy_values(self.property, target.cast(), source.cast(), count);
-            }
+            copy_values(self.property, target, source, count);
         }
     }
 

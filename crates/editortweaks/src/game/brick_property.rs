@@ -9,6 +9,7 @@ use core::ffi::c_void;
 
 use brickrust::ue::coreuobject::UObjectBase;
 use brickrust::ue::fname::FName;
+use brickrust::ue::fproperty::FProperty;
 use brickrust::ue::tarray::TArray;
 use brickrust::ue::tshared::FWeakObjectPtr;
 use brickrust::ue::uclass::UStruct;
@@ -76,6 +77,42 @@ pub unsafe fn post_modify(interface: *mut c_void, event: &mut ChangedEvent) {
         let vtable = *interface.cast::<*const usize>();
         let post: PostModifyFn = core::mem::transmute(*vtable.add(POST_MODIFY_SLOT));
         post(interface, event);
+    }
+}
+
+/// `EPropertyFlags`: `CPF_Edit` marks the properties the panel may list (bricks' are all
+/// `EditDefaultsOnly` in C++: this and `CPF_DisableEditOnInstance`), `CPF_EditConst` the read-only
+/// ones and `CPF_Transient` state the game doesn't save. Read from BRMK 1.11.6's generated property
+/// records, see `docs/re/editor-operations.md`.
+const EDIT: u64 = 0x1;
+const EDIT_CONST: u64 = 0x2_0000;
+const TRANSIENT: u64 = 0x2000;
+
+/// Editable properties of brick classes that aren't brick properties: they're the same for every
+/// brick of a class. `bEnableBlueprintEvents`: whether a brick Blueprint's events run.
+const NOT_BRICK_PROPERTIES: [&str; 1] = ["bEnableBlueprintEvents"];
+
+/// Whether `property`, of a brick's class, is a brick property: declared editable and saved
+/// ([`EDIT`]) by a native class from `brick` (`UBrick`) on, but [`NOT_BRICK_PROPERTIES`]. They're
+/// those the panel lists (checked against BRMK 1.11.6's brick classes), of any type.
+///
+/// # Safety
+/// `property` must be a live property record, and `brick` the class `Brick`.
+pub unsafe fn is_brick_property(property: *const FProperty, brick: *const UStruct) -> bool {
+    // SAFETY: per the contract; a property's owner lives as long as it does.
+    unsafe {
+        let flags = (*property).property_flags;
+        let owner = reflection::declaring_struct(property);
+        let name = &(*property).field.name_private;
+        let brick_class = !owner.is_null()
+            && reflection::is_native_class(owner)
+            && reflection::with_parents(owner).any(|parent| parent == brick);
+        brick_class
+            && flags & EDIT != 0
+            && flags & (EDIT_CONST | TRANSIENT) == 0
+            && !NOT_BRICK_PROPERTIES
+                .iter()
+                .any(|excluded| reflection::name_is(name, excluded))
     }
 }
 

@@ -10,6 +10,8 @@ pub mod assets;
 pub mod axle;
 pub mod brick_connections;
 pub mod brick_editor;
+#[cfg(feature = "coop")]
+pub mod brick_groups;
 pub mod brick_looks;
 pub mod brick_materials;
 pub mod brick_model;
@@ -40,6 +42,8 @@ pub mod guns;
 pub mod hidden_actors;
 pub mod hidden_components;
 pub mod input_help;
+#[cfg(feature = "coop")]
+pub mod input_sources;
 pub mod input_table;
 pub mod kismet;
 pub mod lift_surface;
@@ -53,12 +57,16 @@ pub mod move_mode;
 pub mod net_mode;
 pub mod new_brick_properties;
 pub mod numeric_property;
+#[cfg(feature = "coop")]
+pub mod object_order;
 pub mod outline;
 pub mod penetration;
 pub mod player_input;
 pub mod procedural_mesh;
 pub mod property_copy;
 pub mod property_reflection;
+#[cfg(feature = "coop")]
+pub mod property_values;
 pub mod property_widget;
 pub mod reflection;
 pub mod rotation_limits;
@@ -70,6 +78,8 @@ pub mod slider_drag;
 pub mod slider_text;
 pub mod spinner;
 pub mod spinner_profiles;
+#[cfg(feature = "coop")]
+pub mod steam;
 pub mod text;
 pub mod text_render;
 pub mod texture_readback;
@@ -79,7 +89,13 @@ pub mod tooltip_widget;
 pub mod tyres;
 pub mod ui_library;
 pub mod ui_style;
+#[cfg(feature = "coop")]
+pub mod undo_redo;
+#[cfg(feature = "coop")]
+pub mod vehicle_archive;
 pub mod vehicle_box;
+#[cfg(feature = "coop")]
+pub mod vehicle_changes;
 pub mod vehicle_spawn;
 pub mod view_canvas;
 pub mod view_mode;

@@ -10,8 +10,14 @@ publish.workspace = true
 # Loaded by the brickworks loader via LoadLibrary; it only needs the C exports `mod_info`/`mod_init`.
 crate-type = ["cdylib"]
 
+[features]
+# Coop building, work in progress (`docs/re/coop/`): off by default, so release builds contain
+# none of it. `et.py build --coop` / `install --coop` turn it on.
+coop = ["dep:coop"]
+
 [dependencies]
 brickrust.workspace = true
 brickworks.workspace = true
 model_io = { path = "../model_io" }
+coop = { path = "../coop", optional = true }
 windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_System_Diagnostics_Debug", "Win32_System_LibraryLoader", "Win32_System_Memory", "Win32_System_Threading", "Win32_UI_Controls_Dialogs", "Win32_UI_Input_KeyboardAndMouse", "Win32_UI_WindowsAndMessaging"] }

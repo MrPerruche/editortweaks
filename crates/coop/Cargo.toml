@@ -1,0 +1,14 @@
+[package]
+name = "coop"
+description = "Coop building: wire protocol and session logic (no game code)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+# Pure Rust and free of game code, so `cargo test -p coop` runs anywhere and simulated members can
+# test the whole protocol (`docs/re/coop/protocol.md`). The mod only links this crate when built
+# with its `coop` feature.
+[dependencies]
+# Zlib for snapshots: the version `model_io` already uses.
+miniz_oxide = "0.8"

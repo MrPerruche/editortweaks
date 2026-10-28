@@ -54,18 +54,6 @@ const LOOKS: [&str; 6] = [
     "PatternOffset",
 ];
 
-/// `EPropertyFlags`: `CPF_Edit` marks the properties the panel may list (bricks' are all
-/// `EditDefaultsOnly` in C++: this and `CPF_DisableEditOnInstance`), `CPF_EditConst` the read-only
-/// ones and `CPF_Transient` state the game doesn't save. Read from BRMK 1.11.6's generated property
-/// records, see `docs/re/editor-operations.md`.
-const EDIT: u64 = 0x1;
-const EDIT_CONST: u64 = 0x2_0000;
-const TRANSIENT: u64 = 0x2000;
-
-/// Editable properties of brick classes that aren't brick properties: they're the same for every
-/// brick of a class. `bEnableBlueprintEvents`: whether a brick Blueprint's events run.
-const NOT_BRICK_PROPERTIES: [&str; 1] = ["bEnableBlueprintEvents"];
-
 /// How far the mouse may move from where the key went down for it to be a click (pixels).
 const CLICK_PIXELS: f32 = 4.0;
 
@@ -355,10 +343,8 @@ impl State<'_> {
         }
     }
 
-    /// The brick properties of `brick` that can be copied: those its native classes from `UBrick`
-    /// on declare editable and saved (see [`EDIT`]), but [`NOT_BRICK_PROPERTIES`]. They're those
-    /// the panel lists (checked against BRMK 1.11.6's brick classes), of any type (texts like
-    /// seat names included). Logs what it leaves out.
+    /// The brick properties of `brick` that can be copied (`brick_property::is_brick_property`),
+    /// of any type (texts like seat names included). Logs what it leaves out.
     ///
     /// # Safety
     /// `brick` must be a live brick. Game thread only.
@@ -369,19 +355,7 @@ impl State<'_> {
         // as it does.
         unsafe {
             for property in reflection::properties(reflection::class_of(brick.cast())) {
-                let flags = (*property).property_flags;
-                let owner = reflection::declaring_struct(property);
-                let name = &(*property).field.name_private;
-                let brick_class = !owner.is_null()
-                    && reflection::is_native_class(owner)
-                    && reflection::with_parents(owner).any(|parent| parent == self.game.brick);
-                if !brick_class
-                    || flags & EDIT == 0
-                    || flags & (EDIT_CONST | TRANSIENT) != 0
-                    || NOT_BRICK_PROPERTIES
-                        .iter()
-                        .any(|excluded| reflection::name_is(name, excluded))
-                {
+                if !brick_property::is_brick_property(property, self.game.brick) {
                     continue;
                 }
                 match CopiedProperty::of(property) {
