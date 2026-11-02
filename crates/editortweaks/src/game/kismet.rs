@@ -12,18 +12,43 @@ use crate::game::text::Text;
 /// The engine's `FName` for `text`, created if new (`UKismetStringLibrary::Conv_StringToName`).
 /// Unlike writing to the name pool directly, this takes the pool's lock and indexes the name.
 pub fn string_to_name(text: &str) -> Result<FName, String> {
-    let call = Conversion::find(
-        "KismetStringLibrary",
-        "Default__KismetStringLibrary",
-        "Conv_StringToName",
-        ("NameProperty", size_of::<FName>()),
-    )?;
-    // SAFETY: the result is a NameProperty, an FName; on the game thread like every caller here.
-    let name: FName = unsafe { call.run(text) };
-    if name.is_none() {
-        return Err(format!("no name made for '{text}'"));
+    names()?.name(text)
+}
+
+/// `UKismetStringLibrary::Conv_StringToName`, found once to be used often (finding it walks every
+/// object).
+pub struct Names {
+    to_name: Conversion,
+}
+
+// SAFETY: reflection records and a default object living as long as the game; only called on the
+// game thread.
+unsafe impl Send for Names {}
+unsafe impl Sync for Names {}
+
+/// Finds [`Names`]. After engine init.
+pub fn names() -> Result<Names, String> {
+    Ok(Names {
+        to_name: Conversion::find(
+            "KismetStringLibrary",
+            "Default__KismetStringLibrary",
+            "Conv_StringToName",
+            ("NameProperty", size_of::<FName>()),
+        )?,
+    })
+}
+
+impl Names {
+    /// The engine's `FName` for `text` (see [`string_to_name`]). Game thread only.
+    pub fn name(&self, text: &str) -> Result<FName, String> {
+        // SAFETY: the result is a NameProperty, an FName; on the game thread like every caller
+        // here.
+        let name: FName = unsafe { self.to_name.run(text) };
+        if name.is_none() {
+            return Err(format!("no name made for '{text}'"));
+        }
+        Ok(name)
     }
-    Ok(name)
 }
 
 /// A new `FText` showing `text` as is, not localized (`UKismetTextLibrary::Conv_StringToText`).

@@ -27,6 +27,7 @@ use crate::ids::{CoopId, IdAllocator, LiveSet, ORIGINAL_SLOT, SUBHOST_SLOT, Slot
 use crate::limits::{Flood, Limits};
 use crate::message::{Member, Message, PeerId, PeerInfo, RefuseReason};
 use crate::ops::{Op, Value};
+use crate::presence::View;
 use crate::undo::{Change, History, StepBack};
 use crate::wire::DecodeError;
 
@@ -46,11 +47,19 @@ pub enum EndReason {
     Kicked,
     /// The subhost closed the session.
     Closed,
+    /// We left a subhost that sent far more than any session needs ([`crate::limits`]).
+    HostFlooded(Flood),
 }
 
 /// What the mod should do in the editor, or show.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Event {
+    /// A subhost invites us to its session, calling itself `name` (whatever we do now: the mod
+    /// decides whether to show it).
+    Invited {
+        peer: PeerId,
+        name: String,
+    },
     /// A peer answered or sent a hello.
     Hello {
         peer: PeerId,
@@ -61,6 +70,16 @@ pub enum Event {
         slot: Slot,
     },
     Refused(RefuseReason),
+    /// Subhost, with [`HostSettings::approve`]: `peer` asks to join, calling itself `name`.
+    /// Answer with [`Session::answer_join`].
+    JoinAsked {
+        peer: PeerId,
+        name: String,
+    },
+    /// Subhost: `peer`, which asked to join, gave up before being answered.
+    JoinWithdrawn {
+        peer: PeerId,
+    },
     /// Replace the whole vehicle with `vehicle`; `ids` are its bricks' coop ids in object order.
     /// Own edits not yet committed are lost from the editor here; they come back with their
     /// commits.
@@ -80,6 +99,11 @@ pub enum Event {
     Selection {
         slot: Slot,
         ids: Vec<CoopId>,
+    },
+    /// Where `slot`'s camera is now (`None`: not in the editor's view).
+    Camera {
+        slot: Slot,
+        view: Option<View>,
     },
     /// The subhost's editor in short: compare ours (see `audit`). We're at the same commit with
     /// nothing of ours on the way. If a brick differs, [`Session::request_resync`]; if only the
@@ -137,7 +161,12 @@ pub struct HostSettings {
     pub code: String,
     /// Members besides the subhost.
     pub max_members: usize,
+    /// Whether joiners wait for the subhost's yes ([`Event::JoinAsked`]).
+    pub approve: bool,
 }
+
+/// Joiners waiting for the subhost's answer at once, at most: more are refused.
+const ASKING: usize = 4;
 
 struct HostedMember {
     member: Member,
@@ -180,6 +209,8 @@ struct Host {
     history: History,
     /// Snapshots past a member's allowance, with when they may go.
     deferred: Vec<(u64, SnapshotRequest)>,
+    /// Joiners waiting for the subhost's answer, with their names.
+    asking: Vec<(PeerId, String)>,
 }
 
 struct Pending {
@@ -375,7 +406,43 @@ impl Session {
             name,
             history: History::default(),
             deferred: Vec::new(),
+            asking: Vec::new(),
         });
+        Ok(ids)
+    }
+
+    /// Subhost: the editor's vehicle, which has `bricks` bricks, replaces the session's (its player
+    /// shared another one). Returns their new coop ids in object order. Every member waits for a
+    /// snapshot of it, asked for at once ([`Event::SnapshotWanted`]); edits still on their way
+    /// name bricks that are gone, so they do nothing. Undo starts over: its steps name those too.
+    pub fn rehost(&mut self, bricks: usize) -> Result<Vec<CoopId>, SessionError> {
+        let Role::Host(host) = &mut self.role else {
+            return Err(SessionError::NotSubhost);
+        };
+        if bricks > crate::message::caps::SNAPSHOT_IDS {
+            return Err(SessionError::TooManyBricks);
+        }
+        let ids = (0..bricks)
+            .map(|_| host.ids.next_id().ok_or(SessionError::TooManyBricks))
+            .collect::<Result<Vec<CoopId>, SessionError>>()?;
+        host.commit += 1;
+        host.live = LiveSet::from_ids(ids.iter().copied());
+        host.retired.clear();
+        host.history = History::default();
+        // Snapshots asked for earlier would be of the old vehicle.
+        host.deferred.clear();
+        let commit = host.commit;
+        let requests: Vec<SnapshotRequest> = host
+            .members
+            .iter_mut()
+            .filter_map(|member| {
+                member.waiting = None;
+                member.wait(commit)
+            })
+            .collect();
+        for request in requests {
+            self.want_snapshot(request);
+        }
         Ok(ids)
     }
 
@@ -415,12 +482,42 @@ impl Session {
         self.events.push(Event::Ended(EndReason::Left));
     }
 
-    /// Subhost: removes a member, which can't join again.
+    /// Subhost: removes a member. It may ask to join again.
     pub fn kick(&mut self, peer: PeerId) -> Result<(), SessionError> {
         self.remove(peer, true)
     }
 
-    /// Subhost: the connection to a member was lost. It may join again.
+    /// Subhost: removes a member, or refuses a joiner asking, and refuses its requests until
+    /// `until` ([`Session::tick`]'s clock), telling it how long it waits.
+    pub fn ban(&mut self, peer: PeerId, until: u64) -> Result<(), SessionError> {
+        let Role::Host(host) = &self.role else {
+            return Err(SessionError::NotSubhost);
+        };
+        let asking = host.asking.iter().any(|(p, _)| *p == peer);
+        self.limits.banned_until.insert(peer, until);
+        if asking && let Some(minutes) = self.ban_left(peer) {
+            self.out.send(
+                peer,
+                &Message::JoinRefused(RefuseReason::Banned { minutes }),
+            );
+        }
+        self.remove(peer, true)
+    }
+
+    /// Subhost: lifts `peer`'s ban ([`Session::ban`]).
+    pub fn unban(&mut self, peer: PeerId) {
+        self.limits.banned_until.remove(&peer);
+    }
+
+    /// How many more minutes (rounded up) `peer` is banned for, if it is (`u16::MAX`: at least
+    /// that many, e.g. until the subhost lifts it).
+    fn ban_left(&self, peer: PeerId) -> Option<u16> {
+        let until = *self.limits.banned_until.get(&peer)?;
+        let left = until.checked_sub(self.now).filter(|left| *left > 0)?;
+        Some(left.div_ceil(60_000).min(u16::MAX.into()) as u16)
+    }
+
+    /// Subhost: the connection to a member (or a joiner asking) was lost. It may join again.
     pub fn lost(&mut self, peer: PeerId) -> Result<(), SessionError> {
         self.remove(peer, false)
     }
@@ -429,9 +526,8 @@ impl Session {
         let Role::Host(host) = &mut self.role else {
             return Err(SessionError::NotSubhost);
         };
-        if kick {
-            self.limits.banned.insert(peer);
-        }
+        // Asking again later is a new request.
+        host.asking.retain(|(p, _)| *p != peer);
         let before = host.members.len();
         host.members.retain(|m| m.member.peer != peer);
         if host.members.len() != before {
@@ -441,6 +537,36 @@ impl Session {
             self.assembler.forget(peer);
             self.broadcast_members();
         }
+        Ok(())
+    }
+
+    /// Subhost: lets `peer`, which asked to join ([`Event::JoinAsked`]), in or not. It may have
+    /// asked again or given up meanwhile: an answer to nobody waiting does nothing.
+    pub fn answer_join(&mut self, peer: PeerId, accept: bool) -> Result<(), SessionError> {
+        let Role::Host(host) = &mut self.role else {
+            return Err(SessionError::NotSubhost);
+        };
+        let Some(at) = host.asking.iter().position(|(p, _)| *p == peer) else {
+            return Ok(());
+        };
+        let (_, name) = host.asking.remove(at);
+        if !accept {
+            self.out
+                .send(peer, &Message::JoinRefused(RefuseReason::Refused));
+        } else if let Some(reason) = full(host) {
+            self.out.send(peer, &Message::JoinRefused(reason));
+        } else {
+            self.accept_member(peer, name);
+        }
+        Ok(())
+    }
+
+    /// Subhost: invites `peer` (which then may ask to join), calling ourselves `name`.
+    pub fn invite(&mut self, peer: PeerId, name: String) -> Result<(), SessionError> {
+        if !matches!(self.role, Role::Host(_)) {
+            return Err(SessionError::NotSubhost);
+        }
+        self.out.send(peer, &Message::Invite { name });
         Ok(())
     }
 
@@ -674,6 +800,17 @@ impl Session {
     /// What the local player has selected, for others to see.
     pub fn select(&mut self, mut ids: Vec<CoopId>) {
         ids.truncate(crate::message::caps::SELECTION);
+        self.show(|slot| Message::Selection { slot, ids });
+    }
+
+    /// Where the local player's camera is (`None`: not in the editor's view), for others to see.
+    pub fn show_view(&mut self, view: Option<View>) {
+        self.show(|slot| Message::Camera { slot, view });
+    }
+
+    /// Sends what `message` makes with our slot to the others: the subhost to its ready members,
+    /// a member to the subhost (who passes it on).
+    fn show(&mut self, message: impl FnOnce(Slot) -> Message) {
         match &self.role {
             Role::Host(host) => {
                 let peers: Vec<PeerId> = host
@@ -682,17 +819,14 @@ impl Session {
                     .filter(|m| m.ready())
                     .map(|m| m.member.peer)
                     .collect();
-                let message = Message::Selection {
-                    slot: SUBHOST_SLOT,
-                    ids,
-                };
+                let message = message(SUBHOST_SLOT);
                 peers
                     .into_iter()
                     .for_each(|peer| self.out.send(peer, &message));
             }
             Role::Guest(guest) => {
                 let (host, slot) = (guest.host, guest.slot);
-                self.out.send(host, &Message::Selection { slot, ids });
+                self.out.send(host, &message(slot));
             }
             Role::Idle | Role::Joining { .. } => {}
         }
@@ -717,7 +851,8 @@ impl Session {
     }
 
     /// Whether to read a frame of `len` bytes from `peer`: not from one that can't join, nor past
-    /// its allowance of bytes (a member past it is kicked). Our subhost's are always read.
+    /// its allowance of bytes (a member past it is kicked). Our subhost's are read up to its own,
+    /// bigger allowance (past it, we leave).
     fn admit(&mut self, peer: PeerId, len: usize) -> bool {
         if self.limits.banned.contains(&peer) {
             return false;
@@ -725,7 +860,11 @@ impl Session {
         if let Role::Joining { host } | Role::Guest(Guest { host, .. }) = &self.role
             && *host == peer
         {
-            return true;
+            if self.limits.host(self.now).bytes(self.now, len) {
+                return true;
+            }
+            self.host_flooded(Flood::Bytes);
+            return false;
         }
         if self.limits.crowded() {
             let keep = self.expected_peers();
@@ -743,8 +882,10 @@ impl Session {
     }
 
     fn handle(&mut self, peer: PeerId, session: u32, message: Message) {
-        if matches!(message, Message::Hello(_) | Message::HelloReply(_))
-            && !self.limits.of(peer, self.now).hello(self.now)
+        if matches!(
+            message,
+            Message::Hello(_) | Message::HelloReply(_) | Message::Invite { .. }
+        ) && !self.limits.of(peer, self.now).hello(self.now)
         {
             return;
         }
@@ -759,6 +900,10 @@ impl Session {
                 self.events.push(Event::Hello { peer, info });
                 return;
             }
+            Message::Invite { name } => {
+                self.events.push(Event::Invited { peer, name });
+                return;
+            }
             _ => {}
         }
         match &self.role {
@@ -770,14 +915,48 @@ impl Session {
                 }
             }
             Role::Guest(guest) => {
-                if peer == guest.host && session == self.out.session {
+                if peer == guest.host && session == self.out.session && self.host_allows(&message) {
                     self.handle_as_guest(message);
                 }
             }
         }
     }
 
+    /// Member: whether `message` from our subhost is within its allowance. Past what only a broken
+    /// or hostile subhost sends, we leave (false); selections and cameras past theirs are dropped.
+    fn host_allows(&mut self, message: &Message) -> bool {
+        let now = self.now;
+        let allowance = self.limits.host(now);
+        let within = match message {
+            Message::Selection { .. } => return allowance.selection(now),
+            Message::Camera { .. } => return allowance.camera(now),
+            Message::Snapshot { .. } if !allowance.host_snapshot(now) => Err(Flood::Snapshots),
+            Message::Commit { ops, .. } => allowance.message(now, ops),
+            _ => allowance.message(now, &[]),
+        };
+        match within {
+            Ok(()) => true,
+            Err(what) => {
+                self.host_flooded(what);
+                false
+            }
+        }
+    }
+
+    /// Member: leaves a subhost that sent far too much.
+    fn host_flooded(&mut self, what: Flood) {
+        let host = match &self.role {
+            Role::Joining { host } | Role::Guest(Guest { host, .. }) => *host,
+            Role::Idle | Role::Host(_) => return,
+        };
+        self.out.send(host, &Message::Leave);
+        self.role = Role::Idle;
+        self.assembler = Assembler::default();
+        self.events.push(Event::Ended(EndReason::HostFlooded(what)));
+    }
+
     fn handle_as_host(&mut self, peer: PeerId, session: u32, message: Message) {
+        let banned = self.ban_left(peer);
         let Role::Host(host) = &mut self.role else {
             unreachable!()
         };
@@ -787,40 +966,48 @@ impl Session {
             game_version,
         } = message
         {
-            let refusal = if code != host.settings.code {
+            let refusal = if let Some(minutes) = banned {
+                Some(RefuseReason::Banned { minutes })
+            } else if code != host.settings.code {
                 if self.limits.of(peer, self.now).wrong_code() {
                     self.limits.banned.insert(peer);
                 }
                 Some(RefuseReason::WrongCode)
             } else if game_version != self.info.game_version {
                 Some(RefuseReason::GameVersion)
-            } else if host.members.len() >= host.settings.max_members
-                || host.next_slot > u16::from(Slot::MAX)
-            {
-                Some(RefuseReason::Full)
             } else {
-                None
+                full(host)
             };
             if let Some(reason) = refusal {
                 self.out.send(peer, &Message::JoinRefused(reason));
                 return;
             }
-            // Joining again (its game restarted): the old membership goes.
-            host.members.retain(|m| m.member.peer != peer);
-            let slot = host.next_slot as Slot;
-            host.next_slot += 1;
-            let mut member = HostedMember {
-                member: Member { slot, peer, name },
-                waiting: None,
-            };
-            let request = member
-                .wait(host.commit)
-                .expect("new members aren't waiting yet");
-            host.members.push(member);
-            self.assembler.forget(peer);
-            self.out.send(peer, &Message::JoinAccepted { slot });
-            self.want_snapshot(request);
-            self.broadcast_members();
+            if !host.settings.approve {
+                self.accept_member(peer, name);
+                return;
+            }
+            // Asking again (its game restarted) keeps its place, under its new name, and is told
+            // again.
+            if let Some(asking) = host.asking.iter_mut().find(|(p, _)| *p == peer) {
+                asking.1 = name.clone();
+                self.events.push(Event::JoinAsked { peer, name });
+                return;
+            }
+            if host.asking.len() >= ASKING {
+                self.out
+                    .send(peer, &Message::JoinRefused(RefuseReason::Refused));
+                return;
+            }
+            host.asking.push((peer, name.clone()));
+            self.events.push(Event::JoinAsked { peer, name });
+            return;
+        }
+        // A joiner's frames carry no session yet.
+        if let Message::Leave = message
+            && let Some(at) = host.asking.iter().position(|(p, _)| *p == peer)
+        {
+            host.asking.remove(at);
+            self.events.push(Event::JoinWithdrawn { peer });
             return;
         }
 
@@ -835,7 +1022,8 @@ impl Session {
         let flood = match &message {
             // Only shown: dropped past their allowance.
             Message::Selection { .. } if !allowance.selection(now) => return,
-            Message::Selection { .. } => None,
+            Message::Camera { .. } if !allowance.camera(now) => return,
+            Message::Selection { .. } | Message::Camera { .. } => None,
             Message::Propose { ops, .. } => allowance.message(now, ops).err(),
             _ => allowance.message(now, &[]).err(),
         };
@@ -886,6 +1074,17 @@ impl Session {
                 others.into_iter().for_each(|p| self.out.send(p, &message));
                 self.events.push(Event::Selection { slot, ids });
             }
+            Message::Camera { view, .. } => {
+                let message = Message::Camera { slot, view };
+                let others: Vec<PeerId> = host
+                    .members
+                    .iter()
+                    .filter(|m| m.ready() && m.member.peer != peer)
+                    .map(|m| m.member.peer)
+                    .collect();
+                others.into_iter().for_each(|p| self.out.send(p, &message));
+                self.events.push(Event::Camera { slot, view });
+            }
             Message::Leave => {
                 host.members.retain(|m| m.member.peer != peer);
                 self.assembler.forget(peer);
@@ -893,6 +1092,29 @@ impl Session {
             }
             _ => {}
         }
+    }
+
+    /// Subhost: lets `peer` in; its snapshot follows.
+    fn accept_member(&mut self, peer: PeerId, name: String) {
+        let Role::Host(host) = &mut self.role else {
+            unreachable!()
+        };
+        // Joining again (its game restarted): the old membership goes.
+        host.members.retain(|m| m.member.peer != peer);
+        let slot = host.next_slot as Slot;
+        host.next_slot += 1;
+        let mut member = HostedMember {
+            member: Member { slot, peer, name },
+            waiting: None,
+        };
+        let request = member
+            .wait(host.commit)
+            .expect("new members aren't waiting yet");
+        host.members.push(member);
+        self.assembler.forget(peer);
+        self.out.send(peer, &Message::JoinAccepted { slot });
+        self.want_snapshot(request);
+        self.broadcast_members();
     }
 
     fn handle_as_joiner(&mut self, session: u32, message: Message) {
@@ -1039,6 +1261,7 @@ impl Session {
                 self.events.push(Event::Members(members));
             }
             Message::Selection { slot, ids } => self.events.push(Event::Selection { slot, ids }),
+            Message::Camera { slot, view } => self.events.push(Event::Camera { slot, view }),
             Message::Kick | Message::Close => {
                 let reason = if matches!(message, Message::Kick) {
                     EndReason::Kicked
@@ -1071,6 +1294,7 @@ impl Session {
 
     /// Subhost: kicks a member that sent far too much.
     fn flood(&mut self, peer: PeerId, what: Flood) {
+        self.limits.banned.insert(peer);
         let _ = self.kick(peer);
         self.events.push(Event::Flooded { peer, what });
     }
@@ -1141,6 +1365,12 @@ impl Session {
 }
 
 /// The subhost first (`self_peer` is a placeholder: peers know the subhost's address already).
+/// Why `host` can't take another member, if it can't.
+fn full(host: &Host) -> Option<RefuseReason> {
+    (host.members.len() >= host.settings.max_members || host.next_slot > u16::from(Slot::MAX))
+        .then_some(RefuseReason::Full)
+}
+
 fn host_member_list(host: &Host, self_peer: PeerId) -> Vec<Member> {
     std::iter::once(Member {
         slot: SUBHOST_SLOT,
@@ -1181,6 +1411,7 @@ mod tests {
         HostSettings {
             code: "1234".into(),
             max_members: 4,
+            approve: false,
         }
     }
 
@@ -1234,6 +1465,348 @@ mod tests {
             other_build.take_events(),
             vec![Event::Refused(RefuseReason::GameVersion)]
         );
+    }
+
+    fn approving() -> HostSettings {
+        HostSettings {
+            approve: true,
+            ..settings()
+        }
+    }
+
+    #[test]
+    fn joiners_wait_for_the_subhosts_answer() {
+        let mut host = Session::new(info());
+        host.host(7, "h".into(), approving(), 3).unwrap();
+        let mut guest = Session::new(info());
+        guest.join(1, "1234".into(), "g".into()).unwrap();
+        pump(&mut host, 1, &mut guest, 2);
+        assert_eq!(
+            host.take_events(),
+            vec![Event::JoinAsked {
+                peer: 2,
+                name: "g".into()
+            }]
+        );
+        assert!(guest.take_events().is_empty());
+        assert_eq!(host.members().len(), 1, "only the subhost");
+
+        host.answer_join(2, true).unwrap();
+        pump(&mut host, 1, &mut guest, 2);
+        assert!(guest.take_events().contains(&Event::Joined { slot: 2 }));
+        assert_eq!(snapshot_request(&mut host).peer, 2);
+        // Answering again does nothing: nobody waits any more.
+        host.answer_join(2, false).unwrap();
+        assert!(host.take_outgoing().is_empty());
+    }
+
+    #[test]
+    fn a_refused_joiner_hears_so() {
+        let mut host = Session::new(info());
+        host.host(7, "h".into(), approving(), 3).unwrap();
+        let mut guest = Session::new(info());
+        guest.join(1, "1234".into(), "g".into()).unwrap();
+        pump(&mut host, 1, &mut guest, 2);
+        host.answer_join(2, false).unwrap();
+        pump(&mut host, 1, &mut guest, 2);
+        assert_eq!(
+            guest.take_events(),
+            vec![Event::Refused(RefuseReason::Refused)]
+        );
+        assert!(guest.is_idle());
+        // It may ask again.
+        guest.join(1, "1234".into(), "g".into()).unwrap();
+        pump(&mut host, 1, &mut guest, 2);
+        assert!(matches!(
+            host.take_events()[..],
+            [_, Event::JoinAsked { peer: 2, .. }]
+        ));
+    }
+
+    #[test]
+    fn a_joiner_giving_up_is_forgotten() {
+        let mut host = Session::new(info());
+        host.host(7, "h".into(), approving(), 3).unwrap();
+        let mut guest = Session::new(info());
+        guest.join(1, "1234".into(), "g".into()).unwrap();
+        pump(&mut host, 1, &mut guest, 2);
+        host.take_events();
+        guest.leave();
+        pump(&mut host, 1, &mut guest, 2);
+        assert_eq!(host.take_events(), vec![Event::JoinWithdrawn { peer: 2 }]);
+        host.answer_join(2, true).unwrap();
+        assert!(host.take_outgoing().is_empty());
+    }
+
+    /// Joins `peer` to `host` (approving) under `name`, answering yes.
+    fn join_approved(host: &mut Session, peer: PeerId, name: &str) -> Session {
+        let mut guest = Session::new(info());
+        guest.join(1, "1234".into(), name.into()).unwrap();
+        pump(host, 1, &mut guest, peer);
+        host.answer_join(peer, true).unwrap();
+        pump(host, 1, &mut guest, peer);
+        guest
+    }
+
+    /// What `guest` gets from its subhost (peer 1) after `send` of each message.
+    fn from_subhost(
+        guest: &mut Session,
+        messages: impl IntoIterator<Item = Message>,
+    ) -> Vec<Event> {
+        let session = guest.out.session;
+        for message in messages {
+            for frame in framing::frames(session, &message) {
+                guest.receive(1, &frame);
+            }
+        }
+        guest.take_events()
+    }
+
+    fn told_subhost_it_left(guest: &mut Session) -> bool {
+        guest.take_outgoing().iter().any(|out| {
+            out.to == 1 && matches!(Message::decode(&out.bytes), Ok((_, Message::Leave)))
+        })
+    }
+
+    #[test]
+    fn a_member_leaves_a_subhost_sending_snapshots_without_end() {
+        let mut host = Session::new(info());
+        host.host(7, "h".into(), settings(), 3).unwrap();
+        let mut guest = join_approved_quietly(&mut host, 2);
+        let snapshot = Message::Snapshot {
+            commit: 1,
+            ids: Vec::new(),
+            vehicle: Vec::new(),
+        };
+        let events = from_subhost(&mut guest, std::iter::repeat_n(snapshot, 20));
+        let loads = events
+            .iter()
+            .filter(|e| matches!(e, Event::Load { .. }))
+            .count();
+        assert!(loads <= crate::limits::rates::HOST_SNAPSHOTS.burst as usize);
+        assert!(
+            events.contains(&Event::Ended(EndReason::HostFlooded(Flood::Snapshots))),
+            "{events:?}"
+        );
+        assert!(guest.is_idle());
+        assert!(told_subhost_it_left(&mut guest));
+    }
+
+    #[test]
+    fn a_member_leaves_a_subhost_sending_messages_without_end() {
+        let mut host = Session::new(info());
+        host.host(7, "h".into(), settings(), 3).unwrap();
+        let mut guest = join_approved_quietly(&mut host, 2);
+        // Pings are cheap: as many as every player's edits get through...
+        let many = (crate::limits::rates::MESSAGES.burst * crate::limits::rates::HOST_SCALE)
+            as usize
+            - 100;
+        let events = from_subhost(&mut guest, std::iter::repeat_n(Message::Ping, many));
+        assert!(!events.iter().any(|e| matches!(e, Event::Ended(_))));
+        // ...and a second later, plenty again.
+        guest.tick(1000);
+        let events = from_subhost(&mut guest, std::iter::repeat_n(Message::Ping, 1000));
+        assert!(!events.iter().any(|e| matches!(e, Event::Ended(_))));
+        // Not forever.
+        let events = from_subhost(&mut guest, std::iter::repeat_n(Message::Ping, 100_000));
+        assert!(
+            events.contains(&Event::Ended(EndReason::HostFlooded(Flood::Messages))),
+            "{events:?}"
+        );
+        assert!(told_subhost_it_left(&mut guest));
+    }
+
+    /// A member joined to `host` (as `peer`), with what joining said and sent taken.
+    fn join_approved_quietly(host: &mut Session, peer: PeerId) -> Session {
+        let mut guest = Session::new(info());
+        guest.join(1, "1234".into(), "g".into()).unwrap();
+        pump(host, 1, &mut guest, peer);
+        host.take_events();
+        guest.take_events();
+        guest.take_outgoing();
+        guest
+    }
+
+    #[test]
+    fn invites_reach_anyone() {
+        let mut host = Session::new(info());
+        host.host(7, "h".into(), approving(), 3).unwrap();
+        let mut friend = Session::new(info());
+        host.invite(2, "Perru".into()).unwrap();
+        pump(&mut host, 1, &mut friend, 2);
+        assert_eq!(
+            friend.take_events(),
+            vec![Event::Invited {
+                peer: 1,
+                name: "Perru".into()
+            }]
+        );
+        // Only a subhost invites.
+        assert_eq!(friend.invite(1, "f".into()), Err(SessionError::NotSubhost));
+    }
+
+    #[test]
+    fn a_kicked_member_may_ask_again() {
+        let mut host = Session::new(info());
+        host.host(7, "h".into(), approving(), 3).unwrap();
+        let mut guest = join_approved(&mut host, 2, "g");
+        assert!(host.members().iter().any(|m| m.peer == 2));
+        host.take_events();
+        host.kick(2).unwrap();
+        pump(&mut host, 1, &mut guest, 2);
+        assert!(!host.members().iter().any(|m| m.peer == 2));
+        host.take_events();
+        assert!(
+            guest
+                .take_events()
+                .contains(&Event::Ended(EndReason::Kicked))
+        );
+        let mut again = Session::new(info());
+        again.join(1, "1234".into(), "g".into()).unwrap();
+        pump(&mut host, 1, &mut again, 2);
+        let events = host.take_events();
+        assert!(
+            matches!(events[..], [Event::JoinAsked { peer: 2, .. }]),
+            "{events:?}"
+        );
+    }
+
+    #[test]
+    fn a_banned_member_waits_out_its_ban() {
+        let mut host = Session::new(info());
+        host.host(7, "h".into(), approving(), 3).unwrap();
+        let mut guest = join_approved(&mut host, 2, "g");
+        host.take_events();
+        host.ban(2, 10 * 60_000).unwrap();
+        pump(&mut host, 1, &mut guest, 2);
+        assert!(!host.members().iter().any(|m| m.peer == 2));
+        host.take_events();
+        assert!(
+            guest
+                .take_events()
+                .contains(&Event::Ended(EndReason::Kicked))
+        );
+        let ask = |host: &mut Session| {
+            let mut again = Session::new(info());
+            again.join(1, "1234".into(), "g".into()).unwrap();
+            pump(host, 1, &mut again, 2);
+            again.take_events()
+        };
+        assert_eq!(
+            ask(&mut host),
+            vec![Event::Refused(RefuseReason::Banned { minutes: 10 })]
+        );
+        host.tick(9 * 60_000 + 1);
+        assert_eq!(
+            ask(&mut host),
+            vec![Event::Refused(RefuseReason::Banned { minutes: 1 })]
+        );
+        assert!(host.take_events().is_empty(), "the host's player was asked");
+        host.tick(10 * 60_000);
+        assert!(ask(&mut host).is_empty());
+        host.take_events();
+        // Lifted early.
+        host.ban(2, u64::MAX).unwrap();
+        assert_eq!(
+            ask(&mut host),
+            vec![Event::Refused(RefuseReason::Banned { minutes: u16::MAX })]
+        );
+        host.unban(2);
+        assert!(ask(&mut host).is_empty());
+        let events = host.take_events();
+        assert!(
+            matches!(events[..], [Event::JoinAsked { peer: 2, .. }]),
+            "{events:?}"
+        );
+    }
+
+    #[test]
+    fn banning_a_joiner_asking_refuses_it() {
+        let mut host = Session::new(info());
+        host.host(7, "h".into(), approving(), 3).unwrap();
+        let mut guest = Session::new(info());
+        guest.join(1, "1234".into(), "g".into()).unwrap();
+        pump(&mut host, 1, &mut guest, 2);
+        host.take_events();
+        host.ban(2, 60_000).unwrap();
+        pump(&mut host, 1, &mut guest, 2);
+        assert_eq!(
+            guest.take_events(),
+            vec![Event::Refused(RefuseReason::Banned { minutes: 1 })]
+        );
+        // Its request went with it.
+        host.answer_join(2, true).unwrap();
+        assert!(host.take_outgoing().is_empty());
+    }
+
+    #[test]
+    fn a_joiner_lost_while_asking_asks_anew() {
+        let mut host = Session::new(info());
+        host.host(7, "h".into(), approving(), 3).unwrap();
+        let mut guest = Session::new(info());
+        guest.join(1, "1234".into(), "g".into()).unwrap();
+        pump(&mut host, 1, &mut guest, 2);
+        host.take_events();
+        host.lost(2).unwrap();
+        // Its request went with it.
+        host.answer_join(2, true).unwrap();
+        assert!(host.take_outgoing().is_empty());
+
+        let mut again = Session::new(info());
+        again.join(1, "1234".into(), "g2".into()).unwrap();
+        pump(&mut host, 1, &mut again, 2);
+        assert_eq!(
+            host.take_events(),
+            vec![Event::JoinAsked {
+                peer: 2,
+                name: "g2".into()
+            }]
+        );
+    }
+
+    #[test]
+    fn asking_again_is_told_again() {
+        let mut host = Session::new(info());
+        host.host(7, "h".into(), approving(), 3).unwrap();
+        let mut guest = Session::new(info());
+        guest.join(1, "1234".into(), "g".into()).unwrap();
+        pump(&mut host, 1, &mut guest, 2);
+        host.take_events();
+        let mut restarted = Session::new(info());
+        restarted.join(1, "1234".into(), "g2".into()).unwrap();
+        pump(&mut host, 1, &mut restarted, 2);
+        assert_eq!(
+            host.take_events(),
+            vec![Event::JoinAsked {
+                peer: 2,
+                name: "g2".into()
+            }]
+        );
+        host.answer_join(2, true).unwrap();
+        pump(&mut host, 1, &mut restarted, 2);
+        assert!(restarted.take_events().contains(&Event::Joined { slot: 2 }));
+    }
+
+    #[test]
+    fn only_a_few_joiners_wait_at_once() {
+        let mut host = Session::new(info());
+        host.host(7, "h".into(), approving(), 3).unwrap();
+        let mut asked = 0;
+        for peer in 2..2 + ASKING as PeerId + 2 {
+            let mut guest = Session::new(info());
+            guest.join(1, "1234".into(), "g".into()).unwrap();
+            pump(&mut host, 1, &mut guest, peer);
+            let refused = guest
+                .take_events()
+                .contains(&Event::Refused(RefuseReason::Refused));
+            asked += usize::from(!refused);
+        }
+        assert_eq!(asked, ASKING);
+        // Asking twice keeps one place.
+        let mut again = Session::new(info());
+        again.join(1, "1234".into(), "g2".into()).unwrap();
+        pump(&mut host, 1, &mut again, 2);
+        assert!(again.take_events().is_empty());
     }
 
     #[test]
@@ -1345,5 +1918,81 @@ mod tests {
             &host.take_events()[..],
             [Event::SnapshotWanted(SnapshotRequest { peer: 2, .. })]
         ));
+    }
+
+    #[test]
+    fn cameras_reach_the_others() {
+        let mut host = Session::new(info());
+        let original = host.host(7, "h".into(), settings(), 1).unwrap();
+        let mut guest = Session::new(info());
+        guest.join(1, "1234".into(), "g".into()).unwrap();
+        // Not in yet: nothing more goes out than the join.
+        let joining = guest.take_outgoing();
+        guest.show_view(None);
+        assert!(guest.take_outgoing().is_empty());
+        joining.into_iter().for_each(|o| host.receive(2, &o.bytes));
+        pump(&mut host, 1, &mut guest, 2);
+        let request = snapshot_request(&mut host);
+        host.send_snapshot(request, original, vec![]).unwrap();
+        pump(&mut host, 1, &mut guest, 2);
+        host.take_events();
+        let slot = guest
+            .take_events()
+            .into_iter()
+            .find_map(|e| match e {
+                Event::Joined { slot } => Some(slot),
+                _ => None,
+            })
+            .expect("joined");
+
+        let view = View {
+            location: [10.0, 20.0, 30.0],
+            forward: [0.0, 0.0, -1.0],
+        };
+        guest.show_view(Some(view));
+        let out = guest.take_outgoing();
+        assert!(out.iter().all(|o| !o.reliable));
+        out.into_iter().for_each(|o| host.receive(2, &o.bytes));
+        assert_eq!(
+            host.take_events(),
+            vec![Event::Camera {
+                slot,
+                view: Some(view)
+            }]
+        );
+
+        host.show_view(None);
+        pump(&mut host, 1, &mut guest, 2);
+        assert_eq!(
+            guest.take_events(),
+            vec![Event::Camera {
+                slot: SUBHOST_SLOT,
+                view: None
+            }]
+        );
+    }
+
+    #[test]
+    fn cameras_past_the_allowance_are_dropped() {
+        let mut host = Session::new(info());
+        let original = host.host(7, "h".into(), settings(), 1).unwrap();
+        let mut guest = Session::new(info());
+        guest.join(1, "1234".into(), "g".into()).unwrap();
+        pump(&mut host, 1, &mut guest, 2);
+        let request = snapshot_request(&mut host);
+        host.send_snapshot(request, original, vec![]).unwrap();
+        pump(&mut host, 1, &mut guest, 2);
+        host.take_events();
+        for _ in 0..100 {
+            guest.show_view(None);
+        }
+        pump(&mut host, 1, &mut guest, 2);
+        let cameras = host
+            .take_events()
+            .iter()
+            .filter(|e| matches!(e, Event::Camera { .. }))
+            .count();
+        assert_eq!(cameras, crate::limits::rates::CAMERAS.burst as usize);
+        assert!(host.members().iter().any(|m| m.peer == 2), "not kicked");
     }
 }

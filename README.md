@@ -24,7 +24,16 @@ loaded by the [brickworks](https://github.com/KoT3isGood/brickrust) mod loader.
 .venv\Scripts\python.exe tools/et.py log        # what the loader and the mod printed
 .venv\Scripts\python.exe tools/et.py crashes    # if the game crashed
 .venv\Scripts\python.exe tools/et.py status     # what's installed where
+.venv\Scripts\python.exe tools/et.py package --expires 14d   # a zip for a tester
 ```
+
+`--expires` (on `build`, `install` and `package`) makes a test build: past that local date and
+time the mod doesn't start (it logs why in `brickworks.txt`). It goes by the PC's clock.
+
+Coop building (several players editing one vehicle) is in beta and part of every build.
+`--coop-test` (on `build`, `install` and `package`) adds the test-only tools
+(a local test with two game instances on one PC, a drift key, a Steam self-send probe) and makes
+`package` a test zip with the friend test steps. Notes: `docs/re/coop/`, UI: `docs/coop-ui.md`.
 
 `python tools/et.py --help` lists everything. To disable the mod without uninstalling, rename
 `<game>/brickworks/editortweaks.dll` to `_editortweaks.dll`.

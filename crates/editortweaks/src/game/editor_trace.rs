@@ -22,6 +22,7 @@ use brickrust::ue::coreuobject::UObjectBase;
 
 use crate::framework::hook;
 use crate::framework::sig::{self, FunctionSig, SigMatch};
+use crate::framework::timings;
 
 /// `GetEditorTraceParams`, by its start: the channel set to 3, then the player controller's hidden
 /// components added to the query's ignored ones (the controller's offset at +12, the list's at
@@ -196,13 +197,14 @@ unsafe extern "C" fn trace_params_detour(
     channel: *mut u32,
     params: *mut c_void,
 ) {
+    let _span = timings::span("game::editor_trace::trace_params_detour");
     let original = *ORIGINAL_TRACE_PARAMS
         .get()
         .expect("hook recorded before use");
     // SAFETY: the original function with its own arguments; `channel` is the caller's
     // `ECollisionChannel&`, which the original just wrote.
     unsafe {
-        original(editor, channel, params);
+        timings::game(TRACE_PARAMS.name, || original(editor, channel, params));
         let isolated = CHANNEL.load(Ordering::Relaxed);
         if isolated != NONE && EDITOR.load(Ordering::Relaxed) == editor as usize {
             channel.write(isolated);
@@ -219,13 +221,18 @@ unsafe extern "C" fn line_trace_detour(
     params: *const c_void,
     responses: *const ResponseParams,
 ) -> bool {
+    let _span = timings::span("game::editor_trace::line_trace_detour");
     let original = *ORIGINAL_LINE_TRACE.get().expect("hook recorded before use");
     // SAFETY: the original function with its own arguments, or with the editor's channel and
     // responses in place of the caller's (both live for the call).
     unsafe {
         match editor_channel(channel) {
-            Some(isolated) => original(world, hit, start, end, isolated, params, &only(isolated)),
-            None => original(world, hit, start, end, channel, params, responses),
+            Some(isolated) => timings::game("UWorld::LineTraceSingleByChannel", || {
+                original(world, hit, start, end, isolated, params, &only(isolated))
+            }),
+            None => timings::game("UWorld::LineTraceSingleByChannel", || {
+                original(world, hit, start, end, channel, params, responses)
+            }),
         }
     }
 }
@@ -241,24 +248,29 @@ unsafe extern "C" fn sweep_detour(
     params: *const c_void,
     responses: *const ResponseParams,
 ) -> bool {
+    let _span = timings::span("game::editor_trace::sweep_detour");
     let original = *ORIGINAL_SWEEP.get().expect("hook recorded before use");
     // SAFETY: as in `line_trace_detour`.
     unsafe {
         match editor_channel(channel) {
-            Some(isolated) => original(
-                world,
-                hit,
-                start,
-                end,
-                rotation,
-                isolated,
-                shape,
-                params,
-                &only(isolated),
-            ),
-            None => original(
-                world, hit, start, end, rotation, channel, shape, params, responses,
-            ),
+            Some(isolated) => timings::game("UWorld::SweepSingleByChannel", || {
+                original(
+                    world,
+                    hit,
+                    start,
+                    end,
+                    rotation,
+                    isolated,
+                    shape,
+                    params,
+                    &only(isolated),
+                )
+            }),
+            None => timings::game("UWorld::SweepSingleByChannel", || {
+                original(
+                    world, hit, start, end, rotation, channel, shape, params, responses,
+                )
+            }),
         }
     }
 }

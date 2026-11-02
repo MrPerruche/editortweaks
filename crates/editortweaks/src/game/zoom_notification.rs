@@ -7,13 +7,19 @@
 //! the notification called "zoom" and calls the Blueprint event `UpdateCameraZoomNotification`,
 //! which puts `NumberToText(Ratio, Percent)` and the zoom icon in it; the notification's native
 //! `InitializeNotification` sets its `TextBlock`'s text and its icon.
+//!
+//! Any other notification works the same way, so [`ZoomNotification::show_text`] shows an
+//! arbitrary text under an arbitrary context name (a slot of its own), without an icon update: see
+//! its doc for what the icon then shows.
+
+use std::sync::OnceLock;
 
 use brickrust::ue::coreuobject::UObjectBase;
 use brickrust::ue::fname::FName;
 use brickrust::ue::uclass::UStruct;
 
 use crate::framework::sig::FunctionSig;
-use crate::game::kismet::{self, Texts};
+use crate::game::kismet::{self, Names, Texts};
 use crate::game::reflection::{self, Function, Parameters};
 use crate::game::text::Text;
 use crate::game::world;
@@ -67,7 +73,14 @@ unsafe impl Send for ZoomCode {}
 unsafe impl Sync for ZoomCode {}
 
 /// Finds [`ZoomCode`], checking that the function is the one for the notification called "zoom".
+/// Searched once and kept: `ortho_view` hooks the function, after which its start no longer
+/// matches the pattern.
 pub fn code() -> Result<ZoomCode, String> {
+    static CODE: OnceLock<Result<ZoomCode, String>> = OnceLock::new();
+    CODE.get_or_init(search).clone()
+}
+
+fn search() -> Result<ZoomCode, String> {
     let found = ZOOM_CHANGED.locate()?;
     // SAFETY: 32-bit displacements inside the matched pattern (see its comment), each relative to
     // the end of its instruction; the name's characters are constant data of the game's.
@@ -100,6 +113,7 @@ pub struct ZoomNotification {
     code: ZoomCode,
     /// [`NAME`] as an `FName`.
     name: FName,
+    names: Names,
     /// Where the overlay is, as `UGameOverlayWidget::Get` finds it: `UWorld::OwningGameInstance`;
     /// in a `BrickGameInstance`, its `WindowManagerWidget`; that one's `ActiveWidget`, when it's
     /// the HUD (a `HUDContainerWidget`); and that one's `GameOverlayWidget`.
@@ -150,9 +164,11 @@ pub fn find(code: ZoomCode) -> Result<ZoomNotification, String> {
     let brick_game_instance = class("BrickGameInstance")?;
     let window_manager = class("WindowManagerWidget")?;
     let hud = class("HUDContainerWidget")?;
+    let names = kismet::names()?;
     Ok(ZoomNotification {
         code,
-        name: kismet::string_to_name(NAME)?,
+        name: names.name(NAME)?,
+        names,
         game_instance: object(class("World")?, "OwningGameInstance")?,
         brick_game_instance: brick_game_instance.cast(),
         window_manager: object(brick_game_instance, "WindowManagerWidget")?,
@@ -233,11 +249,58 @@ impl ZoomNotification {
                 return;
             }
             (self.code.update)(overlay, notification, ratio);
+            self.label(notification, label);
+        }
+    }
+
+    /// Shows a notification reading `text` in the slot called `context` (each context is its own
+    /// notification; showing one that shows updates it and restarts its timer), ending by itself
+    /// after a while. If the overlay won't make one for `context`, the zoom's slot shows it. Fails
+    /// if the overlay hides notifications. The HUD overlay is [`ZoomNotification::overlay`].
+    ///
+    /// The notification's icon is not set: it keeps what the widget pool's notification showed
+    /// before (the icon of the zoom, speed, camera mode or HUD visibility notification it was
+    /// last, or the Blueprint's default the first time). `InitializeNotification` takes the icon as
+    /// a soft texture reference and a null one would draw an empty brush; see
+    /// `docs/re/editor-camera.md`.
+    ///
+    /// # Safety
+    /// `overlay` must be the live overlay. Game thread only.
+    pub unsafe fn show_text(
+        &self,
+        overlay: *mut UObjectBase,
+        context: &str,
+        text: &str,
+    ) -> Result<(), String> {
+        let context = self.names.name(context)?;
+        // SAFETY: per the contract; the notification is a live `UHUDNotificationWidget` and the
+        // names outlive the calls (the game copies the name it keeps).
+        unsafe {
+            let mut notification = (self.code.create)(overlay, &context, true);
+            if notification.is_null() {
+                notification = (self.code.create)(overlay, &self.name, true);
+            }
+            if notification.is_null() {
+                return Err("the HUD hides notifications".into());
+            }
+            self.label(notification, text);
+        }
+        Ok(())
+    }
+
+    /// Sets the notification's text block to `text`.
+    ///
+    /// # Safety
+    /// `notification` must be a live `UHUDNotificationWidget`. Game thread only.
+    unsafe fn label(&self, notification: *mut UObjectBase, text: &str) {
+        // SAFETY: per the contract; the text block is a live `UTextBlock`. The text goes in as is:
+        // `SetText` copies it, ProcessEvent doesn't destroy it, so it's released after.
+        unsafe {
             let Some(text_block) = object_at(notification, self.text_block) else {
                 return;
             };
             let mut parameters = Parameters::new();
-            reflection::put(&mut parameters, self.set_text_value, self.texts.text(label));
+            reflection::put(&mut parameters, self.set_text_value, self.texts.text(text));
             self.set_text.call(text_block, &mut parameters);
             reflection::take::<Text>(&parameters, self.set_text_value).release();
         }

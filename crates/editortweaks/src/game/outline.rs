@@ -16,7 +16,10 @@
 //! `EBrickOutlineState` (not reflected; named after the material's parameters): `Invalid` 0,
 //! `Neutral` 1, `Valid` 2 (bricks a property picker offers), `Active` 3 (the primary selected
 //! brick), `Selected` 4, `Unselected` 5. Each has its color in the material (`SelectedColor`, ...),
-//! from the UI style.
+//! from the UI style. The material's code (BRMK's `M_EditorOutline_Master`, a custom node) switches
+//! on the bits 1-3 themselves, its "case": 1 `ValidColor`, 2 `InvalidColor`, 3 `NeutralColor`, 4
+//! `ActiveColor`, 5 `SelectedColor`, else `UnselectedColor` (so the first three names above may be
+//! off by their order; only cases 1-3 show validity, while moving bricks or picking a property).
 
 use brickrust::ue::coreuobject::UObjectBase;
 
@@ -44,6 +47,19 @@ pub struct Look {
 }
 
 impl Look {
+    /// The material's case for this look (see the module's doc).
+    pub fn case(self) -> i32 {
+        (self.stencil & STATE_BITS) >> 1
+    }
+
+    /// This look outlined in the material's `case`, its hover and group kept.
+    pub fn in_case(self, case: i32) -> Self {
+        Self {
+            outlined: true,
+            stencil: (self.stencil & !STATE_BITS) | ((case << 1) & STATE_BITS),
+        }
+    }
+
     /// This look for an object in `state`, its hover and group kept. An unselected object is
     /// outlined only while hovered (as the game does in the usual view modes).
     pub fn in_state(self, state: OutlineState) -> Self {

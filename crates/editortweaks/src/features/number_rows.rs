@@ -9,7 +9,7 @@
 use core::ffi::c_void;
 use std::sync::{Mutex, OnceLock, PoisonError};
 
-use crate::framework::hook;
+use crate::framework::{hook, timings};
 use crate::game::property_widget::{self, UpdateValueFn};
 
 /// Runs around a row's update: called with the row (a live `UNumericPropertyWidget`, on the game
@@ -46,6 +46,7 @@ fn hook_update() -> Result<(), String> {
 }
 
 unsafe extern "C" fn update_value(this: *mut c_void, event: *const c_void) {
+    let _span = timings::span("number_rows::update_value");
     let original = *ORIGINAL.get().expect("hook recorded before use");
     // Copied out, so that a listener may add another meanwhile without a deadlock.
     let listeners = LISTENERS
@@ -53,7 +54,11 @@ unsafe extern "C" fn update_value(this: *mut c_void, event: *const c_void) {
         .unwrap_or_else(PoisonError::into_inner)
         .clone();
     // SAFETY: forwards the caller's arguments unchanged.
-    let mut update = || unsafe { original(this, event) };
+    let mut update = || {
+        timings::game(property_widget::UPDATE_VALUE.name, || unsafe {
+            original(this, event)
+        })
+    };
     // SAFETY: UpdateValue is a UNumericPropertyWidget member, so `this` is a live row, and UI code
     // runs on the game thread.
     unsafe { run(&listeners, this, &mut update) };

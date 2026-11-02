@@ -52,6 +52,7 @@ fn join_load_and_edit_over_tcp() {
             HostSettings {
                 code: "abc".into(),
                 max_members: 3,
+                approve: false,
             },
             3,
         )

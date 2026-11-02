@@ -20,6 +20,56 @@ pub const MIN_ANGLE: f64 = 1.0;
 /// The panel's smallest radius and size (cm).
 pub const MIN_LENGTH: f64 = 1.0;
 
+/// The game's cross-section shapes (`ESpinnerBrickShape`, 0 to 12) grouped into families: the
+/// variants of one shape that differ in which way they point (in, out or up). Rectangle, triangle,
+/// isosceles triangle, circle, half circle, quarter circle, diamond.
+const SHAPE_FAMILIES: [&[u8]; 7] = [
+    &[0],
+    &[1, 2],
+    &[3, 4, 5],
+    &[6],
+    &[7, 8, 9],
+    &[10, 11],
+    &[12],
+];
+
+/// The family `shape` is in, and its place in it. `None` for a number that isn't a shape.
+fn family_of(shape: u8) -> Option<(usize, usize)> {
+    SHAPE_FAMILIES
+        .iter()
+        .enumerate()
+        .find_map(|(family, variants)| {
+            let place = variants.iter().position(|&variant| variant == shape)?;
+            Some((family, place))
+        })
+}
+
+/// The next variant of `shape` in its family, going round (the last one gives the first); a shape
+/// that is its family's only one stays. A number that isn't a shape is returned as it is.
+pub fn next_variant(shape: u8) -> u8 {
+    match family_of(shape) {
+        Some((family, place)) => {
+            let variants = SHAPE_FAMILIES[family];
+            variants[(place + 1) % variants.len()]
+        }
+        None => shape,
+    }
+}
+
+/// The same variant of the next family, going round (the diamond gives the rectangle): the one in
+/// the same place in its family, or the next family's first if it has fewer variants (a half
+/// circle's outward variant, the second, gives the quarter circle's second, but its upward one, the
+/// third, gives the quarter circle's first). A number that isn't a shape is returned as it is.
+pub fn next_family(shape: u8) -> u8 {
+    match family_of(shape) {
+        Some((family, place)) => {
+            let next = SHAPE_FAMILIES[(family + 1) % SHAPE_FAMILIES.len()];
+            next.get(place).copied().unwrap_or(next[0])
+        }
+        None => shape,
+    }
+}
+
 /// A spinner's values (`USpinnerBrick`'s properties).
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Spinner {
@@ -111,6 +161,71 @@ impl Spinner {
     pub fn outward(t: f64) -> Vec3 {
         let (sin, cos) = t.sin_cos();
         [-sin, cos, 0.0]
+    }
+
+    /// The way the point at angle `t` (radians), `across` the ring, goes along the arc as `t` grows
+    /// (length 1); `None` where the ring has no length there (at the hub).
+    pub fn along(&self, t: f64, across: f64) -> Option<Vec3> {
+        let (sin, cos) = t.sin_cos();
+        let way = [
+            -cos * (self.radius[0] + across),
+            -sin * (self.radius[1] + across),
+            0.0,
+        ];
+        normalized(way)
+    }
+
+    /// The outward normal of a cap (length 1): the end's, or the start's, away from the arc.
+    pub fn cap_normal(&self, end: bool) -> Option<Vec3> {
+        let t = if end { self.radians() } else { 0.0 };
+        let along = self.along(t, 0.0)?;
+        // The arc goes on along `along` from the start for a positive angle, back along it at the
+        // end; the other way round for a negative one.
+        let out = if end == (self.angle >= 0.0) {
+            1.0
+        } else {
+            -1.0
+        };
+        Some(along.map(|axis| axis * out))
+    }
+
+    /// The outward normal (length 1) of the surface swept by the cross-section's segment from
+    /// `start` to `end` (from -1 to 1) at angle `t` (radians), `inside` being a point inside the
+    /// cross-section: across the segment and along the arc. `None` for a segment of no length, or
+    /// at the hub.
+    pub fn surface_normal(
+        &self,
+        t: f64,
+        start: [f64; 2],
+        end: [f64; 2],
+        inside: [f64; 2],
+    ) -> Option<Vec3> {
+        let middle = [(start[0] + end[0]) / 2.0, (start[1] + end[1]) / 2.0];
+        let half = [self.thickness() / 2.0, self.height() / 2.0];
+        let across = self.along(t, middle[0] * half[0])?;
+        // Across the ring, then up: the segment in cm.
+        let outward = Self::outward(t);
+        let segment = [(end[0] - start[0]) * half[0], (end[1] - start[1]) * half[1]];
+        let tangent = [outward[0] * segment[0], outward[1] * segment[0], segment[1]];
+        let normal = normalized(cross(tangent, across))?;
+        let away = sub(self.section_point(t, middle), self.section_point(t, inside));
+        let facing = normal[0] * away[0] + normal[1] * away[1] + normal[2] * away[2];
+        Some(if facing < 0.0 {
+            normal.map(|axis| -axis)
+        } else {
+            normal
+        })
+    }
+
+    /// The angles (radians) of the quarter turns strictly inside the arc (not at its ends): where
+    /// its lines go furthest along the brick's X or Y axis, or cross it.
+    pub fn quarter_turns(&self) -> Vec<f64> {
+        let arc = self.radians();
+        let way = if arc < 0.0 { -1.0 } else { 1.0 };
+        (1..=4)
+            .map(|quarter| way * f64::from(quarter) * FRAC_PI_2)
+            .take_while(|t| t.abs() < arc.abs() - 1e-9)
+            .collect()
     }
 
     /// Where `point` is (see [`Place`]), if it isn't at the hub.
@@ -350,6 +465,23 @@ pub fn offset_to_ellipse(point: [f64; 2], semi: [f64; 2]) -> Option<f64> {
         }
     }
     Some((low + high) / 2.0)
+}
+
+fn sub(a: Vec3, b: Vec3) -> Vec3 {
+    [a[0] - b[0], a[1] - b[1], a[2] - b[2]]
+}
+
+fn cross(a: Vec3, b: Vec3) -> Vec3 {
+    [
+        a[1] * b[2] - a[2] * b[1],
+        a[2] * b[0] - a[0] * b[2],
+        a[0] * b[1] - a[1] * b[0],
+    ]
+}
+
+fn normalized(a: Vec3) -> Option<Vec3> {
+    let length = (a[0] * a[0] + a[1] * a[1] + a[2] * a[2]).sqrt();
+    (length > 1e-12).then(|| a.map(|axis| axis / length))
 }
 
 /// The angle of `point` along the ellipse with semi-axes `semi` (radians, in (-pi, pi]): the `t`
@@ -704,6 +836,53 @@ mod tests {
     }
 
     #[test]
+    fn variants_cycle_within_their_family() {
+        let cycle = |start: u8| -> Vec<u8> {
+            let mut shapes = vec![start];
+            loop {
+                let next = next_variant(*shapes.last().unwrap());
+                if next == start {
+                    return shapes;
+                }
+                shapes.push(next);
+            }
+        };
+        assert_eq!(cycle(1), [1, 2]);
+        assert_eq!(cycle(5), [5, 3, 4]);
+        assert_eq!(cycle(9), [9, 7, 8]);
+        assert_eq!(cycle(11), [11, 10]);
+        // Families of one stay.
+        for alone in [0, 6, 12] {
+            assert_eq!(next_variant(alone), alone);
+        }
+        // Not a shape.
+        assert_eq!(next_variant(13), 13);
+        assert_eq!(next_variant(255), 255);
+    }
+
+    #[test]
+    fn families_follow_each_other_keeping_the_variant() {
+        // Rectangle, triangle, isosceles triangle, circle, half circle, quarter circle, diamond.
+        let firsts = [0, 1, 3, 6, 7, 10, 12];
+        let mut shape = 0;
+        for &first in firsts.iter().cycle().skip(1).take(8) {
+            shape = next_family(shape);
+            assert_eq!(shape, first);
+        }
+        // The variant's place is kept where the next family has one, else its first.
+        assert_eq!(next_family(2), 4);
+        assert_eq!(next_family(4), 6);
+        assert_eq!(next_family(5), 6);
+        assert_eq!(next_family(7), 10);
+        assert_eq!(next_family(8), 11);
+        assert_eq!(next_family(9), 10);
+        assert_eq!(next_family(11), 12);
+        assert_eq!(next_family(12), 0);
+        // Not a shape.
+        assert_eq!(next_family(13), 13);
+    }
+
+    #[test]
     fn the_box_is_the_swept_box() {
         for &angle in &[
             1.0, 45.0, 90.0, 135.0, 200.0, 280.0, 360.0, -60.0, -190.0, -300.0,
@@ -1042,5 +1221,91 @@ mod tests {
             facings(&outline),
             [[0.0, -1.0], [1.0, 0.0], [0.0, 1.0], [-1.0, 0.0]]
         );
+    }
+
+    fn close3(a: Vec3, b: Vec3) -> bool {
+        (0..3).all(|axis| (a[axis] - b[axis]).abs() <= 1e-9)
+    }
+
+    #[test]
+    fn along_follows_the_arc() {
+        // A difference along the arc, against the direction.
+        for spinner in [
+            spinner([50.0, 50.0], [10.0, 10.0], 90.0),
+            spinner([80.0, 30.0], [10.0, 10.0], -200.0),
+        ] {
+            for &(t, across) in &[(0.0, 0.0), (0.8, 4.0), (-2.0, -5.0)] {
+                let step = 1e-6;
+                let ahead = sub(
+                    spinner.point(t + step, across, 0.0),
+                    spinner.point(t, across, 0.0),
+                );
+                let way = normalized(ahead).unwrap();
+                let along = spinner.along(t, across).unwrap();
+                assert!(
+                    (0..3).all(|axis| (way[axis] - along[axis]).abs() < 1e-5),
+                    "{along:?} {way:?}"
+                );
+            }
+        }
+        assert_eq!(
+            spinner([0.0, 0.0], [10.0, 10.0], 90.0).along(1.0, 0.0),
+            None
+        );
+    }
+
+    #[test]
+    fn caps_face_away_from_the_arc() {
+        let quarter = spinner([50.0, 50.0], [10.0, 10.0], 90.0);
+        // From +Y toward -X: the start faces +X, the end at -X faces -Y.
+        assert!(close3(quarter.cap_normal(false).unwrap(), [1.0, 0.0, 0.0]));
+        assert!(close3(quarter.cap_normal(true).unwrap(), [0.0, -1.0, 0.0]));
+        let back = spinner([50.0, 50.0], [10.0, 10.0], -90.0);
+        assert!(close3(back.cap_normal(false).unwrap(), [-1.0, 0.0, 0.0]));
+        assert!(close3(back.cap_normal(true).unwrap(), [0.0, -1.0, 0.0]));
+    }
+
+    #[test]
+    fn sides_face_out_of_the_cross_section() {
+        let ring = spinner([50.0, 50.0], [10.0, 20.0], 270.0);
+        let inside = [0.0, 0.0];
+        let t = 1.0;
+        let outward = Spinner::outward(t);
+        // The square's outer, top, inner and bottom sides.
+        let outer = ring
+            .surface_normal(t, [1.0, -1.0], [1.0, 1.0], inside)
+            .unwrap();
+        assert!(close3(outer, outward), "{outer:?}");
+        let top = ring
+            .surface_normal(t, [1.0, 1.0], [-1.0, 1.0], inside)
+            .unwrap();
+        assert!(close3(top, [0.0, 0.0, 1.0]), "{top:?}");
+        let inner = ring
+            .surface_normal(t, [-1.0, 1.0], [-1.0, -1.0], inside)
+            .unwrap();
+        assert!(close3(inner, outward.map(|axis| -axis)), "{inner:?}");
+        let bottom = ring
+            .surface_normal(t, [-1.0, -1.0], [1.0, -1.0], inside)
+            .unwrap();
+        assert!(close3(bottom, [0.0, 0.0, -1.0]), "{bottom:?}");
+        // A slanted side, either way round: half out, half up, stretched by the sizes.
+        let slanted = ring.surface_normal(t, [1.0, -1.0], [-1.0, 1.0], [1.0, 1.0]);
+        let flipped = ring.surface_normal(t, [-1.0, 1.0], [1.0, -1.0], [1.0, 1.0]);
+        assert_eq!(slanted, flipped);
+        let slanted = slanted.unwrap();
+        // Across it: (-10, 20) in cm, so its normal is (-2, -1) over its length, facing down-in.
+        let expected = [-2.0 * outward[0], -2.0 * outward[1], -1.0].map(|axis| axis / 5f64.sqrt());
+        assert!(close3(slanted, expected), "{slanted:?}");
+        assert_eq!(ring.surface_normal(t, [1.0, 1.0], [1.0, 1.0], inside), None);
+    }
+
+    #[test]
+    fn quarter_turns_are_inside_the_arc() {
+        let quarters = |angle: f64| spinner([50.0, 50.0], [10.0, 10.0], angle).quarter_turns();
+        assert!(quarters(90.0).is_empty());
+        assert_eq!(quarters(91.0), [FRAC_PI_2]);
+        assert_eq!(quarters(270.0), [FRAC_PI_2, PI]);
+        assert_eq!(quarters(360.0), [FRAC_PI_2, PI, 3.0 * FRAC_PI_2]);
+        assert_eq!(quarters(-200.0), [-FRAC_PI_2, -PI]);
     }
 }

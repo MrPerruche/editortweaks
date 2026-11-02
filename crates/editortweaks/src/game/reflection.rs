@@ -2,8 +2,10 @@
 //! Names survive game updates and offsets are read from the running game, so layout changes don't
 //! matter. Only usable after engine init (see `Feature::on_engine_init`).
 
+use core::cell::RefCell;
 use core::ffi::c_void;
 use core::marker::PhantomData;
+use std::collections::HashMap;
 
 use brickrust::ue::coreuobject::{
     EObjectFlags, FStaticConstructObjectParameters, GObjects, StaticConstructObject_Internal,
@@ -15,7 +17,8 @@ use brickrust::ue::fproperty::FProperty;
 use brickrust::ue::tarray::TArray;
 use brickrust::ue::uclass::{UClass, UFunction, UStruct};
 
-use crate::framework::sig;
+use crate::framework::{sig, timings};
+use crate::game::weak_object::WeakObject;
 
 /// `FProperty::PropertyFlags` bit of a function's return value (`CPF_ReturnParm`).
 pub const RETURN_PARAMETER: u64 = 0x400;
@@ -69,39 +72,62 @@ pub unsafe fn name_text(name: &FName) -> String {
 }
 
 /// The native class called `name`, without its `U`/`A` prefix (e.g. `"BrickSliderWidget"`).
-/// Walks every live object, so call it once and keep the result.
+/// See [`find_object`].
 pub fn find_class(name: &'static str) -> Option<*const UClass> {
     find_object(name, "Class").map(|object| object as *const UClass)
 }
 
+thread_local! {
+    /// What [`find_object`] found, by name and class (not what it didn't: it may load later).
+    static FOUND: RefCell<HashMap<(&'static str, &'static str), WeakObject>> =
+        RefCell::new(HashMap::new());
+}
+
 /// The first live object called `name` whose class is called `class` (e.g. an enum: `"Enum"`; a
-/// class's default object: `"Default__KismetStringLibrary"`, `"KismetStringLibrary"`). Walks every
-/// live object, so call it once and keep the result.
+/// class's default object: `"Default__KismetStringLibrary"`, `"KismetStringLibrary"`). The first
+/// call walks every live object (milliseconds with a big vehicle in the editor); later ones find
+/// the same object again at once while it lives, so features may look things up when needed.
 pub fn find_object(name: &'static str, class: &'static str) -> Option<*mut UObjectBase> {
+    let _span = timings::span("reflection::find_object");
     // SAFETY: runs on the game thread after engine init; GObjects slots hold live objects or null,
     // and every object has a valid class pointer.
     unsafe {
-        let wanted = FName::search_str(name);
+        // Walks the name pool, the first time for each name.
+        let wanted = {
+            let _span = timings::span("brickrust::FName::search_str");
+            FName::search_str(name)
+        };
         if wanted.is_none() {
             return None;
         }
-        GObjects()
+        let is_wanted = |object: *mut UObjectBase| {
+            !object.is_null()
+                && (*object).name_private.comparison_index == wanted.comparison_index
+                && (*object).name_private.number == wanted.number
+                && !(*object).class_private.is_null()
+                && name_is(
+                    &(*(*object).class_private)
+                        .ustruct
+                        .ufield
+                        .uobject
+                        .name_private,
+                    class,
+                )
+        };
+        let found =
+            FOUND.with_borrow(|found| found.get(&(name, class)).and_then(WeakObject::get_live));
+        // Checked again: a new object may have taken the slot and the address of a destroyed one.
+        if let Some(object) = found
+            && is_wanted(object)
+        {
+            return Some(object);
+        }
+        let object = GObjects()
             .iter()
-            .find(|&object| {
-                !object.is_null()
-                    && (*object).name_private.comparison_index == wanted.comparison_index
-                    && (*object).name_private.number == wanted.number
-                    && !(*object).class_private.is_null()
-                    && name_is(
-                        &(*(*object).class_private)
-                            .ustruct
-                            .ufield
-                            .uobject
-                            .name_private,
-                        class,
-                    )
-            })
-            .map(|object| object.cast())
+            .find(|&object| is_wanted(object.cast()))?
+            .cast();
+        FOUND.with_borrow_mut(|found| found.insert((name, class), WeakObject::new(object)));
+        Some(object)
     }
 }
 
@@ -294,7 +320,6 @@ impl BoolField {
     }
 
     /// The same field in a struct `by` bytes into another (where the struct is a field).
-    #[cfg(feature = "coop")]
     pub fn shifted(self, by: usize) -> Self {
         Self {
             offset: self.offset + by,

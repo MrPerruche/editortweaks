@@ -1,6 +1,6 @@
 //! The two groups each editor object is in (`EBrickGroupType`: 0 editor group, 1 weld group), as
 //! group numbers (0: in none): coop reads and writes them (`docs/re/coop/change-hooks.md`,
-//! section 3); only in builds with the `coop` feature.
+//! section 3).
 //!
 //! Neither is reflected: the weld group is a `uint16` in the object, the editor group a `uint16`
 //! in its `EditorParams`. Every game function that groups objects writes these words inline, then

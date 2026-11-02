@@ -84,6 +84,33 @@ pub const GUIDE: Pen = Pen {
     on_top: true,
     halo: true,
 };
+/// The selected spinners' curve (`spinner_curve`): its centre line, its nodes and handles' tips,
+/// and its handles.
+pub const CURVE: Pen = Pen {
+    color: [0.0, 0.8, 0.55],
+    pixels: 1.5,
+    on_top: true,
+    halo: true,
+};
+pub const CURVE_CONTROL: Pen = Pen {
+    color: [0.0, 0.8, 0.55],
+    pixels: 2.5,
+    on_top: true,
+    halo: true,
+};
+pub const CURVE_HANDLE: Pen = Pen {
+    color: [0.0, 0.8, 0.55],
+    pixels: 1.0,
+    on_top: true,
+    halo: false,
+};
+/// From a curve's control the spinners hold back to where the mouse asks for it (dashed).
+pub const CURVE_HELD: Pen = Pen {
+    color: [1.0, 0.35, 0.2],
+    pixels: 1.5,
+    on_top: true,
+    halo: true,
+};
 /// A spinner's hub, while it's under the mouse with the resize key held.
 pub const HUB: Pen = Pen {
     color: [0.55, 0.85, 1.0],
@@ -159,6 +186,8 @@ pub enum Mark {
     /// An X in a square.
     BoxedCross,
     Hourglass,
+    /// A +.
+    Plus,
 }
 
 /// The size of a pixel at a distance from the camera, and the screen's directions, in the vehicle.
@@ -363,6 +392,7 @@ impl Drawing {
         /// A point of a mark: x going right and y down on the screen, from -1 to 1.
         type Spot = (f64, f64);
         const X: [[Spot; 2]; 2] = [[(-0.8, -0.8), (0.8, 0.8)], [(-0.8, 0.8), (0.8, -0.8)]];
+        const PLUS: [[Spot; 2]; 2] = [[(-1.0, 0.0), (1.0, 0.0)], [(0.0, -1.0), (0.0, 1.0)]];
         let square = vec![(-1.0, -1.0), (1.0, -1.0), (1.0, 1.0), (-1.0, 1.0)];
         // A closed outline, and lines.
         let (outline, lines): (Vec<Spot>, &[[Spot; 2]]) = match mark {
@@ -385,6 +415,7 @@ impl Drawing {
                 vec![(-1.0, -1.0), (1.0, -1.0), (-1.0, 1.0), (1.0, 1.0)],
                 &[],
             ),
+            Mark::Plus => (Vec::new(), &PLUS),
         };
         let half = self.pixels.of(size, point) / 2.0;
         let (right, down) = (self.pixels.right, self.pixels.down);

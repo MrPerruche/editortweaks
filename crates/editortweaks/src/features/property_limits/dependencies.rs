@@ -28,7 +28,7 @@ use brickrust::ue::uclass::UStruct;
 
 use super::limits::{self, Edit, MAX_DEPENDENCY_SIZE, Previous, SAFE_MAX};
 use super::{brick_size, rules};
-use crate::framework::hook;
+use crate::framework::{hook, timings};
 use crate::game::brick_property::{self, CanModifyFn, ChangedEvent, PostModifyFn};
 use crate::game::numeric_property::{Container, NumericRange, NumericValue};
 use crate::game::reflection;
@@ -121,27 +121,39 @@ unsafe extern "C" fn can_modify_detour(
     edit_info: *const c_void,
     container: *const Container,
 ) -> u8 {
+    let _span = timings::span("property_limits::can_modify_detour");
     let original = *CAN_MODIFY.get().expect("hook recorded before use");
     if super::slider::active() && !container.is_null() {
         // SAFETY: the editor passes a live container, whose root is a live object or null.
         unsafe { record((*container).root().cast()) };
     }
     // SAFETY: forwards the caller's arguments unchanged.
-    unsafe { original(edit_info, container) }
+    unsafe {
+        timings::game(brick_property::CAN_MODIFY.name, || {
+            original(edit_info, container)
+        })
+    }
 }
 
 unsafe extern "C" fn post_modify_detour(interface: *mut c_void, event: *mut ChangedEvent) {
+    let _span = timings::span("property_limits::post_modify_detour");
     let original = *POST_MODIFY.get().expect("hook recorded before use");
     if !super::slider::active() || REPORTING.get() || interface.is_null() || event.is_null() {
         // SAFETY: forwards the caller's arguments unchanged.
-        return unsafe { original(interface, event) };
+        return unsafe {
+            timings::game(scalable_brick::POST_MODIFY.name, || {
+                original(interface, event)
+            })
+        };
     }
     // SAFETY: the game passes a live brick's `IBrickPropertyInterface` and an event that stays
     // valid during the call. UI code only runs on the game thread.
     unsafe {
         let object = brick_property::object_of(interface);
         let limited = limit_dependents(object, &*event);
-        original(interface, event);
+        timings::game(scalable_brick::POST_MODIFY.name, || {
+            original(interface, event)
+        });
         for property in limited {
             report(interface, &mut *event, property);
         }

@@ -28,7 +28,7 @@ use brickrust::ue::coreuobject::UObjectBase;
 use brickrust::ue::fname::FName;
 
 use super::click_swap;
-use crate::framework::hook;
+use crate::framework::{hook, timings};
 use crate::game::input_table::{self, Action, InputTables, LoadAssetLibrariesFn};
 use crate::game::kismet;
 use crate::game::player_input::{self, Chord, PlayerInputs};
@@ -56,12 +56,13 @@ pub static ADD_TO_DRAG_SELECTION: Keybind = Keybind::new(
     &["LeftShift", "RightShift"],
 );
 
-/// Shows the box of the brick under the mouse while held; clicking then resizes it, or moves it
-/// while moving bricks with the gizmo showing (`brick_resize`).
+/// Shows the box of the brick under the mouse while held, or while toggled on by a tap of it (see
+/// `brick_resize::is_fast_editing`); clicking then resizes it, or moves it while moving bricks with
+/// the gizmo showing (`brick_resize`).
 pub static RESIZE_BRICKS: Keybind = Keybind::new(
     "EditorTweaks_ResizeBricks",
     "Fast editing",
-    "Hold to show the box of a brick under the mouse. Use this box to move or resize it.",
+    "Hold to show the box of a brick under the mouse. Use this box to move or resize it. Can be a key to tap instead (a setting: Editor tweaks options, Fast editing).",
     &["LeftAlt", "RightAlt"],
 );
 
@@ -70,8 +71,8 @@ pub static RESIZE_BRICKS: Keybind = Keybind::new(
 pub static MODEL_EDITING: Keybind = Keybind::new(
     "EditorTweaks_ModelEditing",
     "Use models",
-    "Hold while fast editing to use the faces, edges and vertices of bricks' models instead of their boxes.",
-    &["ThumbMouseButton", "ThumbMouseButton2", "Tab"],
+    "Hold while fast editing to use the faces, edges and vertices of bricks' models instead of their boxes (for spinners, their model's facets instead of their own corners, lines and sides). On the middle mouse button, a quick click of it copies looks instead.",
+    &["MiddleMouseButton", "ThumbMouseButton", "ThumbMouseButton2"],
 );
 
 /// Snaps the dragged part to other bricks while held during a resize or move (`brick_resize`).
@@ -89,6 +90,26 @@ pub static NEXT_ORIENTATION: Keybind = Keybind::new(
     "Next orientation",
     "Press while moving bricks with fast editing snapping to turn them the next way that matches the face or edge they snap to.",
     &["R"],
+);
+
+/// Pressed while fast editing (the resize key held) over a spinner, switches its cross-section to
+/// the next variant of its shape: inward, outward, upward (`brick_resize`). R also turns snapped
+/// moves ([`NEXT_ORIENTATION`]), which only exist while moving bricks.
+pub static NEXT_SPINNER_VARIANT: Keybind = Keybind::new(
+    "EditorTweaks_NextSpinnerVariant",
+    "Next spinner variant",
+    "Press while fast editing over a spinner to switch its cross-section to the next variant of its shape (inward, outward, upward). One step to undo; its mirror mode counterpart changes too.",
+    &["R"],
+);
+
+/// Like [`NEXT_SPINNER_VARIANT`], but switches to the next shape: rectangle, triangle, isosceles
+/// triangle, circle, half circle, quarter circle, diamond (`brick_resize`). Takes the press when
+/// both keys are held, its key including [`NEXT_SPINNER_VARIANT`]'s.
+pub static NEXT_SPINNER_SHAPE: Keybind = Keybind::new(
+    "EditorTweaks_NextSpinnerShape",
+    "Next spinner shape",
+    "Press while fast editing over a spinner to switch its cross-section to the next shape (rectangle, triangle, isosceles triangle, circle, half circle, quarter circle, diamond), keeping its variant where the shape has it. One step to undo; its mirror mode counterpart changes too.",
+    &["Ctrl+R"],
 );
 
 /// Clicked while fast editing moved bricks (the resize key held), places a point of the line they
@@ -127,7 +148,7 @@ pub static CLEAR_LINE: Keybind = Keybind::new(
 pub static COPY_LOOKS: Keybind = Keybind::new(
     "EditorTweaks_CopyLooks",
     "Copy brick looks",
-    "Click while fast editing to copy the color, material, pattern and pattern scale, rotation and offset of the brick under the mouse onto the selected bricks (one step to undo); new bricks get them too. Not when the left or right mouse button is pressed before letting go of it (a drag), or the mouse moves.",
+    "Click while fast editing to copy the color, material, pattern and pattern scale, rotation and offset of the brick under the mouse onto the selected bricks (one step to undo); new bricks get them too. Not when the left or right mouse button is pressed before letting go of it (a drag), the mouse moves, or it is held longer than a moment.",
     &["MiddleMouseButton"],
 );
 
@@ -136,7 +157,7 @@ pub static COPY_LOOKS: Keybind = Keybind::new(
 pub static COPY_PROPERTIES: Keybind = Keybind::new(
     "EditorTweaks_CopyProperties",
     "Copy brick properties",
-    "Click while fast editing to copy every property of the brick under the mouse that the selected bricks have (looks, size, wheel and axle settings, input channels...) onto them (one step to undo); not names. New bricks get its looks too. Not when the left or right mouse button is pressed before letting go of it (a drag), or the mouse moves.",
+    "Click while fast editing to copy every property of the brick under the mouse that the selected bricks have (looks, size, wheel and axle settings, input channels...) onto them (one step to undo); not names. New bricks get its looks too. Not when the left or right mouse button is pressed before letting go of it (a drag), the mouse moves, or it is held longer than a moment.",
     &["Ctrl+MiddleMouseButton"],
 );
 
@@ -226,9 +247,9 @@ pub static EXPORT_MODEL: Keybind = Keybind::menu(
     "/Game/BrickRigs/UI/Textures/Icons/T_SaveFileAs.T_SaveFileAs",
 );
 
-/// Coop builds only: makes this member's vehicle differ from the coop session's on purpose, to test
-/// that it's noticed and mended (`coop`'s `drift`).
-#[cfg(feature = "coop")]
+/// Coop test builds only: makes this member's vehicle differ from the coop session's on purpose, to
+/// test that it's noticed and mended (`coop`'s `drift`).
+#[cfg(feature = "coop-test")]
 pub static COOP_DRIFT: Keybind = Keybind::new(
     "EditorTweaks_CoopDrift",
     "Coop test: drift on purpose",
@@ -236,11 +257,47 @@ pub static COOP_DRIFT: Keybind = Keybind::new(
     &["Ctrl+F8"],
 );
 
-/// The Tools section's keybinds (with the coop test's, in coop builds).
-#[cfg(feature = "coop")]
-const TOOLS: &[&Keybind] = &[&EXPORT_MODEL, &COOP_DRIFT];
-#[cfg(not(feature = "coop"))]
-const TOOLS: &[&Keybind] = &[&EXPORT_MODEL];
+/// Opens the coop page (`coop::ui`).
+pub static COOP_MENU: Keybind = Keybind::menu(
+    "EditorTweaks_Coop",
+    "Coop...",
+    "Press in the editor (or pick it in the editor's Editor tweaks menu) to open the coop page: host this vehicle, join a friend hosting, answer who asks to join, leave.",
+    &[],
+    "/Game/BrickRigs/UI/Textures/Icons/T_Dummy.T_Dummy",
+);
+
+/// The coop subhost lets in the oldest player asking to join (`coop`).
+pub static COOP_ACCEPT_JOIN: Keybind = Keybind::new(
+    "EditorTweaks_CoopAcceptJoin",
+    "Coop: accept a join request",
+    "While hosting, lets in the player a notification says asks to join (the oldest, if several ask).",
+    &["Ctrl+F9"],
+);
+
+/// The coop subhost refuses the oldest player asking to join (`coop`).
+pub static COOP_REFUSE_JOIN: Keybind = Keybind::new(
+    "EditorTweaks_CoopRefuseJoin",
+    "Coop: refuse a join request",
+    "While hosting, refuses the player a notification says asks to join (the oldest, if several ask).",
+    &["Ctrl+F10"],
+);
+
+/// The Tools section's keybinds (with coop's; the drift key in test builds only).
+#[cfg(feature = "coop-test")]
+const TOOLS: &[&Keybind] = &[
+    &EXPORT_MODEL,
+    &COOP_MENU,
+    &COOP_ACCEPT_JOIN,
+    &COOP_REFUSE_JOIN,
+    &COOP_DRIFT,
+];
+#[cfg(not(feature = "coop-test"))]
+const TOOLS: &[&Keybind] = &[
+    &EXPORT_MODEL,
+    &COOP_MENU,
+    &COOP_ACCEPT_JOIN,
+    &COOP_REFUSE_JOIN,
+];
 
 /// Every keybind, by section, in the order the settings list them. The sections are the
 /// changelog's headers (those having keys).
@@ -254,6 +311,8 @@ static SECTIONS: [Section; 6] = [
             &MODEL_EDITING,
             &LINE_POINT,
             &NEXT_ORIENTATION,
+            &NEXT_SPINNER_VARIANT,
+            &NEXT_SPINNER_SHAPE,
             &SLIDE_ALONG_LINE,
             &CLEAR_LINE,
             &COPY_LOOKS,
@@ -651,11 +710,16 @@ impl Feature for Keybinds {
 }
 
 unsafe extern "C" fn load_asset_libraries(manager: *mut UObjectBase, mode: u8) {
+    let _span = timings::span("keybinds::load_asset_libraries");
     let Some(original) = ORIGINAL_LOAD.get() else {
         return;
     };
     // SAFETY: forwards the caller's arguments.
-    unsafe { original(manager, mode) };
+    unsafe {
+        timings::game(input_table::LOAD_ASSET_LIBRARIES.name, || {
+            original(manager, mode)
+        })
+    };
     // SAFETY: the asset manager the game just filled, on the game thread.
     if let Err(reason) = unsafe { add_ours(manager) } {
         log!("keybinds not in the input settings: {reason}");

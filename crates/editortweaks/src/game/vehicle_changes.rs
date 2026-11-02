@@ -1,6 +1,5 @@
-//! Where the vehicle editor's objects come and go, for coop to pass on (only in builds with the
-//! `coop` feature). Found statically in game 1.11.7 (build 25831956) against BRMK 1.11.6
-//! (`docs/re/coop/change-hooks.md`, sections 1, 2 and 5):
+//! Where the vehicle editor's objects come and go, for coop to pass on. Found statically in game 1.11.7 (build 25831956)
+//! against BRMK 1.11.6 (`docs/re/coop/change-hooks.md`, sections 1, 2 and 5):
 //!
 //! - every new object passes `virtual void AVehicleEditor::OnBrickEditorObjectsCreated(const
 //!   TArray<UBrickEditorObject*>&, EBrickEditorObjectCreationContext)` (BRMK 0xC18D0, game RVA
@@ -17,6 +16,7 @@ use brickrust::ue::tarray::TArray;
 
 use crate::framework::hook;
 use crate::framework::sig::{self, FunctionSig};
+use crate::framework::timings;
 use crate::game::vehicle_archive::{self, DestroyObjectsFn};
 
 /// The call of `OnBrickEditorObjectsCreated` for a new brick (in
@@ -103,6 +103,7 @@ unsafe extern "C" fn created_detour(
     objects: *const TArray<*mut UObjectBase>,
     context: u8,
 ) {
+    let _span = timings::span("game::vehicle_changes::created_detour");
     let original = *ORIGINAL_CREATED.get().expect("hook recorded before use");
     // SAFETY: the game's array of new objects; copied first, as the editor may change it.
     let created = unsafe { objects_of(objects) };
@@ -112,7 +113,11 @@ unsafe extern "C" fn created_detour(
         context
     };
     // SAFETY: the original function with its own arguments (the context one it knows).
-    unsafe { original(editor, objects, passed) };
+    unsafe {
+        timings::game("AVehicleEditor::OnBrickEditorObjectsCreated", || {
+            original(editor, objects, passed)
+        })
+    };
     if let Some(callback) = ON_CREATED.get() {
         callback(editor, &created, context);
     }
@@ -123,6 +128,7 @@ unsafe extern "C" fn destroy_detour(
     objects: *const TArray<*mut UObjectBase>,
     all: bool,
 ) -> bool {
+    let _span = timings::span("game::vehicle_changes::destroy_detour");
     let original = *ORIGINAL_DESTROY.get().expect("hook recorded before use");
     // SAFETY: the game's array; copied, as it may be the component's own array, which emptying
     // the vehicle changes.
@@ -133,7 +139,11 @@ unsafe extern "C" fn destroy_detour(
         callback(component, &doomed);
     }
     // SAFETY: the original function with its own arguments.
-    unsafe { original(component, objects, all) }
+    unsafe {
+        timings::game(vehicle_archive::DESTROY_OBJECTS.name, || {
+            original(component, objects, all)
+        })
+    }
 }
 
 /// Calls `callback` before any editor objects are destroyed, from now on. Only the first

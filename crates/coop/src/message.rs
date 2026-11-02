@@ -6,6 +6,7 @@
 use crate::audit::{Audit, Digest};
 use crate::ids::{Check, CoopId, Slot};
 use crate::ops::{Op, read_ids, read_ops, write_ids, write_ops};
+use crate::presence::View;
 use crate::wire::{DecodeError, Reader, Result, Writer};
 
 /// A peer's address on the transport: a SteamID64 over Steam, any made-up number elsewhere.
@@ -13,7 +14,7 @@ pub type PeerId = u64;
 
 pub const MAGIC: [u8; 2] = *b"ET";
 /// Bumped whenever a message changes.
-pub const PROTOCOL: u16 = 3;
+pub const PROTOCOL: u16 = 6;
 /// magic + protocol + kind + session.
 pub const HEADER_LEN: usize = 2 + 2 + 1 + 4;
 
@@ -61,6 +62,10 @@ pub enum RefuseReason {
     Full,
     /// Not hosting (any more).
     NotHosting,
+    /// The subhost banned us, for this many more minutes.
+    Banned {
+        minutes: u16,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -112,10 +117,20 @@ pub enum Message {
         slot: Slot,
         ids: Vec<CoopId>,
     },
+    /// Where a member's camera is (`None`: not in the editor's view). `slot` as for
+    /// [`Self::Selection`].
+    Camera {
+        slot: Slot,
+        view: Option<View>,
+    },
     Leave,
     Kick,
     Close,
     Ping,
+    /// A subhost invites us to its session, calling itself `name`.
+    Invite {
+        name: String,
+    },
     /// A piece of a message too big for one transport message (see `framing`).
     Part {
         index: u32,
@@ -146,12 +161,17 @@ impl Message {
             Self::Audit(_) => 16,
             Self::OrderWanted => 17,
             Self::Order { .. } => 18,
+            Self::Camera { .. } => 19,
+            Self::Invite { .. } => 20,
         }
     }
 
-    /// Whether it may be lost: only selections and pings, which are resent anyway.
+    /// Whether it may be lost: only selections, cameras and pings, which are resent anyway.
     pub fn reliable(&self) -> bool {
-        !matches!(self, Self::Selection { .. } | Self::Ping)
+        !matches!(
+            self,
+            Self::Selection { .. } | Self::Camera { .. } | Self::Ping
+        )
     }
 
     pub fn encode(&self, session: u32) -> Vec<u8> {
@@ -178,7 +198,17 @@ impl Message {
                 w.str(game_version);
             }
             Self::JoinAccepted { slot } => w.u8(*slot),
-            Self::JoinRefused(reason) => w.u8(*reason as u8),
+            Self::JoinRefused(reason) => match reason {
+                RefuseReason::WrongCode => w.u8(0),
+                RefuseReason::Refused => w.u8(1),
+                RefuseReason::GameVersion => w.u8(2),
+                RefuseReason::Full => w.u8(3),
+                RefuseReason::NotHosting => w.u8(4),
+                RefuseReason::Banned { minutes } => {
+                    w.u8(5);
+                    w.u16(*minutes);
+                }
+            },
             Self::Members(members) => {
                 w.count(members.len());
                 for m in members {
@@ -236,6 +266,16 @@ impl Message {
                 w.u32(*commit);
                 write_ids(&mut w, ids);
             }
+            Self::Camera { slot, view } => {
+                w.u8(*slot);
+                w.bool(view.is_some());
+                if let Some(view) = view {
+                    view.location
+                        .iter()
+                        .chain(&view.forward)
+                        .for_each(|&v| w.f32(v));
+                }
+            }
             Self::Resync
             | Self::OrderWanted
             | Self::Leave
@@ -247,6 +287,7 @@ impl Message {
                 w.u32(*count);
                 w.raw(data);
             }
+            Self::Invite { name } => w.str(name),
         }
         w.finish()
     }
@@ -290,6 +331,7 @@ impl Message {
                 2 => RefuseReason::GameVersion,
                 3 => RefuseReason::Full,
                 4 => RefuseReason::NotHosting,
+                5 => RefuseReason::Banned { minutes: r.u16()? },
                 tag => {
                     return Err(DecodeError::BadTag {
                         what: "refuse reason",
@@ -360,6 +402,9 @@ impl Message {
             12 => Self::Kick,
             13 => Self::Close,
             14 => Self::Ping,
+            20 => Self::Invite {
+                name: r.str("name", caps::NAME)?,
+            },
             15 => Self::Part {
                 index: r.u32()?,
                 count: r.u32()?,
@@ -397,6 +442,26 @@ impl Message {
                     .map(|_| crate::ops::read_id(&mut r))
                     .collect::<Result<_>>()?;
                 Self::Order { commit, ids }
+            }
+            19 => {
+                let slot = r.u8()?;
+                let view = if r.bool()? {
+                    let mut v = [0f32; 6];
+                    for value in &mut v {
+                        *value = r.f32()?;
+                    }
+                    let view = View {
+                        location: [v[0], v[1], v[2]],
+                        forward: [v[3], v[4], v[5]],
+                    };
+                    if !view.is_sane() {
+                        return Err(DecodeError::BadValue("camera"));
+                    }
+                    Some(view)
+                } else {
+                    None
+                };
+                Self::Camera { slot, view }
             }
             tag => {
                 return Err(DecodeError::BadTag {
@@ -439,6 +504,10 @@ mod tests {
             },
             Message::JoinAccepted { slot: 3 },
             Message::JoinRefused(RefuseReason::Full),
+            Message::JoinRefused(RefuseReason::Banned { minutes: 600 }),
+            Message::Invite {
+                name: "Perru".into(),
+            },
             Message::Members(vec![Member {
                 slot: 1,
                 peer: 76561198000000000,
@@ -480,6 +549,17 @@ mod tests {
             Message::Selection {
                 slot: 2,
                 ids: vec![id(2, 7)],
+            },
+            Message::Camera {
+                slot: 3,
+                view: Some(View {
+                    location: [1.0, -2.5, 300.0],
+                    forward: [0.0, 0.6, -0.8],
+                }),
+            },
+            Message::Camera {
+                slot: 1,
+                view: None,
             },
             Message::Leave,
             Message::Kick,

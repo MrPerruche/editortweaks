@@ -8,10 +8,14 @@ from __future__ import annotations
 import argparse
 import hashlib
 import os
+import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
+import zipfile
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -44,6 +48,62 @@ def profile_of(args: argparse.Namespace) -> str:
     return "debug" if getattr(args, "debug", False) else "release"
 
 
+def parse_expiry(text: str) -> datetime:
+    """`--expires`: a local date and time (`2026-11-15 18:00`, `2026-11-15T18:00`), a date (its
+    midnight, as it starts), or a time from now (`7d`, `36h`)."""
+    relative = re.fullmatch(r"(\d+)([dh])", text.strip())
+    if relative:
+        amount, unit = int(relative.group(1)), relative.group(2)
+        moment = datetime.now() + (timedelta(days=amount) if unit == "d" else timedelta(hours=amount))
+        return moment.replace(second=0, microsecond=0)
+    try:
+        moment = datetime.fromisoformat(text.strip())
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"{text!r}: use 2026-11-15, 2026-11-15 18:00, 7d or 36h")
+    if moment.tzinfo is not None:
+        raise argparse.ArgumentTypeError(f"{text!r}: give a local time, without a time zone")
+    return moment
+
+
+def expiry_of(args: argparse.Namespace) -> int | None:
+    """`--expires` as seconds since 1970 (what the mod compares its clock with), checked."""
+    moment = getattr(args, "expires", None)
+    if moment is None:
+        return None
+    if moment <= datetime.now():
+        raise SystemExit(f"--expires {moment:%Y-%m-%d %H:%M} is already past.")
+    return int(moment.timestamp())
+
+
+def describe_expiry(expires: int | None) -> str:
+    if expires is None:
+        return "never expires"
+    local = datetime.fromtimestamp(expires)
+    utc = datetime.fromtimestamp(expires, timezone.utc)
+    return f"stops loading after {local:%Y-%m-%d %H:%M} (your time; {utc:%Y-%m-%d %H:%M} UTC)"
+
+
+def workspace_version() -> str:
+    text = (paths.PROJECT_ROOT / "Cargo.toml").read_text(encoding="utf-8")
+    match = re.search(r'^version\s*=\s*"([^"]+)"', text, re.MULTILINE)
+    return match.group(1) if match else "unknown"
+
+
+def git_revision() -> str:
+    """Short commit, `+changes` if the working tree differs from it."""
+    def git(*args: str) -> str:
+        return subprocess.run(["git", *args], cwd=paths.PROJECT_ROOT, capture_output=True, text=True).stdout.strip()
+
+    commit = git("rev-parse", "--short", "HEAD") or "unknown"
+    return f"{commit}+changes" if git("status", "--porcelain") else commit
+
+
+def check_runtime_imports(dll: Path) -> None:
+    missing = [d for d in PeImage(dll).imported_dlls() if d.lower() in UNSHIPPED_RUNTIME_DLLS]
+    if missing:
+        print(f"WARNING: the mod imports {', '.join(missing)}, which the game folder may not have.")
+
+
 # --- commands -------------------------------------------------------------------------------
 
 
@@ -51,24 +111,30 @@ def cmd_setup(args: argparse.Namespace) -> None:
     toolchain.setup()
 
 
+def cargo_features(args: argparse.Namespace) -> list[str]:
+    """The cargo feature arguments for `--coop-test` (coop building itself is in every build)."""
+    return ["--features", "coop-test"] if args.coop_test else []
+
+
 def cmd_build(args: argparse.Namespace) -> None:
-    toolchain.cargo("build", *([] if args.debug else ["--release"]), *(["--features", "coop"] if args.coop else []))
-    print(f"Built {paths.build_output(profile_of(args))}")
+    expires = expiry_of(args)
+    toolchain.cargo("build", *([] if args.debug else ["--release"]), *cargo_features(args), expires=expires)
+    print(f"Built {paths.build_output(profile_of(args))} ({describe_expiry(expires)})")
 
 
 def cmd_install(args: argparse.Namespace) -> None:
     game = paths.find_game()
     if game_running():
         raise SystemExit("The game is running; close it first (the DLL is locked while loaded).")
+    if args.no_build and args.expires:
+        raise SystemExit("--expires needs a build: leave out --no-build.")
     if not args.no_build:
         cmd_build(args)
     dll = paths.build_output(profile_of(args))
     if not dll.exists():
         raise SystemExit(f"{dll} doesn't exist; build first.")
 
-    missing = [d for d in PeImage(dll).imported_dlls() if d.lower() in UNSHIPPED_RUNTIME_DLLS]
-    if missing:
-        print(f"WARNING: the mod imports {', '.join(missing)}, which the game folder may not have.")
+    check_runtime_imports(dll)
     loader = game.win64 / "brickworks.dll"
     if not loader.exists():
         print("WARNING: no loader in the game folder (xinput1_3.dll + brickworks.dll); the mod won't load.")
@@ -78,6 +144,131 @@ def cmd_install(args: argparse.Namespace) -> None:
     game.native_mods.mkdir(exist_ok=True)
     shutil.copy2(dll, game.installed_mod)
     print(f"Installed {game.installed_mod}")
+
+
+PACKAGE_README = """\
+editortweaks {version}{coop_note}
+Built {built} from {revision}. This build {expiry}.
+
+A mod for Brick Rigs' vehicle editor, loaded by the brickworks mod loader 0.1.0 (included).
+Made for game version {game_version} (Steam): with another version it may not load or may crash.
+
+INSTALL
+1. Close Brick Rigs.
+2. In Steam, right-click Brick Rigs > Manage > Browse local files. That opens the game folder
+   (the one with BrickRigs.exe in it).
+3. Extract everything in this zip into that folder, keeping the folders, so that you get:
+     <game folder>\\brickworks\\editortweaks.dll
+     <game folder>\\BrickRigs\\Binaries\\Win64\\brickworks.dll
+     <game folder>\\BrickRigs\\Binaries\\Win64\\xinput1_3.dll
+   (If Windows asks to replace an xinput1_3.dll, another mod loader is installed there: ask first.)
+4. Start the game from Steam. The options have a new "Editor tweaks" menu.
+{coop_howto}
+IF SOMETHING GOES WRONG
+Send these files from the game folder (close the game first, they're rewritten at each start):
+  brickworks.txt{coop_logs}
+If the game crashed, also the newest folder in
+  %LOCALAPPDATA%\\BrickRigs\\SavedRemastered\\Crashes
+{backups}
+UNINSTALL
+Delete <game folder>\\brickworks\\editortweaks.dll (the mod). To remove the loader too, delete
+brickworks.dll and xinput1_3.dll from <game folder>\\BrickRigs\\Binaries\\Win64.
+Steam's "Verify integrity of game files" doesn't remove them.
+
+LICENSES
+editortweaks: GNU GPL v3 or later (licenses\\editortweaks-LICENSE.txt); its source is available
+from its author on request. brickworks loader: MIT (licenses\\brickworks-LICENSE.txt).
+
+Files (SHA-256):
+{hashes}
+"""
+
+PACKAGE_COOP_HOWTO = """
+COOP BUILDING ({kind})
+Both players need this same build, and to be Steam friends.
+- Open the vehicle editor. In its top bar, "Editor tweaks" > "Coop..." opens the coop page.
+- To host: "Host this vehicle". When a friend asks to join, the coop page opens: "Let in".
+- To join: "Join a friend", wait for the host to show in the list, then "Join". Your own vehicle
+  is backed up first, then replaced by the host's.
+- Everything you place, move, paint or change shows for the other player. Undo (Ctrl+Z) only
+  undoes your own changes.
+{test_steps}"""
+
+PACKAGE_COOP_TEST_STEPS = "- COOP-TEST.txt has the steps to test it together.\n"
+
+PACKAGE_BACKUPS = """Coop backs up your vehicle before joining, and the session's vehicle every few minutes, in
+  %LOCALAPPDATA%\\BrickRigs\\SavedRemastered\\EditorTweaks\\CoopBackups
+To restore one, copy it over the Vehicle.brv in a saved vehicle's folder.
+"""
+
+
+def cmd_package(args: argparse.Namespace) -> None:
+    """A zip to give a tester: the release DLL, the loader from this game install, and a README."""
+    game = paths.find_game()
+    loader = [game.win64 / "brickworks.dll", game.win64 / "xinput1_3.dll"]
+    for file in loader:
+        if not file.exists():
+            raise SystemExit(f"{file} doesn't exist: install the brickworks loader 0.1.0 first (README.md).")
+    if not KNOWN_LOADERS.get(sha256(loader[0]), "").endswith("(supported)"):
+        raise SystemExit(f"The installed loader is {KNOWN_LOADERS.get(sha256(loader[0]), 'an unknown build')}, not 0.1.0.")
+
+    expires = expiry_of(args)
+    args.debug = False
+    cmd_build(args)
+    check_runtime_imports(paths.build_output("release"))
+    # Without its debug info (code and exports unchanged, a quarter of the size): crash addresses
+    # still match this PC's build, which keeps it for `crashes` and `hang`.
+    stripped = Path(tempfile.mkdtemp()) / "editortweaks.dll"
+    subprocess.run([str(paths.MINGW_BIN / "strip.exe"), "--strip-debug", "-o", str(stripped),
+                    str(paths.build_output("release"))], check=True)
+    dll = stripped
+
+    version = workspace_version()
+    built = datetime.now()
+    files = {
+        "brickworks/editortweaks.dll": dll,
+        "BrickRigs/Binaries/Win64/brickworks.dll": loader[0],
+        "BrickRigs/Binaries/Win64/xinput1_3.dll": loader[1],
+        "licenses/editortweaks-LICENSE.txt": paths.PROJECT_ROOT / "LICENSE",
+        "licenses/brickworks-LICENSE.txt": paths.PROJECT_ROOT / "third_party" / "brickrust" / "LICENSE",
+    }
+    readme = PACKAGE_README.format(
+        version=version,
+        coop_note=" (coop building test build)" if args.coop_test else "",
+        built=f"{built:%Y-%m-%d %H:%M}",
+        revision=git_revision(),
+        expiry=describe_expiry(expires).replace("stops loading", "stops loading (the mod just doesn't start)"),
+        game_version=game_version(),
+        coop_howto=PACKAGE_COOP_HOWTO.format(
+            kind="test build" if args.coop_test else "beta",
+            test_steps=PACKAGE_COOP_TEST_STEPS if args.coop_test else "",
+        ),
+        coop_logs="\n  editortweaks-coop-host.txt or editortweaks-coop-member.txt (whichever you have)",
+        backups=PACKAGE_BACKUPS,
+        hashes="\n".join(f"  {sha256(source)}  {name}" for name, source in files.items() if name.endswith(".dll")),
+    )
+
+    out_dir = Path(args.out) if args.out else paths.PROJECT_ROOT / ".local" / "packages"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    name = f"editortweaks-{version}{'-coop-test' if args.coop_test else ''}-{built:%Y%m%d-%H%M}.zip"
+    archive = out_dir / name
+    with zipfile.ZipFile(archive, "w", zipfile.ZIP_DEFLATED) as zf:
+        for inside, source in files.items():
+            zf.write(source, inside)
+        zf.writestr("README.txt", readme.replace("\n", "\r\n"))
+        if args.coop_test:
+            steps = (paths.PROJECT_ROOT / "docs" / "coop-friend-test.txt").read_text(encoding="utf-8")
+            zf.writestr("COOP-TEST.txt", steps.replace("\n", "\r\n"))
+    shutil.rmtree(stripped.parent, ignore_errors=True)
+    print(f"Packaged {archive} ({archive.stat().st_size:,} bytes; {describe_expiry(expires)})")
+    print("Your own game needs the same build: et.py install --no-build")
+
+
+def game_version() -> str:
+    """The game version the mod targets (`TARGET_GAME_VERSION` in lib.rs)."""
+    text = (paths.PROJECT_ROOT / "crates" / "editortweaks" / "src" / "lib.rs").read_text(encoding="utf-8")
+    match = re.search(r'TARGET_GAME_VERSION: &CStr = c"([^"]+)"', text)
+    return match.group(1) if match else "unknown"
 
 
 def cmd_uninstall(args: argparse.Namespace) -> None:
@@ -132,6 +323,29 @@ def cmd_log(args: argparse.Namespace) -> None:
                 print(line, end="", flush=True)
             else:
                 time.sleep(0.25)
+
+
+def cmd_timings(args: argparse.Namespace) -> None:
+    """Switches the mod's timings (`framework/timings.rs`) with `LogTimings` in `EditorTweaks.ini`,
+    or prints the timing lines of the last session's log."""
+    ini = paths.SAVED_DIR / "Config" / "WindowsNoEditor" / "EditorTweaks.ini"
+    if args.state is None:
+        log = paths.find_game().log
+        lines = log.read_text(encoding="utf-8", errors="replace").splitlines() if log.exists() else []
+        timed = [line for line in lines if "timings" in line]
+        print("\n".join(timed[-args.lines:] if args.lines else timed) or "No timings in the log.")
+        return
+    value = "True" if args.state == "on" else "False"
+    text = ini.read_text(encoding="utf-8") if ini.exists() else "[EditorTweaks]\n"
+    text, found = re.subn(r"(?im)^\s*LogTimings\s*=.*$", f"LogTimings={value}", text)
+    if not found:
+        text = text.rstrip("\n") + f"\nLogTimings={value}\n"
+    ini.parent.mkdir(parents=True, exist_ok=True)
+    ini.write_text(text, encoding="utf-8")
+    print(f"LogTimings={value} in {ini}")
+    if game_running():
+        print("The game is running: this applies from its next start (and changing a setting in "
+              "its menu before then writes the file over).")
 
 
 def cmd_second(args: argparse.Namespace) -> None:
@@ -321,16 +535,28 @@ def main() -> None:
 
     sub.add_parser("setup", help="install the Rust toolchain, MinGW and the Python venv").set_defaults(func=cmd_setup)
 
+    expires_help = ("a test build: the mod doesn't start after this local date/time "
+                    "(2026-11-15, '2026-11-15 18:00', or from now: 7d, 36h)")
+
     p = sub.add_parser("build", help="build the mod DLL")
     p.add_argument("--debug", action="store_true", help="debug profile instead of release")
-    p.add_argument("--coop", action="store_true", help="with coop building (work in progress, off in releases)")
+    p.add_argument("--coop-test", action="store_true", help="with coop's test-only tools (drift key, local test, probe)")
+    p.add_argument("--expires", type=parse_expiry, metavar="WHEN", help=expires_help)
     p.set_defaults(func=cmd_build)
 
     p = sub.add_parser("install", help="build and copy the DLL into <game>/brickworks/")
     p.add_argument("--debug", action="store_true", help="install the debug build")
     p.add_argument("--no-build", action="store_true", help="install the existing build as-is")
-    p.add_argument("--coop", action="store_true", help="build with coop building (work in progress)")
+    p.add_argument("--coop-test", action="store_true", help="with coop's test-only tools (drift key, local test, probe)")
+    p.add_argument("--expires", type=parse_expiry, metavar="WHEN", help=expires_help)
     p.set_defaults(func=cmd_install)
+
+    p = sub.add_parser("package", help="a zip for a tester: release DLL, loader, README")
+    p.add_argument("--coop-test", action="store_true",
+                   help="a tester's zip: coop's test-only tools and COOP-TEST.txt")
+    p.add_argument("--expires", type=parse_expiry, metavar="WHEN", help=expires_help)
+    p.add_argument("--out", help="folder for the zip (default: .local/packages)")
+    p.set_defaults(func=cmd_package)
 
     sub.add_parser("uninstall", help="remove the DLL from the game").set_defaults(func=cmd_uninstall)
     sub.add_parser("status", help="game, loader and install state").set_defaults(func=cmd_status)
@@ -339,10 +565,15 @@ def main() -> None:
     p.add_argument("-n", "--lines", type=int, default=0, help="only the last N lines")
     p.add_argument("-f", "--follow", action="store_true", help="keep printing new lines")
     p.add_argument("--coop", choices=["host", "member"],
-                   help="that instance's coop log instead (coop builds, local test)")
+                   help="that instance's coop log instead (needs a --coop-test build, local test)")
     p.set_defaults(func=cmd_log)
 
-    sub.add_parser("second", help="start a second game instance (coop's local test)").set_defaults(func=cmd_second)
+    p = sub.add_parser("timings", help="switch the mod's timings in the log (next start), or print them")
+    p.add_argument("state", nargs="?", choices=["on", "off"], help="omit to print the log's timing lines")
+    p.add_argument("-n", "--lines", type=int, default=0, help="only the last N lines")
+    p.set_defaults(func=cmd_timings)
+
+    sub.add_parser("second", help="start a second game instance (coop's local test, needs a --coop-test build)").set_defaults(func=cmd_second)
 
     p = sub.add_parser("crashes", help="summarize recent game crash reports")
     p.add_argument("-n", "--count", type=int, default=3)

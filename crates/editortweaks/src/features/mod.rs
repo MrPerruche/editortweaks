@@ -4,6 +4,7 @@
 
 use crate::framework::feature::Feature;
 use crate::framework::settings::{Section, Setting};
+use crate::framework::timings;
 
 mod actuator_arrows;
 mod axis_permutations;
@@ -13,8 +14,7 @@ mod camera_speed;
 mod click_swap;
 mod compact_panel;
 mod connector_markers;
-/// Coop building, only in builds with the `coop` cargo feature.
-#[cfg(feature = "coop")]
+/// Coop building.
 mod coop;
 mod copy_properties;
 mod drag_select;
@@ -51,6 +51,7 @@ mod slider_drag;
 mod slider_formulas;
 mod spawn_mode;
 mod suspension_arrows;
+mod thruster_size;
 mod view_modes;
 
 /// All features, in load order.
@@ -62,6 +63,7 @@ pub static ALL: &[&dyn Feature] = &[
     &slider_formulas::SliderFormulas,
     &slider_drag::SliderDrag,
     &axis_permutations::AxisPermutations,
+    &thruster_size::ThrusterSize,
     &camera_speed::CameraSpeed,
     &free_pitch::FreePitch,
     &editor_frame::EditorFrame,
@@ -88,7 +90,6 @@ pub static ALL: &[&dyn Feature] = &[
     &settings_menu::SettingsMenu,
     &model_export::ModelExport,
     &editor_menu::EditorMenu,
-    #[cfg(feature = "coop")]
     &coop::Coop,
 ];
 
@@ -99,13 +100,12 @@ pub static SETTINGS: &[&[Section]] = &[
     &references::SETTINGS,
     &model_export::SETTINGS,
     &PREVIEWS,
-    #[cfg(feature = "coop")]
     &coop::SETTINGS,
 ];
 
 /// The settings of the editor itself: which buttons select, the camera's pitch, what a box picks,
-/// how selected bricks' connectors show, how far sliders drag, the value order button, how compact
-/// the side panel is.
+/// how selected bricks' connectors show, how far sliders drag, how compact the side
+/// panel is.
 static EDITOR: [Section; 1] = [Section {
     title: "Editor",
     settings: &[
@@ -114,25 +114,26 @@ static EDITOR: [Section; 1] = [Section {
         Setting::Choice(&drag_select::PICKS),
         Setting::Toggle(&connector_markers::AXIS_COLORS),
         Setting::Toggle(&slider_drag::LIFT_SLIDER_LIMITS),
-        Setting::Toggle(&axis_permutations::ORDER_BUTTON),
         Setting::Choice(&compact_panel::COMPACT_PANEL),
     ],
-    // The side panel's "Spawn mode" and "Disable lighting" rows set them.
+    // The side panel's "Spawn mode" and "Disable lighting" rows set them; the others are only in
+    // `EditorTweaks.ini`, too rarely wanted to show.
     unlisted: &[
         Setting::Choice(&spawn_mode::SPAWN_MODE),
         Setting::Toggle(&editor_lighting::NO_LIGHTING),
+        Setting::Toggle(&thruster_size::THREE_VALUES),
+        Setting::Toggle(&timings::LOG_TIMINGS),
     ],
 }];
 
 /// The settings of what the editor previews: where shots go, the tooltips of the shot preview and
-/// the view modes, and the Physics view mode's centers and lift and drag.
+/// the view modes, and the Physics view mode's lift and drag.
 static PREVIEWS: [Section; 1] = [Section {
     title: "Shot preview and view modes",
     settings: &[
         Setting::Choice(&gun_preview::SHOWS),
         Setting::Toggle(&gun_preview::HITS_VEHICLE),
         Setting::Choice(&view_modes::TOOLTIPS),
-        Setting::Toggle(&view_modes::CENTERS),
         Setting::Choice(&view_modes::LIFT_DRAG),
     ],
     unlisted: &[],

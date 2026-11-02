@@ -211,6 +211,36 @@ pub fn closest_on_segment(ray: &Ray, start: Vec3, end: Vec3) -> Vec3 {
     add(start, scale(direction, distance.clamp(0.0, length)))
 }
 
+/// How far `point` is from the ray's line.
+pub fn ray_distance(ray: &Ray, point: Vec3) -> f64 {
+    let offset = sub(point, ray.origin);
+    let along = dot(offset, ray.direction);
+    length(sub(offset, scale(ray.direction, along)))
+}
+
+/// The point of the line through `points` (in order) nearest the ray, and where it is along them:
+/// the index of the point it's after, plus the share of the way to the next one. `None` without
+/// points.
+pub fn closest_on_polyline(ray: &Ray, points: &[Vec3]) -> Option<(f64, Vec3)> {
+    if let [only] = points {
+        return Some((0.0, *only));
+    }
+    points
+        .windows(2)
+        .enumerate()
+        .map(|(index, pair)| {
+            let point = closest_on_segment(ray, pair[0], pair[1]);
+            let span = length(sub(pair[1], pair[0]));
+            let share = if span > 0.0 {
+                length(sub(point, pair[0])) / span
+            } else {
+                0.0
+            };
+            (index as f64 + share, point)
+        })
+        .min_by(|a, b| ray_distance(ray, a.1).total_cmp(&ray_distance(ray, b.1)))
+}
+
 /// How far along the ray it meets the plane through `point` across `normal`, if in front.
 /// `min_cosine` is the smallest angle's cosine between the ray and the plane accepted (rays almost
 /// along the plane give unsteady points).

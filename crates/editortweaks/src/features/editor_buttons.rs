@@ -18,7 +18,7 @@ use std::sync::{Mutex, OnceLock, PoisonError};
 
 use brickrust::ue::coreuobject::UObjectBase;
 
-use crate::framework::hook;
+use crate::framework::{hook, timings};
 use crate::game::editor_input::{self, ButtonAction};
 use crate::game::reflection::NativeThunk;
 use crate::prelude::log;
@@ -208,9 +208,19 @@ fn hook_handlers() -> Result<(), String> {
 }
 
 unsafe extern "C" fn select_detour(context: *mut c_void, stack: *mut c_void, result: *mut c_void) {
+    let _span = timings::span("editor_buttons::select_detour");
     let original = *ORIGINAL_SELECT.get().expect("hook recorded before use");
     // SAFETY: the thunk's own arguments, passed on.
-    unsafe { handle(Button::Select, context, stack, result, original) }
+    unsafe {
+        handle(
+            Button::Select,
+            "UBaseEditorInputComponent::execAction_Select",
+            context,
+            stack,
+            result,
+            original,
+        )
+    }
 }
 
 unsafe extern "C" fn add_to_selection_detour(
@@ -218,11 +228,21 @@ unsafe extern "C" fn add_to_selection_detour(
     stack: *mut c_void,
     result: *mut c_void,
 ) {
+    let _span = timings::span("editor_buttons::add_to_selection_detour");
     let original = *ORIGINAL_ADD_TO_SELECTION
         .get()
         .expect("hook recorded before use");
     // SAFETY: the thunk's own arguments, passed on.
-    unsafe { handle(Button::AddToSelection, context, stack, result, original) }
+    unsafe {
+        handle(
+            Button::AddToSelection,
+            "execAction_AddToSelection",
+            context,
+            stack,
+            result,
+            original,
+        )
+    }
 }
 
 unsafe extern "C" fn move_camera_detour(
@@ -230,11 +250,21 @@ unsafe extern "C" fn move_camera_detour(
     stack: *mut c_void,
     result: *mut c_void,
 ) {
+    let _span = timings::span("editor_buttons::move_camera_detour");
     let original = *ORIGINAL_MOVE_CAMERA
         .get()
         .expect("hook recorded before use");
     // SAFETY: the thunk's own arguments, passed on.
-    unsafe { handle(Button::MoveCamera, context, stack, result, original) }
+    unsafe {
+        handle(
+            Button::MoveCamera,
+            "UEditorInputComponent::execAction_MoveCamera",
+            context,
+            stack,
+            result,
+            original,
+        )
+    }
 }
 
 unsafe extern "C" fn pivot_camera_detour(
@@ -242,17 +272,37 @@ unsafe extern "C" fn pivot_camera_detour(
     stack: *mut c_void,
     result: *mut c_void,
 ) {
+    let _span = timings::span("editor_buttons::pivot_camera_detour");
     let original = *ORIGINAL_PIVOT_CAMERA
         .get()
         .expect("hook recorded before use");
     // SAFETY: the thunk's own arguments, passed on.
-    unsafe { handle(Button::PivotCamera, context, stack, result, original) }
+    unsafe {
+        handle(
+            Button::PivotCamera,
+            "UEditorInputComponent::execAction_PivotCamera",
+            context,
+            stack,
+            result,
+            original,
+        )
+    }
 }
 
 unsafe extern "C" fn delete_detour(context: *mut c_void, stack: *mut c_void, result: *mut c_void) {
+    let _span = timings::span("editor_buttons::delete_detour");
     let original = *ORIGINAL_DELETE.get().expect("hook recorded before use");
     // SAFETY: the thunk's own arguments, passed on.
-    unsafe { handle(Button::Delete, context, stack, result, original) }
+    unsafe {
+        handle(
+            Button::Delete,
+            "execAction_DeleteSelection",
+            context,
+            stack,
+            result,
+            original,
+        )
+    }
 }
 
 unsafe extern "C" fn duplicate_detour(
@@ -260,15 +310,35 @@ unsafe extern "C" fn duplicate_detour(
     stack: *mut c_void,
     result: *mut c_void,
 ) {
+    let _span = timings::span("editor_buttons::duplicate_detour");
     let original = *ORIGINAL_DUPLICATE.get().expect("hook recorded before use");
     // SAFETY: the thunk's own arguments, passed on.
-    unsafe { handle(Button::Duplicate, context, stack, result, original) }
+    unsafe {
+        handle(
+            Button::Duplicate,
+            "execAction_DuplicateSelection",
+            context,
+            stack,
+            result,
+            original,
+        )
+    }
 }
 
 unsafe extern "C" fn hide_detour(context: *mut c_void, stack: *mut c_void, result: *mut c_void) {
+    let _span = timings::span("editor_buttons::hide_detour");
     let original = *ORIGINAL_HIDE.get().expect("hook recorded before use");
     // SAFETY: the thunk's own arguments, passed on.
-    unsafe { handle(Button::Hide, context, stack, result, original) }
+    unsafe {
+        handle(
+            Button::Hide,
+            "execAction_HideSelection",
+            context,
+            stack,
+            result,
+            original,
+        )
+    }
 }
 
 unsafe extern "C" fn unhide_all_detour(
@@ -276,12 +346,22 @@ unsafe extern "C" fn unhide_all_detour(
     stack: *mut c_void,
     result: *mut c_void,
 ) {
+    let _span = timings::span("editor_buttons::unhide_all_detour");
     let original = *ORIGINAL_UNHIDE_ALL.get().expect("hook recorded before use");
     // SAFETY: the thunk's own arguments, passed on.
-    unsafe { handle(Button::UnhideAll, context, stack, result, original) }
+    unsafe {
+        handle(
+            Button::UnhideAll,
+            "execAction_UnhideAll",
+            context,
+            stack,
+            result,
+            original,
+        )
+    }
 }
 
-/// Runs `original`, the thunk of `button`'s action called with `context`, `stack` and `result`,
+/// Runs `original` (the game's `game_name`), the thunk of `button`'s action called with `context`, `stack` and `result`,
 /// unless a listener takes the call.
 ///
 /// # Safety
@@ -289,6 +369,7 @@ unsafe extern "C" fn unhide_all_detour(
 /// thread.
 unsafe fn handle(
     button: Button,
+    game_name: &'static str,
     context: *mut c_void,
     stack: *mut c_void,
     result: *mut c_void,
@@ -327,6 +408,6 @@ unsafe fn handle(
                 }
             }
         }
-        original(context, stack, result);
+        timings::game(game_name, || original(context, stack, result));
     }
 }

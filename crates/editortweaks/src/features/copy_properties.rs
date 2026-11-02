@@ -1,4 +1,4 @@
-//! Copying a brick's properties while fast editing: with [`keybinds::RESIZE_BRICKS`] held, a click
+//! Copying a brick's properties while fast editing ([`brick_resize::is_fast_editing`]): a click
 //! on a brick (the nearest under the mouse, `brick_resize::nearest_hovered_brick`: fast editing
 //! itself points at selected bricks behind others first) gives the selected bricks its properties,
 //! as one step to undo:
@@ -13,12 +13,14 @@
 //! after editing each of them on that brick in the panel (`game::new_brick_properties`). With
 //! mirror mode on, counterparts change only if selected too.
 //!
-//! A click: the key goes down with the fast editing key held, in the editor's default mode (not
-//! while moving or placing bricks), over a brick, and comes up again with neither the left nor the
-//! right mouse button pressed meanwhile (fast editing's drags, which the key may take part in: it
-//! may be the model key too), and the mouse moved at most [`CLICK_PIXELS`] from where it went down.
-//! While fast editing, `brick_resize` keeps the middle button from pivoting the camera, so the
-//! cursor stays free.
+//! A click: the key goes down while fast editing ([`brick_resize::is_fast_editing`]), in the
+//! editor's default mode (not while moving or placing bricks), over a brick, and comes up again
+//! within [`CLICK_MS`], with neither the left nor the right mouse button pressed meanwhile (fast
+//! editing's drags, which the key may take part in: it may be the model key too), and the mouse
+//! moved at most [`CLICK_PIXELS`] from where it went down. Held longer it's no click: the middle
+//! button is the model key by default, so someone holding it to look at models and then letting go
+//! without moving must not copy. While fast editing, `brick_resize` keeps the middle button from
+//! pivoting the camera, so the cursor stays free.
 //!
 //! How: the editor's tick (hooked) watches the keys, after `brick_resize`'s. The selected bricks
 //! are changed like the panel does (`game::brick_property`): in one editor operation, each value
@@ -26,6 +28,7 @@
 //! [`brick_editor::PROPERTY_CHANGED`].
 
 use std::sync::{Mutex, Once, OnceLock, PoisonError};
+use std::time::{Duration, Instant};
 
 use brickrust::ue::coreuobject::UObjectBase;
 use brickrust::ue::uclass::UStruct;
@@ -56,6 +59,9 @@ const LOOKS: [&str; 6] = [
 
 /// How far the mouse may move from where the key went down for it to be a click (pixels).
 const CLICK_PIXELS: f32 = 4.0;
+
+/// How long the key may be held for it to be a click (milliseconds).
+const CLICK_MS: u64 = 350;
 
 pub struct CopyProperties;
 
@@ -97,12 +103,13 @@ enum Copied {
 #[derive(Clone, Copy)]
 enum Key {
     Up,
-    /// Down for a click on `brick` copying `copied`, the mouse at `at` (screen pixels) when it went
-    /// down.
+    /// Down for a click on `brick` copying `copied`, the mouse at `at` (screen pixels) and the
+    /// time `since` when it went down.
     Down {
         brick: WeakObject,
         copied: Copied,
         at: [f32; 2],
+        since: Instant,
     },
     /// Down, but no click (see [`State::tick`]): nothing until they're up again.
     Ignored,
@@ -177,7 +184,7 @@ struct State<'a> {
 
 impl State<'_> {
     /// Follows the keys, and copies the properties of the brick clicked when they come up after a
-    /// click. Both keys count as one: Ctrl + the middle mouse button also holds the middle mouse
+    /// quick click. Both keys count as one: Ctrl + the middle mouse button also holds the middle mouse
     /// button, and letting go of Ctrl first still ends the click as one copying everything.
     ///
     /// # Safety
@@ -193,11 +200,25 @@ impl State<'_> {
             *key = match (*key, held) {
                 (Key::Up, false) => Key::Up,
                 (Key::Up, true) => self.press(mouse),
-                (Key::Down { brick, copied, at }, held) => {
-                    if !self.clicking(at, mouse) {
+                (
+                    Key::Down {
+                        brick,
+                        copied,
+                        at,
+                        since,
+                    },
+                    held,
+                ) => {
+                    let quick = since.elapsed() <= Duration::from_millis(CLICK_MS);
+                    if !quick || !self.clicking(at, mouse) {
                         Key::Ignored
                     } else if held {
-                        Key::Down { brick, copied, at }
+                        Key::Down {
+                            brick,
+                            copied,
+                            at,
+                            since,
+                        }
                     } else {
                         if let Some(brick) = brick.get_live() {
                             self.copy(brick, copied);
@@ -220,7 +241,7 @@ impl State<'_> {
     unsafe fn press(&self, mouse: Option<[f32; 2]>) -> Key {
         // SAFETY: per the contract; `nearest_hovered_brick` returns a live object.
         unsafe {
-            if !keybinds::RESIZE_BRICKS.is_held() || !self.can_click() {
+            if !brick_resize::is_fast_editing() || !self.can_click() {
                 return Key::Ignored;
             }
             let copied = if keybinds::COPY_PROPERTIES.is_held() {
@@ -233,6 +254,7 @@ impl State<'_> {
                     brick: WeakObject::new(brick),
                     copied,
                     at,
+                    since: Instant::now(),
                 },
                 _ => Key::Ignored,
             }

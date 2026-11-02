@@ -20,9 +20,9 @@ const STEPS: u32 = 16;
 /// UV units per centimeter: one per meter, planar on each face.
 const UV_SCALE: f64 = 0.01;
 
-/// How far (cm) every face is pushed out along its normal. The brick under the shapes shows the
-/// hidden material, which would z-fight with a shape face lying on the brick's surface; this puts
-/// the shapes just in front. Too small to see, and to matter for what sticks out.
+/// How far (cm) every face is pushed out along its normal when the brick shows under the shapes
+/// (`SEE_THROUGH_BRICKS`): its hidden material would z-fight with a shape face lying on the brick's
+/// surface; this puts the shapes just in front. Small, but visible up close.
 const OUTSET: f64 = 0.1;
 
 /// The smallest radius and cylinder length the engine gives a scaled capsule

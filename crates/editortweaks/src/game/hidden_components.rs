@@ -25,6 +25,7 @@ use brickrust::ue::coreuobject::UObjectBase;
 
 use crate::framework::hook;
 use crate::framework::sig::FunctionSig;
+use crate::framework::timings;
 use crate::game::reflection;
 
 /// The test above, found by the code around it (anywhere inside the function, see
@@ -103,10 +104,15 @@ unsafe extern "C" fn update(
     view: *const [f32; 3],
     hidden: *mut c_void,
 ) {
+    let _span = timings::span("game::hidden_components::update");
     let original = *ORIGINAL.get().expect("hook recorded before use");
     let Some(&field) = EDITOR_FIELD.get() else {
         // SAFETY: the original function with its own arguments.
-        return unsafe { original(controller, view, hidden) };
+        return unsafe {
+            timings::game(UPDATE_HIDDEN_COMPONENTS.name, || {
+                original(controller, view, hidden)
+            })
+        };
     };
     // SAFETY: the game calls this with a live controller, whose `BrickEditor` field is at `field`
     // (checked in `install`). The field is restored before the detour returns; the game thread is
@@ -128,10 +134,14 @@ unsafe extern "C" fn update(
         }
         if show_map() && !editor.is_null() {
             slot.write(core::ptr::null_mut());
-            original(controller, view, hidden);
+            timings::game(UPDATE_HIDDEN_COMPONENTS.name, || {
+                original(controller, view, hidden)
+            });
             slot.write(editor);
         } else {
-            original(controller, view, hidden);
+            timings::game(UPDATE_HIDDEN_COMPONENTS.name, || {
+                original(controller, view, hidden)
+            });
         }
     }
 }

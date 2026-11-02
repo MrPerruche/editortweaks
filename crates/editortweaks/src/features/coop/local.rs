@@ -1,6 +1,6 @@
 //! The local test: two game instances on one PC, linked over localhost instead of Steam (both are
 //! signed in to the same account, so Steam can't tell them apart; `docs/re/coop/testing.md`).
-//! The first editor opened listens and hosts its vehicle; the other connects and joins.
+//! The one hosting listens; the other connects and joins.
 
 use std::io;
 use std::time::Duration;
@@ -38,10 +38,12 @@ fn member_id() -> PeerId {
     1000 + PeerId::from(std::process::id())
 }
 
-/// Joins an instance already listening, or else listens.
-pub fn link() -> io::Result<(TcpTransport, Role)> {
-    match TcpTransport::connect(member_id(), PORT, HOST, CONNECT_TIMEOUT) {
-        Ok(transport) => Ok((transport, Role::Member)),
-        Err(_) => Ok((TcpTransport::listen(HOST, PORT)?, Role::Host)),
-    }
+/// Connects to the instance hosting.
+pub fn connect() -> io::Result<TcpTransport> {
+    TcpTransport::connect(member_id(), PORT, HOST, CONNECT_TIMEOUT)
+}
+
+/// Listens, to host.
+pub fn listen() -> io::Result<TcpTransport> {
+    TcpTransport::listen(HOST, PORT)
 }

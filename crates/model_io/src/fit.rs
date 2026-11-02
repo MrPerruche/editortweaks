@@ -5,13 +5,15 @@
 //! [`Surface::distance`] doesn't test every triangle. The game's mesh builder has UVs but no vertex
 //! colors, so the distance is shown through a one-pixel-tall [`gradient`] texture: [`scale_u`]
 //! gives the U that reads a distance's color, and [`sample`] turns a brick's surface into a mesh
-//! with those UVs, subdivided where the distance changes too fast for linear interpolation.
+//! with those UVs, subdivided where the distance changes too fast for linear interpolation, as
+//! finely as a [`Detail`] says (a quick preview, then the fine version).
 //!
 //! The gradient is a log scale (a hair away and a meter away both matter), with a gray band at
 //! the end for surfaces that have no reference. It is wide so that the game may sample it without
 //! filtering and the steps between neighbouring texels still can't be seen.
 
-use std::collections::{HashMap, HashSet};
+use std::cmp::{Ordering, Reverse};
+use std::collections::{BinaryHeap, HashMap, HashSet};
 
 use crate::image::Image;
 use crate::model::{Part, SMOOTH_ANGLE};
@@ -23,26 +25,45 @@ pub const GRADIENT_WIDTH: usize = 4096;
 /// How many texels at the start of the gradient hold the distance scale. The rest are gray.
 pub const GRADIENT_TEXELS: usize = 4080;
 
-/// The most triangles [`sample`] returns (it isn't subdivided if its input already has about as
-/// many, see [`SUBDIVISION_BUDGET`]).
-pub const MAX_TRIANGLES: usize = 3000;
+/// How finely [`sample`] subdivides.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Detail {
+    /// The most triangles [`sample`] returns, unless its input already has more (it isn't
+    /// subdivided then). This counts the triangles cut up next to subdivided ones to close the
+    /// cracks, so fewer are subdivided: as many as fit once those are cut up.
+    pub max_triangles: usize,
+    /// Triangles whose longest edge (cm, in the reference's space) is this short or shorter aren't
+    /// subdivided.
+    pub min_edge: f32,
+    /// The most the U in the middle of a triangle may differ from what linear interpolation gives
+    /// (on the 0..1 range of U, a seventh of which is a factor of ten in distance) before the
+    /// triangle is subdivided.
+    pub max_u_error: f32,
+    /// Triangles with a longer edge (cm) near the reference are subdivided with what budget is
+    /// left once every triangle whose colors are measurably off is, since a dip in the distance
+    /// (the surface touching the reference) can hide between the points measured.
+    pub max_edge: f32,
+}
 
-/// The most triangles [`sample`] subdivides to. The rest of [`MAX_TRIANGLES`] is room for cutting up
-/// the triangles next to subdivided ones afterwards, which adds a triangle for every vertex that
-/// would otherwise hang on their edges.
-const SUBDIVISION_BUDGET: usize = MAX_TRIANGLES * 2 / 3;
+impl Detail {
+    /// Quick to measure (a brick being dragged, the first colors after a change): centimeter
+    /// detail, colors off by up to a factor of about 2.2 inside a triangle, and few precautions.
+    pub const PREVIEW: Self = Self {
+        max_triangles: 600,
+        min_edge: 2.0,
+        max_u_error: 0.05,
+        max_edge: 50.0,
+    };
 
-/// Triangles whose longest edge (in the reference's space, cm) is this short or shorter aren't
-/// subdivided: finer than the eye can tell.
-const MIN_EDGE: f32 = 0.5;
-
-/// Triangles with a longer edge (cm) near the reference are always subdivided, since a dip in the
-/// distance (the surface touching the reference) can hide between their corners.
-const MAX_EDGE: f32 = 10.0;
-
-/// The most the U in the middle of a triangle may differ from what linear interpolation gives
-/// (on the 0..1 range of U) before the triangle is subdivided.
-const MAX_U_ERROR: f32 = 0.025;
+    /// Sharp: half-millimeter detail where the distance changes, colors off by up to a factor of
+    /// about 1.3 inside a triangle.
+    pub const FINE: Self = Self {
+        max_triangles: 6000,
+        min_edge: 0.05,
+        max_u_error: 0.015,
+        max_edge: 10.0,
+    };
+}
 
 /// The distance scale starts at `10^LOG_MIN` cm and ends at `10^LOG_MAX` cm.
 const LOG_MIN: f32 = -2.0;
@@ -309,14 +330,14 @@ pub struct Sampled {
 ///
 /// Hard edges get their own vertices first (the game shades smoothly across shared ones), then
 /// triangles are subdivided where the distance varies too much to be read from the corners alone,
-/// up to [`MAX_TRIANGLES`] in total. Where a subdivided triangle meets a coarser one, the coarser
-/// one is cut up to match, so the mesh has no cracks. Triangles with indices out of range are
-/// dropped.
+/// as finely as `detail` says. Where a subdivided triangle meets a coarser one, the coarser one is
+/// cut up to match, so the mesh has no cracks. Triangles with indices out of range are dropped.
 pub fn sample(
     positions: &[[f32; 3]],
     corners: &[[u32; 3]],
     to_reference: &dyn Fn([f32; 3]) -> [f32; 3],
     surface: &Surface,
+    detail: &Detail,
 ) -> Sampled {
     let mut part = Part {
         positions: positions.to_vec(),
@@ -339,9 +360,76 @@ pub fn sample(
             corners: part.corners,
         };
     }
-    let mut vertices = Vertices::new(part.positions, to_reference, surface);
-    let corners = vertices.subdivide(part.corners);
+    let mut vertices = Vertices::new(part.positions, to_reference, surface, detail);
+    let subdivision = vertices.subdivide(part.corners);
+    let corners = vertices.within_budget(&subdivision);
     vertices.finish(corners)
+}
+
+/// Why a triangle should be subdivided, least pressing first.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
+enum Need {
+    /// Its colors look right where they were measured, but it's long and near the reference, so the
+    /// distance may dip between those points.
+    Precaution,
+    /// Its colors are measurably off.
+    Evidence,
+}
+
+/// A triangle waiting to be subdivided (by its index in [`Subdivision::triangles`]). The most
+/// pressing comes first: by [`Need`], then the longest, then the first made (so the order of
+/// splits doesn't depend on how the heap breaks ties).
+struct Wanted {
+    need: Need,
+    longest: f32,
+    index: usize,
+}
+
+impl Ord for Wanted {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.need
+            .cmp(&other.need)
+            .then(self.longest.total_cmp(&other.longest))
+            .then(Reverse(self.index).cmp(&Reverse(other.index)))
+    }
+}
+
+impl PartialOrd for Wanted {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl PartialEq for Wanted {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other) == Ordering::Equal
+    }
+}
+
+impl Eq for Wanted {}
+
+/// Every triangle a subdivision made, and in which order it split them: the mesh after any number
+/// of its first splits can be told from it ([`Subdivision::after`]).
+struct Subdivision {
+    /// The input's, then four for each split.
+    triangles: Vec<[u32; 3]>,
+    /// For each triangle, which split (counting from 0) cut it in four; `usize::MAX` if none did.
+    split_at: Vec<usize>,
+    /// How many triangles the input had.
+    input: usize,
+    /// How many splits were made.
+    splits: usize,
+}
+
+impl Subdivision {
+    /// The mesh after the first `splits` splits: the triangles made by then and not split by then.
+    fn after(&self, splits: usize) -> Vec<[u32; 3]> {
+        let made = self.input + 4 * splits;
+        (0..made)
+            .filter(|&index| self.split_at[index] >= splits)
+            .map(|index| self.triangles[index])
+            .collect()
+    }
 }
 
 /// The vertices of a mesh being subdivided, with what is known about each.
@@ -356,6 +444,7 @@ struct Vertices<'a> {
     midpoints: HashMap<(u32, u32), u32>,
     to_reference: &'a dyn Fn([f32; 3]) -> [f32; 3],
     surface: &'a Surface,
+    detail: &'a Detail,
 }
 
 impl<'a> Vertices<'a> {
@@ -363,6 +452,7 @@ impl<'a> Vertices<'a> {
         local: Vec<[f32; 3]>,
         to_reference: &'a dyn Fn([f32; 3]) -> [f32; 3],
         surface: &'a Surface,
+        detail: &'a Detail,
     ) -> Self {
         let mut vertices = Self {
             local: Vec::with_capacity(local.len()),
@@ -371,6 +461,7 @@ impl<'a> Vertices<'a> {
             midpoints: HashMap::new(),
             to_reference,
             surface,
+            detail,
         };
         for position in local {
             vertices.add(position, &[]);
@@ -436,45 +527,96 @@ impl<'a> Vertices<'a> {
         [0, 1, 2].map(|axis| (a[axis] + b[axis] + c[axis]) / 3.0)
     }
 
-    /// Subdivides level by level, so the budget is spread evenly: every triangle that needs it is
-    /// split in four, and so on with the new ones. When a level doesn't fit in
-    /// [`SUBDIVISION_BUDGET`], the triangles with the longest edges are split first and that's the
-    /// last level.
-    fn subdivide(&mut self, triangles: Vec<[u32; 3]>) -> Vec<[u32; 3]> {
-        if triangles.len() >= SUBDIVISION_BUDGET {
-            return triangles;
+    /// Splits the most pressing triangle in four ([`Wanted`]), again and again, until none needs it
+    /// or the mesh has [`Detail::max_triangles`]. The triangles whose colors are measurably off go
+    /// first, the biggest of them first, so the budget is spent where the colors are most wrong,
+    /// down to the finest detail if it lasts. Triangles split only as a precaution get what's
+    /// left: a big face that looks right everywhere can't take the budget from a small area that
+    /// doesn't. Closing the cracks adds triangles, so [`Vertices::within_budget`] may then keep
+    /// only the first splits.
+    fn subdivide(&mut self, triangles: Vec<[u32; 3]>) -> Subdivision {
+        let input = triangles.len();
+        let mut subdivision = Subdivision {
+            split_at: vec![usize::MAX; input],
+            triangles,
+            input,
+            splits: 0,
+        };
+        let budget = self.detail.max_triangles;
+        if input >= budget {
+            return subdivision;
         }
-        let mut done = Vec::new();
-        let mut pending = triangles;
-        loop {
-            let mut wanted = Vec::new();
-            for triangle in pending {
-                match self.wants_split(triangle) {
-                    Some(longest) => wanted.push((longest, triangle)),
-                    None => done.push(triangle),
-                }
-            }
-            // Each split adds three triangles.
-            let room = (SUBDIVISION_BUDGET - done.len() - wanted.len()) / 3;
-            let last_level = wanted.len() > room;
-            if last_level {
-                wanted.sort_by(|a, b| b.0.total_cmp(&a.0));
-                done.extend(
-                    wanted
-                        .split_off(room)
-                        .into_iter()
-                        .map(|(_, triangle)| triangle),
-                );
-            }
-            pending = wanted
-                .into_iter()
-                .flat_map(|(_, triangle)| self.split(triangle))
-                .collect();
-            if last_level || pending.is_empty() {
-                done.extend(pending);
-                return done;
+        let mut wanted = BinaryHeap::new();
+        for index in 0..input {
+            self.consider(&subdivision, index, &mut wanted);
+        }
+        // Each split adds three triangles.
+        let mut count = input;
+        while count + 3 <= budget {
+            let Some(most_pressing) = wanted.pop() else {
+                break;
+            };
+            subdivision.split_at[most_pressing.index] = subdivision.splits;
+            subdivision.splits += 1;
+            count += 3;
+            for quarter in self.split(subdivision.triangles[most_pressing.index]) {
+                subdivision.triangles.push(quarter);
+                subdivision.split_at.push(usize::MAX);
+                self.consider(&subdivision, subdivision.triangles.len() - 1, &mut wanted);
             }
         }
+        subdivision
+    }
+
+    /// Adds a subdivision's triangle to the `wanted` ones if it should be split.
+    fn consider(
+        &mut self,
+        subdivision: &Subdivision,
+        index: usize,
+        wanted: &mut BinaryHeap<Wanted>,
+    ) {
+        if let Some((need, longest)) = self.wants_split(subdivision.triangles[index]) {
+            wanted.push(Wanted {
+                need,
+                longest,
+                index,
+            });
+        }
+    }
+
+    /// The mesh after as many of the subdivision's splits as keep it within
+    /// [`Detail::max_triangles`] once its cracks are closed ([`Vertices::conform`]): the least
+    /// pressing splits are left out first. Found by halving (closing the cracks nearly always
+    /// adds more triangles after more splits), only counting the triangles, nothing is measured.
+    fn within_budget(&self, subdivision: &Subdivision) -> Vec<[u32; 3]> {
+        let max = self.detail.max_triangles;
+        let all = subdivision.after(subdivision.splits);
+        if self.conformed_count(&all) <= max {
+            return all;
+        }
+        // No split at all is the fallback, even if the input alone has too many.
+        let (mut fits, mut too_many) = (0, subdivision.splits);
+        while too_many - fits > 1 {
+            let middle = (fits + too_many) / 2;
+            if self.conformed_count(&subdivision.after(middle)) <= max {
+                fits = middle;
+            } else {
+                too_many = middle;
+            }
+        }
+        subdivision.after(fits)
+    }
+
+    /// How many triangles [`Vertices::conform`] makes of `triangles`.
+    fn conformed_count(&self, triangles: &[[u32; 3]]) -> usize {
+        let used: HashSet<u32> = triangles.iter().flatten().copied().collect();
+        triangles
+            .iter()
+            .map(|&triangle| match self.outline(triangle, &used).len() {
+                3 => 1,
+                fan => fan,
+            })
+            .sum()
     }
 
     /// The triangle in four, wound as it is.
@@ -487,9 +629,9 @@ impl<'a> Vertices<'a> {
         [[a, ab, ca], [ab, b, bc], [ca, bc, c], [ab, bc, ca]]
     }
 
-    /// The length of the triangle's longest edge (in the reference's space) if it should be
-    /// subdivided.
-    fn wants_split(&mut self, triangle: [u32; 3]) -> Option<f32> {
+    /// Why the triangle should be subdivided and the length of its longest edge (in the
+    /// reference's space), if it should be.
+    fn wants_split(&mut self, triangle: [u32; 3]) -> Option<(Need, f32)> {
         let longest = [(0, 1), (1, 2), (2, 0)]
             .into_iter()
             .map(|(from, to)| {
@@ -498,24 +640,31 @@ impl<'a> Vertices<'a> {
             })
             .fold(0.0f32, f32::max)
             .sqrt();
-        if longest <= MIN_EDGE {
+        if longest <= self.detail.min_edge {
             return None;
         }
-        // A long triangle near the reference: the distance can dip between its corners.
         let distances = triangle.map(|vertex| self.distance[vertex as usize]);
-        let nearest = distances.iter().copied().fold(f32::INFINITY, f32::min);
-        if longest > MAX_EDGE && nearest < 2.0 * longest {
-            return Some(longest);
-        }
-        if interpolation_is_safe(distances, longest) {
+        let max_u_error = self.detail.max_u_error;
+        if interpolation_is_safe(distances, longest, max_u_error) {
             return None;
         }
-        self.interpolation_is_off(triangle).then_some(longest)
+        if self.interpolation_is_off(triangle) {
+            return Some((Need::Evidence, longest));
+        }
+        // A long triangle near the reference: the distance can dip between the points measured.
+        // Unless the nearest corner is already at the near end of the scale, where a dip changes
+        // no color: then it's a face lying on the reference, right as it is however big.
+        let nearest = distances.iter().copied().fold(f32::INFINITY, f32::min);
+        let dip_shows = scale_u(nearest) - scale_u(0.0) > max_u_error;
+        (longest > self.detail.max_edge && nearest < 2.0 * longest && dip_shows)
+            .then_some((Need::Precaution, longest))
     }
 
     /// Whether linear interpolation of U between the corners is off in the middle of the triangle
-    /// or of one of its edges, by more than [`MAX_U_ERROR`]. Makes the edges' midpoints on the way.
+    /// or of one of its edges, by more than [`Detail::max_u_error`]. Makes the edges' midpoints on
+    /// the way.
     fn interpolation_is_off(&mut self, triangle: [u32; 3]) -> bool {
+        let max_u_error = self.detail.max_u_error;
         let [a, b, c] = triangle;
         let (ua, ub, uc) = (self.u(a), self.u(b), self.u(c));
         let mut off = false;
@@ -525,12 +674,12 @@ impl<'a> Vertices<'a> {
             (c, a, (uc + ua) / 2.0),
         ] {
             let middle = self.midpoint(from, to);
-            off |= (self.u(middle) - expected).abs() > MAX_U_ERROR;
+            off |= (self.u(middle) - expected).abs() > max_u_error;
         }
         if !off {
             let center = (self.to_reference)(self.center(triangle));
             let measured = scale_u(self.measure_near(center, &triangle));
-            off = (measured - (ua + ub + uc) / 3.0).abs() > MAX_U_ERROR;
+            off = (measured - (ua + ub + uc) / 3.0).abs() > max_u_error;
         }
         off
     }
@@ -615,10 +764,10 @@ impl<'a> Vertices<'a> {
 /// distance to a surface changes by at most the way travelled. So the distance inside is at least
 /// the farthest corner's minus `longest`, and at most the nearest corner's plus `longest`, and
 /// [`scale_u`] being monotonic gives the same range for the true U. Interpolation stays between the
-/// corners' smallest and largest U. If these two ranges are never more than [`MAX_U_ERROR`] apart,
+/// corners' smallest and largest U. If these two ranges are never more than `max_u_error` apart,
 /// the interpolation can't be off. It also covers triangles whose range is clamped at the ends of
 /// the scale, where U doesn't change at all.
-fn interpolation_is_safe(distances: [f32; 3], longest: f32) -> bool {
+fn interpolation_is_safe(distances: [f32; 3], longest: f32, max_u_error: f32) -> bool {
     let nearest = distances.iter().copied().fold(f32::INFINITY, f32::min);
     let farthest = distances.iter().copied().fold(f32::NEG_INFINITY, f32::max);
     let true_u = (scale_u(farthest - longest), scale_u(nearest + longest));
@@ -628,7 +777,7 @@ fn interpolation_is_safe(distances: [f32; 3], longest: f32) -> bool {
         corner_us.iter().copied().fold(f32::NEG_INFINITY, f32::max),
     );
     let most_off = (true_u.1 - interpolated_u.0).max(interpolated_u.1 - true_u.0);
-    most_off <= MAX_U_ERROR
+    most_off <= max_u_error
 }
 
 /// Unit normals for the vertices: the sum of the normals of the triangles around each, weighted by
@@ -977,10 +1126,16 @@ mod tests {
         ];
         let corners = vec![[0, 1, 2], [0, 2, 3]];
         let surface = Surface::new(&[[[50.0, 50.0, 0.0], [52.0, 50.0, 0.0], [50.0, 52.0, 5.0]]]);
-        let sampled = sample(&positions, &corners, &|point| point, &surface);
+        let sampled = sample(
+            &positions,
+            &corners,
+            &|point| point,
+            &surface,
+            &Detail::FINE,
+        );
 
         assert!(sampled.corners.len() > 100, "{}", sampled.corners.len());
-        assert!(sampled.corners.len() <= MAX_TRIANGLES);
+        assert!(sampled.corners.len() <= Detail::FINE.max_triangles);
         assert_eq!(sampled.positions.len(), sampled.uvs.len());
         assert!((area(&sampled) - 10_000.0).abs() < 10_000.0 * 1e-3);
         // Same winding as the input: facing +Z or -Z, as the first input triangle does.
@@ -1007,7 +1162,13 @@ mod tests {
     fn subdivision_leaves_far_away_flat_surfaces_alone() {
         let positions = vec![[0.0, 0.0, 0.0], [4.0, 0.0, 0.0], [0.0, 4.0, 0.0]];
         let surface = Surface::new(&[[[0.0, 0.0, 1000.0], [1.0, 0.0, 1000.0], [0.0, 1.0, 1000.0]]]);
-        let sampled = sample(&positions, &[[0, 1, 2]], &|point| point, &surface);
+        let sampled = sample(
+            &positions,
+            &[[0, 1, 2]],
+            &|point| point,
+            &surface,
+            &Detail::FINE,
+        );
         assert_eq!(sampled.corners.len(), 1);
     }
 
@@ -1029,16 +1190,28 @@ mod tests {
             })
             .collect();
         let surface = Surface::new(&sheet);
-        let sampled = sample(&positions, &[[0, 1, 2]], &|point| point, &surface);
+        let sampled = sample(
+            &positions,
+            &[[0, 1, 2]],
+            &|point| point,
+            &surface,
+            &Detail::FINE,
+        );
         assert!(sampled.corners.len() > 1000);
-        assert!(sampled.corners.len() <= MAX_TRIANGLES);
+        assert!(sampled.corners.len() <= Detail::FINE.max_triangles);
         assert!((area(&sampled) - 500_000.0).abs() < 500_000.0 * 1e-3);
     }
 
     #[test]
     fn no_reference_is_all_gray() {
         let (positions, corners) = cube(100.0);
-        let sampled = sample(&positions, &corners, &|point| point, &Surface::default());
+        let sampled = sample(
+            &positions,
+            &corners,
+            &|point| point,
+            &Surface::default(),
+            &Detail::FINE,
+        );
         assert_eq!(sampled.corners.len(), 12);
         assert!(sampled.uvs.iter().all(|&uv| uv[0] == no_reference_u()));
     }
@@ -1048,7 +1221,13 @@ mod tests {
         let (positions, corners) = cube(100.0);
         // Far from the reference, so nothing is subdivided: 4 vertices per face.
         let surface = Surface::new(&[[[0.0, 0.0, 1e6], [1.0, 0.0, 1e6], [0.0, 1.0, 1e6]]]);
-        let sampled = sample(&positions, &corners, &|point| point, &surface);
+        let sampled = sample(
+            &positions,
+            &corners,
+            &|point| point,
+            &surface,
+            &Detail::FINE,
+        );
         assert_eq!(sampled.corners.len(), 12);
         assert_eq!(sampled.positions.len(), 24);
         assert_eq!(
@@ -1060,17 +1239,18 @@ mod tests {
 
     #[test]
     fn subdivision_is_measured_in_the_reference_space() {
-        // A 0.3 unit triangle is under MIN_EDGE as it is, but 30 cm long in the reference's space,
-        // where it touches the reference.
-        let positions = vec![[0.0, 0.0, 0.0], [0.3, 0.0, 0.0], [0.0, 0.3, 0.0]];
+        // A 0.03 unit triangle is under the finest edge as it is, but 30 cm long in the
+        // reference's space, where it touches the reference.
+        let positions = vec![[0.0, 0.0, 0.0], [0.03, 0.0, 0.0], [0.0, 0.03, 0.0]];
         let surface = Surface::new(&[[[0.0, 0.0, 0.0], [10.0, 0.0, 0.0], [0.0, 10.0, 5.0]]]);
-        let unscaled = sample(&positions, &[[0, 1, 2]], &|p| p, &surface);
+        let unscaled = sample(&positions, &[[0, 1, 2]], &|p| p, &surface, &Detail::FINE);
         assert_eq!(unscaled.corners.len(), 1);
         let scaled = sample(
             &positions,
             &[[0, 1, 2]],
-            &|p| p.map(|axis| axis * 100.0),
+            &|p| p.map(|axis| axis * 1000.0),
             &surface,
+            &Detail::FINE,
         );
         assert!(scaled.corners.len() > 1);
     }
@@ -1148,10 +1328,16 @@ mod tests {
         ];
         let corners = vec![[0, 1, 2], [0, 2, 3]];
         let surface = Surface::new(&sphere([50.0, 50.0, 33.0], 30.0, 8, 12));
-        let sampled = sample(&positions, &corners, &|point| point, &surface);
+        let sampled = sample(
+            &positions,
+            &corners,
+            &|point| point,
+            &surface,
+            &Detail::FINE,
+        );
 
         assert!(sampled.corners.len() > 100, "{}", sampled.corners.len());
-        assert!(sampled.corners.len() <= MAX_TRIANGLES);
+        assert!(sampled.corners.len() <= Detail::FINE.max_triangles);
         assert!((area(&sampled) - 10_000.0).abs() < 10.0);
         for triangle in &sampled.corners {
             let points = triangle.map(|i| sampled.positions[i as usize]);
@@ -1182,7 +1368,13 @@ mod tests {
             [60.0, 50.0, 1000.0],
             [50.0, 60.0, 1000.0],
         ]]);
-        let sampled = sample(&positions, &corners, &|point| point, &surface);
+        let sampled = sample(
+            &positions,
+            &corners,
+            &|point| point,
+            &surface,
+            &Detail::FINE,
+        );
         assert_eq!(sampled.corners, corners);
         assert_eq!(sampled.positions, positions);
     }
@@ -1190,13 +1382,14 @@ mod tests {
     #[test]
     fn interpolation_is_safe_only_when_the_corners_pin_it_down() {
         // Far away, a triangle's distances can't stray much in proportion.
-        assert!(interpolation_is_safe([1000.0, 1010.0, 1020.0], 20.0));
+        let error = Detail::FINE.max_u_error;
+        assert!(interpolation_is_safe([1000.0, 1010.0, 1020.0], 20.0, error));
         // Close to the reference they can: it may even touch it in the middle.
-        assert!(!interpolation_is_safe([1.0, 1.0, 1.0], 5.0));
-        assert!(!interpolation_is_safe([0.001; 3], 10.0));
+        assert!(!interpolation_is_safe([1.0, 1.0, 1.0], 5.0, error));
+        assert!(!interpolation_is_safe([0.001; 3], 10.0, error));
         // Past either end of the scale, U doesn't change.
-        assert!(interpolation_is_safe([2e5, 3e5, 2e5], 1.0));
-        assert!(interpolation_is_safe([0.001; 3], 0.001));
+        assert!(interpolation_is_safe([2e5, 3e5, 2e5], 1.0, error));
+        assert!(interpolation_is_safe([0.001; 3], 0.001, error));
     }
 
     #[test]
@@ -1206,7 +1399,7 @@ mod tests {
         let corners: Vec<[u32; 3]> = corners.iter().map(|&[a, b, c]| [a, c, b]).collect();
         let far = Surface::new(&[[[0.0, 0.0, 1e6], [1.0, 0.0, 1e6], [0.0, 1.0, 1e6]]]);
         for surface in [&far, &Surface::default()] {
-            let sampled = sample(&positions, &corners, &|point| point, surface);
+            let sampled = sample(&positions, &corners, &|point| point, surface, &Detail::FINE);
             assert_eq!(sampled.normals.len(), sampled.positions.len());
             for (position, normal) in sampled.positions.iter().zip(&sampled.normals) {
                 let length = length(normal.map(f64::from));
@@ -1214,6 +1407,180 @@ mod tests {
                 let outward = [0, 1, 2].map(|axis| position[axis] - 50.0);
                 let along = dot(normal.map(f64::from), outward.map(f64::from));
                 assert!(along > 0.0, "{position:?} has the normal {normal:?}");
+            }
+        }
+    }
+
+    /// A square from `(0, 0, z)` to `(size, size, z)`, two triangles.
+    fn square(size: f32, z: f32) -> (Vec<[f32; 3]>, Vec<[u32; 3]>) {
+        let positions = vec![
+            [0.0, 0.0, z],
+            [size, 0.0, z],
+            [size, size, z],
+            [0.0, size, z],
+        ];
+        (positions, vec![[0, 1, 2], [0, 2, 3]])
+    }
+
+    /// A flat reference at height 0, reaching past `size` on every side.
+    fn floor(size: f32) -> Vec<[[f32; 3]; 3]> {
+        let (low, high) = (-size, 2.0 * size);
+        vec![
+            [[low, low, 0.0], [high, low, 0.0], [high, high, 0.0]],
+            [[low, low, 0.0], [high, high, 0.0], [low, high, 0.0]],
+        ]
+    }
+
+    /// The share of the mesh's area whose interpolated U is off from the true one by more than
+    /// `tolerance`, from seven points in every triangle.
+    fn share_off(sampled: &Sampled, surface: &Surface, tolerance: f32) -> f64 {
+        let weights: [[f32; 3]; 7] = [
+            [1.0 / 3.0, 1.0 / 3.0, 1.0 / 3.0],
+            [2.0 / 3.0, 1.0 / 6.0, 1.0 / 6.0],
+            [1.0 / 6.0, 2.0 / 3.0, 1.0 / 6.0],
+            [1.0 / 6.0, 1.0 / 6.0, 2.0 / 3.0],
+            [1.0 / 6.0, 5.0 / 12.0, 5.0 / 12.0],
+            [5.0 / 12.0, 1.0 / 6.0, 5.0 / 12.0],
+            [5.0 / 12.0, 5.0 / 12.0, 1.0 / 6.0],
+        ];
+        let (mut off, mut total) = (0.0, 0.0);
+        for triangle in &sampled.corners {
+            let points = triangle.map(|i| sampled.positions[i as usize]);
+            let us = triangle.map(|i| sampled.uvs[i as usize][0]);
+            let [a, b, c] = points.map(|point| point.map(f64::from));
+            let area = length(cross(sub(b, a), sub(c, a))) / 2.0;
+            for weight in weights {
+                let point =
+                    [0, 1, 2].map(|axis| (0..3).map(|k| weight[k] * points[k][axis]).sum::<f32>());
+                let interpolated: f32 = (0..3).map(|k| weight[k] * us[k]).sum();
+                let true_u = scale_u(surface.distance(point).unwrap());
+                total += area;
+                if (interpolated - true_u).abs() > tolerance {
+                    off += area;
+                }
+            }
+        }
+        off / total
+    }
+
+    /// The longest edge of the finest triangle with a corner within `within` of the circle of
+    /// `radius` around `center` (in X and Y).
+    fn finest_near_circle(sampled: &Sampled, center: [f32; 2], radius: f32, within: f32) -> f32 {
+        sampled
+            .corners
+            .iter()
+            .map(|triangle| triangle.map(|i| sampled.positions[i as usize]))
+            .filter(|points| {
+                points.iter().any(|point| {
+                    let (x, y) = (point[0] - center[0], point[1] - center[1]);
+                    ((x * x + y * y).sqrt() - radius).abs() < within
+                })
+            })
+            .map(|[a, b, c]| {
+                [(a, b), (b, c), (c, a)]
+                    .map(|(p, q)| distance_squared_f32(p, q).sqrt())
+                    .into_iter()
+                    .fold(0.0, f32::max)
+            })
+            .fold(f32::INFINITY, f32::min)
+    }
+
+    #[test]
+    fn a_giant_face_lying_on_the_reference_stays_coarse() {
+        // Ten meters wide, a tenth of a millimeter or less from the reference: right as it is.
+        let surface = Surface::new(&floor(1000.0));
+        for z in [0.0, 0.001, 0.005] {
+            let (positions, corners) = square(1000.0, z);
+            let sampled = sample(&positions, &corners, &|p| p, &surface, &Detail::FINE);
+            assert!(sampled.corners.len() <= 8, "{z}: {}", sampled.corners.len());
+            assert_eq!(share_off(&sampled, &surface, 0.01), 0.0);
+        }
+    }
+
+    #[test]
+    fn measured_errors_get_the_budget_before_precautions() {
+        // A ten meter face half a centimeter above the reference, everywhere long enough to be
+        // split as a precaution, with a small ball of the reference poking through it: the circle
+        // where they meet still gets millimeter triangles.
+        let mut triangles = floor(1000.0);
+        // Through the middle of the face's diagonal, measured from the start: a ball between the
+        // points measured could only be found by the precautions.
+        triangles.extend(sphere([500.0, 503.0, 0.5], 3.0, 24, 32));
+        let surface = Surface::new(&triangles);
+        let (positions, corners) = square(1000.0, 0.5);
+        let sampled = sample(&positions, &corners, &|p| p, &surface, &Detail::FINE);
+        assert!(sampled.corners.len() <= Detail::FINE.max_triangles);
+        let finest = finest_near_circle(&sampled, [500.0, 503.0], 3.0, 0.5);
+        assert!(finest <= 0.1, "{finest} cm");
+    }
+
+    #[test]
+    fn fine_colors_are_right_almost_everywhere() {
+        // A 20 cm plate cutting through a ball: the colors change fast around the circle where
+        // they meet, and slowly away from it.
+        let surface = Surface::new(&sphere([10.0, 10.0, 1.0], 4.0, 32, 48));
+        let (positions, corners) = square(20.0, 0.0);
+        let fine = sample(&positions, &corners, &|p| p, &surface, &Detail::FINE);
+        let preview = sample(&positions, &corners, &|p| p, &surface, &Detail::PREVIEW);
+        assert!(fine.corners.len() <= Detail::FINE.max_triangles);
+        assert!(preview.corners.len() <= Detail::PREVIEW.max_triangles);
+        assert!(preview.corners.len() < fine.corners.len());
+
+        // Off by more than a factor of 1.4 (0.15 of a decade) on under 2% of the area.
+        let fine_off = share_off(&fine, &surface, 0.15 / 7.0);
+        let preview_off = share_off(&preview, &surface, 0.15 / 7.0);
+        assert!(fine_off < 0.02, "fine: {fine_off}");
+        assert!(
+            fine_off < preview_off,
+            "fine {fine_off}, preview {preview_off}"
+        );
+        let finest = finest_near_circle(&fine, [10.0, 10.0], 15f32.sqrt(), 0.3);
+        assert!(finest <= 0.1, "{finest} cm");
+    }
+
+    #[test]
+    fn the_preview_keeps_its_budget() {
+        // The dense sheet of `the_budget_is_kept`.
+        let positions = vec![[0.0, 0.0, 0.0], [1000.0, 0.0, 0.0], [0.0, 1000.0, 0.0]];
+        let sheet: Vec<[[f32; 3]; 3]> = (0..40)
+            .flat_map(|i| {
+                (0..40).map(move |j| {
+                    let (x, y) = (i as f32 * 25.0, j as f32 * 25.0);
+                    [[x, y, 3.0], [x + 10.0, y, 0.0], [x, y + 10.0, 8.0]]
+                })
+            })
+            .collect();
+        let surface = Surface::new(&sheet);
+        let sampled = sample(&positions, &[[0, 1, 2]], &|p| p, &surface, &Detail::PREVIEW);
+        assert!(sampled.corners.len() > 100);
+        assert!(sampled.corners.len() <= Detail::PREVIEW.max_triangles);
+    }
+
+    /// How long each detail takes on a few bricks against a dense reference. Run with
+    /// `cargo test --release -p model_io -- --ignored --nocapture timings`.
+    #[test]
+    #[ignore]
+    fn timings() {
+        let mut triangles = sphere([10.0, 10.0, 1.0], 4.0, 300, 400);
+        triangles.extend(sphere([60.0, 30.0, -20.0], 25.0, 300, 400));
+        let surface = Surface::new(&triangles);
+        let cases = [
+            ("plate through a small ball", square(20.0, 0.0)),
+            ("plate over a big ball", square(100.0, 5.0)),
+            ("plate far away", square(20.0, 500.0)),
+        ];
+        for (name, (positions, corners)) in &cases {
+            for (detail_name, detail) in [("preview", Detail::PREVIEW), ("fine", Detail::FINE)] {
+                let started = std::time::Instant::now();
+                let sampled = sample(positions, corners, &|p| p, &surface, &detail);
+                let took = started.elapsed();
+                let off = share_off(&sampled, &surface, 0.15 / 7.0);
+                println!(
+                    "{name}, {detail_name}: {} triangles in {:.2} ms, {:.2}% off",
+                    sampled.corners.len(),
+                    took.as_secs_f64() * 1000.0,
+                    off * 100.0
+                );
             }
         }
     }

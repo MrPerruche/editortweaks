@@ -335,7 +335,8 @@ impl State {
     pub unsafe fn hide(&mut self) {
         self.failing = None;
         SHOWS.store(false, Ordering::Relaxed);
-        if let Some(code) = code() {
+        // Without its code it never showed: not looked for until a shot is.
+        if let Some(Some(code)) = CODE.get() {
             // SAFETY: per the contract.
             unsafe { self.tooltip.hide(&code.ui) };
         }

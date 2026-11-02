@@ -8,7 +8,11 @@
 //! breaks off one of the vehicle's bricks) and a square where it comes out, a green diamond where
 //! it ricochets with the cone it leaves in (the game turns it randomly within it), and where it
 //! ends an X (white where something stops it, gray at its range) or a star where it explodes. The
-//! vehicle's bricks it hits are outlined: magenta if it breaks them off, violet if they hold.
+//! vehicle's bricks it hits are outlined by the editor's own outline, following their shape
+//! (`game::outline_cases`): thick magenta if it breaks them off, thin violet if they hold. Where
+//! that outline can't show (the game uses its colors while moving bricks or picking a property, a
+//! drag box restyles outlines, coop shows others' selections with it, or the brick is selected and
+//! keeps its selection outline) a box is drawn around the brick instead, in the same colors.
 //! Tooltips ([`label`]) tell about what the mouse is on: a gun or its barrels, a path, a marker, a
 //! brick hit. See [`ballistics`] for how a shot flies and why its path doesn't depend on the frame
 //! rate.
@@ -48,12 +52,13 @@ use brickrust::ue::coreuobject::UObjectBase;
 use brickrust::ue::uclass::UStruct;
 
 use self::ballistics::{Contact, Ending, Flight, Frame, Ricochet, Shot};
-use super::{map_in_editor, view_modes};
+use super::{drag_select, map_in_editor, view_modes};
 use crate::framework::settings::{Alternative, Choice, Toggle};
 use crate::game::brick_connections::{self, Connections};
 use crate::game::brick_editor;
 use crate::game::collision::Collision;
 use crate::game::component_bounds::{self, ComponentBounds};
+use crate::game::editor_mode::{self, EditorModes};
 use crate::game::editor_object::{self, LocalBounds, Selection, Transform, WorldTransforms};
 use crate::game::editor_view::{self, Bricks, EditorCode};
 use crate::game::gravity::{self, Gravity};
@@ -62,6 +67,7 @@ use crate::game::guns::{
 };
 use crate::game::line_batcher::{self, Line, LineBatcher};
 use crate::game::line_trace::{self, ComponentTrace, ProfileTrace};
+use crate::game::outline_cases::{self, CASES, Highlights, OutlineCases};
 use crate::game::penetration::{self, Densities};
 use crate::game::reflection;
 use crate::game::weak_object::WeakObject;
@@ -140,8 +146,13 @@ const CONE_LINES: usize = 12;
 /// The path's width through what it pierces, as a share of its distance from the camera (a few
 /// pixels); elsewhere it's a pixel wide.
 const PIERCING_WIDTH: f64 = 0.005;
-/// How far outside a hit brick's box its outline is drawn, in cm.
+/// How far outside a hit brick's box its box is drawn, in cm (where the editor's outline can't
+/// show it).
 const OUTLINE_MARGIN: f64 = 0.5;
+/// The editor outline's free cases the hit bricks get (`game::outline_cases`): the first is drawn
+/// thicker than the last, so the bricks broken off stand out.
+const BREAKS_CASE: usize = 0;
+const HOLDS_CASE: usize = CASES - 1;
 /// Path steps: about this share of the shot's range, but no shorter than [`MIN_STEP`] cm.
 const STEPS: f64 = 200.0;
 const MIN_STEP: f64 = 1000.0;
@@ -169,6 +180,8 @@ struct Code {
     world: Option<WorldCode>,
     /// What shots hit of the vehicle; without it, they pass through it (logged).
     vehicle: Option<VehicleCode>,
+    /// The editor's outline for the bricks hit; without it, they get boxes (logged).
+    outline: Option<OutlineCode>,
     /// `EAmmoType` values that explode on impact, and those that steer (shown unguided).
     explosive: Vec<u8>,
     homing: Vec<u8>,
@@ -198,6 +211,13 @@ struct VehicleCode {
     vehicle_editor: *const UStruct,
 }
 
+/// What outlining the bricks hit with the editor's own outline needs: its free cases, and the
+/// editor's modes (they're free in its default mode only).
+struct OutlineCode {
+    cases: OutlineCases,
+    modes: EditorModes,
+}
+
 // SAFETY: reflection records and game code living as long as the game; only used on the game
 // thread.
 unsafe impl Send for Code {}
@@ -222,6 +242,12 @@ struct State {
     /// The camera location the lines were drawn for, if drawn.
     drawn_for: Option<Vec3>,
     label: label::State,
+    /// The vehicle's bricks the shots hit.
+    hits: Vec<Hit>,
+    /// The editor's outline in our colors, once used.
+    highlights: Option<Highlights>,
+    /// The bricks hit that the editor's outline shows (the others get boxes), as last drawn.
+    outlined: Vec<usize>,
 }
 
 // SAFETY: weak pointers to game objects, only used on the game thread.
@@ -236,8 +262,20 @@ impl State {
             vehicle: None,
             drawn_for: None,
             label: label::State::new(),
+            hits: Vec::new(),
+            highlights: None,
+            outlined: Vec::new(),
         }
     }
+}
+
+/// A brick of the vehicle the shots hit: its address, the brick, whether a shot breaks it off,
+/// and the component the editor's outline shows of it.
+struct Hit {
+    brick: usize,
+    object: WeakObject,
+    breaks: bool,
+    component: Option<WeakObject>,
 }
 
 /// The vehicle's bricks shots can hit.
@@ -353,6 +391,14 @@ fn find() -> Result<Code, String> {
     })()
     .map_err(|reason| log!("shots pass through the vehicle: {reason}"))
     .ok();
+    let outline = (|| {
+        Ok::<_, String>(OutlineCode {
+            cases: outline_cases::find()?,
+            modes: editor_mode::find()?,
+        })
+    })()
+    .map_err(|reason| log!("bricks hit get boxes, not the editor's outline: {reason}"))
+    .ok();
     let ammo = |name: &str| {
         reflection::enum_value("EAmmoType", &format!("EAmmoType::{name}"))
             .ok()
@@ -380,6 +426,7 @@ fn find() -> Result<Code, String> {
         lines: line_batcher::find()?,
         world,
         vehicle,
+        outline,
         explosive: ["Incendiary", "HighExplosive", "TargetSeeking", "Guided"]
             .iter()
             .filter_map(|name| ammo(name))
@@ -425,11 +472,16 @@ fn after_tick(editor: *mut UObjectBase, _delta: f32) {
     let mut guard = STATE.lock().unwrap_or_else(PoisonError::into_inner);
     let state = &mut *guard;
     if !state.editor.as_ref().is_some_and(|known| known.is(editor)) {
-        // A new editor: the old one's lines went with its world.
+        // A new editor: the old one's lines and outlines went with its world.
+        let mut highlights = state.highlights.take();
+        if let Some(highlights) = &mut highlights {
+            highlights.forget();
+        }
         *state = State {
             // SAFETY: the live editor, ticking.
             editor: Some(unsafe { WeakObject::new(editor) }),
             label: core::mem::replace(&mut state.label, label::State::new()),
+            highlights,
             ..State::new()
         };
     }
@@ -483,6 +535,15 @@ unsafe fn tick(code: &Code, editor: *mut UObjectBase, state: &mut State) {
         };
         // SAFETY: per the contract.
         state.shots = unsafe { work_out(code, editor, &found, &wanted, vehicle, map, gravity) };
+        // SAFETY: per the contract; the bricks are the editor's, live.
+        state.hits = unsafe { hits(code, &state.shots, &found.bricks) };
+        state.drawn_for = None;
+    }
+    // SAFETY: per the contract.
+    let outlined = unsafe { outline_hits(code, editor, state) };
+    if outlined != state.outlined {
+        // Boxes for the others.
+        state.outlined = outlined;
         state.drawn_for = None;
     }
     // SAFETY: per the contract.
@@ -501,8 +562,14 @@ unsafe fn tick(code: &Code, editor: *mut UObjectBase, state: &mut State) {
     };
     if moved {
         let vehicle = state.vehicle.as_ref().map(|(_, vehicle)| vehicle);
+        let boxed: HashMap<usize, bool> = state
+            .hits
+            .iter()
+            .filter(|hit| !state.outlined.contains(&hit.brick))
+            .map(|hit| (hit.brick, hit.breaks))
+            .collect();
         // SAFETY: per the contract.
-        unsafe { draw(code, &state.shots, vehicle, camera) };
+        unsafe { draw(code, &state.shots, vehicle, &boxed, camera) };
         state.drawn_for = Some(camera.unwrap_or_default());
     } else {
         // SAFETY: per the contract; the batcher is the current world's, or null.
@@ -539,6 +606,12 @@ unsafe fn tick(code: &Code, editor: *mut UObjectBase, state: &mut State) {
 unsafe fn clear(code: &Code, state: &mut State) {
     state.key = None;
     state.shots.clear();
+    state.hits.clear();
+    state.outlined.clear();
+    if let (Some(outline), Some(highlights)) = (&code.outline, &mut state.highlights) {
+        // SAFETY: per the contract.
+        unsafe { highlights.hide(&outline.cases) };
+    }
     if state.drawn_for.take().is_some() {
         // SAFETY: per the contract; the batcher is the current world's, or null.
         unsafe {
@@ -1037,12 +1110,103 @@ unsafe fn contact(
     None
 }
 
-/// Draws the shots, their markers and widths sized for a camera at `camera`, and outlines the
-/// bricks of `vehicle` they hit.
+/// The bricks of the vehicle (among `bricks`, those shown) that `shots` hit, in `bricks`' order:
+/// whether any shot breaks them off.
+///
+/// # Safety
+/// `bricks` must be live editor objects. Game thread only.
+unsafe fn hits(code: &Code, shots: &[Preview], bricks: &[*mut UObjectBase]) -> Vec<Hit> {
+    let mut breaks: HashMap<usize, bool> = HashMap::new();
+    for shot in shots {
+        for (impact, &broken) in shot.flight.impacts.iter().zip(&shot.breaks) {
+            if let Some(brick) = impact.brick {
+                *breaks.entry(brick).or_default() |= broken;
+            }
+        }
+    }
+    bricks
+        .iter()
+        .filter_map(|&object| {
+            let breaks = *breaks.get(&(object as usize))?;
+            // SAFETY: per the contract; the component is the live brick's.
+            unsafe {
+                let component = code
+                    .outline
+                    .as_ref()
+                    .and_then(|outline| outline.cases.outlines().component_of(object));
+                Some(Hit {
+                    brick: object as usize,
+                    object: WeakObject::new(object),
+                    breaks,
+                    component: component.map(|component| WeakObject::new(component)),
+                })
+            }
+        })
+        .collect()
+}
+
+/// Outlines the bricks hit with the editor's own outline, in our colors, where it can show them;
+/// returns those it shows (the others get boxes). It can't while the editor isn't in its default
+/// mode or a drag box restyles outlines, nor on selected bricks (they keep their selection
+/// outline); and gives way when the game or coop uses its free cases (`game::outline_cases`).
+///
+/// # Safety
+/// `editor` must be the live editor. Game thread only.
+unsafe fn outline_hits(code: &Code, editor: *mut UObjectBase, state: &mut State) -> Vec<usize> {
+    let Some(outline) = &code.outline else {
+        return Vec::new();
+    };
+    let highlights = state
+        .highlights
+        .get_or_insert_with(|| Highlights::new(OWNER, 0));
+    // SAFETY: per the contract.
+    let free = unsafe { outline.modes.is_editing(editor) } && !drag_select::dragging();
+    let mut wanted = Vec::new();
+    let mut outlined = Vec::new();
+    for hit in state.hits.iter().filter(|_| free) {
+        let (Some(object), Some(component)) = (
+            hit.object.get_live(),
+            hit.component.and_then(|component| component.get_live()),
+        ) else {
+            continue;
+        };
+        // SAFETY: a live editor object (just checked).
+        if unsafe { code.selection.is_selected(object) } {
+            continue;
+        }
+        let case = if hit.breaks { BREAKS_CASE } else { HOLDS_CASE };
+        wanted.push((component, case));
+        outlined.push(hit.brick);
+    }
+    let mut colors = [None; CASES];
+    colors[BREAKS_CASE] = Some(BREAKS.map(srgb));
+    colors[HOLDS_CASE] = Some(HOLDS.map(srgb));
+    // SAFETY: per the contract; the components are live (just checked, nothing ran since).
+    let shown = unsafe { highlights.show(&outline.cases, editor, &wanted, colors) };
+    if shown { outlined } else { Vec::new() }
+}
+
+/// A linear color channel in sRGB (the editor's outline is drawn after tone mapping).
+fn srgb(linear: f32) -> f32 {
+    if linear <= 0.003_130_8 {
+        linear * 12.92
+    } else {
+        1.055 * linear.powf(1.0 / 2.4) - 0.055
+    }
+}
+
+/// Draws the shots, their markers and widths sized for a camera at `camera`, and boxes around the
+/// bricks of `vehicle` in `boxed` (by address: whether they break off).
 ///
 /// # Safety
 /// Game thread only.
-unsafe fn draw(code: &Code, shots: &[Preview], vehicle: Option<&Vehicle>, camera: Option<Vec3>) {
+unsafe fn draw(
+    code: &Code,
+    shots: &[Preview],
+    vehicle: Option<&Vehicle>,
+    boxed: &HashMap<usize, bool>,
+    camera: Option<Vec3>,
+) {
     let mut canvas = Canvas::default();
     let lines = &mut canvas.lines;
     let width = |at: Vec3| {
@@ -1050,7 +1214,6 @@ unsafe fn draw(code: &Code, shots: &[Preview], vehicle: Option<&Vehicle>, camera
             math::length(math::sub(at, camera)) * PIERCING_WIDTH
         })
     };
-    let (mut broken, mut held) = (HashSet::new(), HashSet::new());
     for shot in shots {
         let params = &shot.params;
         let color = |range: f64| {
@@ -1065,14 +1228,7 @@ unsafe fn draw(code: &Code, shots: &[Preview], vehicle: Option<&Vehicle>, camera
         for pair in shot.flight.points.windows(2) {
             push_line(lines, pair[0].at, pair[1].at, color(pair[1].range), 0.0);
         }
-        for (impact, &breaks) in shot.flight.impacts.iter().zip(&shot.breaks) {
-            if let Some(brick) = impact.brick {
-                if breaks {
-                    broken.insert(brick);
-                } else {
-                    held.insert(brick);
-                }
-            }
+        for impact in &shot.flight.impacts {
             if impact.through {
                 let middle = math::scale(math::add(impact.at, impact.exit), 0.5);
                 push_line(lines, impact.at, impact.exit, THROUGH, width(middle));
@@ -1118,12 +1274,10 @@ unsafe fn draw(code: &Code, shots: &[Preview], vehicle: Option<&Vehicle>, camera
         }
     }
     for target in vehicle.map_or(&[][..], |vehicle| &vehicle.targets) {
-        let color = if broken.contains(&target.brick) {
-            BREAKS
-        } else if held.contains(&target.brick) {
-            HOLDS
-        } else {
-            continue;
+        let color = match boxed.get(&target.brick) {
+            Some(true) => BREAKS,
+            Some(false) => HOLDS,
+            None => continue,
         };
         if let Some(outline) = &target.outline {
             outline_box(&mut canvas.lines, outline, color);

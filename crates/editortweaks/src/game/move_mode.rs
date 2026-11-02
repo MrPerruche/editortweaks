@@ -45,6 +45,7 @@ use brickrust::ue::tshared::FWeakObjectPtr;
 
 use crate::framework::hook;
 use crate::framework::sig::{self, FunctionSig, SigMatch};
+use crate::framework::timings;
 use crate::game::editor_object::Vector;
 use crate::game::reflection;
 use crate::game::weak_object::{self, WeakObject};
@@ -643,6 +644,7 @@ unsafe extern "C" fn snapping_offset_detour(
     out: *mut Adjustment,
     params: *const c_void,
 ) -> *mut Adjustment {
+    let _span = timings::span("game::move_mode::snapping_offset_detour");
     if as_replaced() {
         // SAFETY: `out` is where the caller takes the result from.
         unsafe { out.write_unaligned(Adjustment::NONE) };
@@ -653,7 +655,9 @@ unsafe extern "C" fn snapping_offset_detour(
         .expect("hook recorded before use");
     // SAFETY: the original function with its own arguments.
     let mut snap = || unsafe {
-        original(editor, out, params);
+        timings::game("ABrickEditor::GetMoveSnappingOffset", || {
+            original(editor, out, params)
+        });
     };
     match AROUND_SNAPPING.get() {
         Some(around) => around(&mut snap),

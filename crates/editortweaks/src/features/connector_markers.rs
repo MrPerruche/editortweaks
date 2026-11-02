@@ -25,6 +25,7 @@ use brickrust::ue::coreuobject::UObjectBase;
 
 use crate::framework::hook;
 use crate::framework::settings::Toggle;
+use crate::framework::timings;
 use crate::game::brick_editor;
 use crate::game::connectors_ism::{
     self, AddConnectorFieldsFn, ConnectorsIsm, Instance, KIND_SPACING_CM, MESH_CM,
@@ -137,11 +138,14 @@ unsafe extern "C" fn add_detour(
     focused_axes: u8,
     brick_size: *const Vector,
 ) {
+    let _span = timings::span("connector_markers::add_detour");
     let original = *ORIGINAL.get().expect("hook recorded before use");
     // SAFETY: the game's call, passed on; `component` is the live marker component it filled, on
     // the game thread.
     unsafe {
-        original(component, fields, focused_axes, brick_size);
+        timings::game(connectors_ism::ADD_CONNECTOR_FIELDS.name, || {
+            original(component, fields, focused_axes, brick_size)
+        });
         if let Some(code) = CODE.get() {
             code.rearrange(component);
         }

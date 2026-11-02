@@ -6,10 +6,17 @@
 use std::fs::File;
 use std::io::Write;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Mutex, PoisonError};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 static FILE: Mutex<Option<File>> = Mutex::new(None);
+
+/// Bytes of coop lines written this run, and the most there may be. Other players' traffic writes
+/// lines (one per edit applied, one per unreadable message), so a hostile one could otherwise fill
+/// the disk; a long session writes a few MB at most (about 100 bytes per edit).
+static WRITTEN: AtomicUsize = AtomicUsize::new(0);
+const MOST: usize = 32 << 20;
 
 /// `coop_log!("format {}", args)`: like `log!`, and into this instance's coop log once it has one.
 macro_rules! coop_log {
@@ -41,6 +48,14 @@ pub fn start(role: &str) {
 
 /// Writes one line to `brickworks.txt` and the coop log. Prefer [`coop_log!`].
 pub fn write(line: &str) {
+    let size = line.len() + 1;
+    let before = WRITTEN.fetch_add(size, Ordering::Relaxed);
+    let line = match before + size {
+        total if total <= MOST => line,
+        // The first line past it says so.
+        _ if before <= MOST => "coop log full (32 MB this run): later coop lines are left out",
+        _ => return,
+    };
     crate::framework::log::write("editortweaks::features::coop", line);
     if let Some(file) = FILE.lock().unwrap_or_else(PoisonError::into_inner).as_mut() {
         let _ = writeln!(file, "{} {line}", time_of_day());

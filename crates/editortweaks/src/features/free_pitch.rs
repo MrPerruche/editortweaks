@@ -19,6 +19,7 @@ use super::editor_frame;
 use super::mouse_moves::{self, Direction, Handling, Movement};
 use crate::framework::hook;
 use crate::framework::settings::{Alternative, Choice};
+use crate::framework::timings;
 use crate::game::editor_input::{self, CameraFlags};
 use crate::game::reflection;
 use crate::game::rotation_limits::{self, RotationLimitsFn};
@@ -122,10 +123,13 @@ unsafe extern "C" fn rotation_limits_detour(
     min: *mut [f32; 2],
     max: *mut [f32; 2],
 ) {
+    let _span = timings::span("free_pitch::rotation_limits_detour");
     let original = *ORIGINAL.get().expect("hook recorded before use");
     // SAFETY: the game's own arguments, passed on: the view target's interface and two vectors.
     unsafe {
-        original(interface, min, max);
+        timings::game(rotation_limits::DEFAULT_LIMITS.name, || {
+            original(interface, min, max)
+        });
         if Upside::chosen() != Upside::Off && is_editor(interface) {
             (*min)[0] = -ANY_PITCH;
             (*max)[0] = ANY_PITCH;

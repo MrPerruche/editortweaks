@@ -6,15 +6,16 @@
 //! (`game::brick_model`, what the editor's clicks hit), else its simple shapes (spinners' hulls),
 //! else its box. Threads of ours ([`worker`]) measure it against the references
 //! ([`model_io::fit`]), subdividing where the distance changes, and put each vertex's distance in
-//! its texture coordinate U. Each brick then gets a procedural mesh component of ours with those
+//! its texture coordinate U: first a quick preview of every brick changed, then finely, which
+//! replaces the preview. Each brick then gets a procedural mesh component of ours with those
 //! triangles (`game::procedural_mesh`: the whole mesh in one call), attached to its own mesh
 //! component and scaled like the collision view mode's shapes, showing a lit material whose texture
 //! is the color scale: the GPU blends U across each triangle, so colors change smoothly over a face
-//! without a shader of ours (the game can't compile one). The brick itself shows the game's hidden
-//! material (`view_modes` hooks `GetEditorMaterialOverride` for that) until our component is
-//! there; then its own mesh leaves the main pass (`MeshComponents::set_drawn`), since our component
-//! lies on the same surface and the dithered copy would z-fight with it. The selection outline is
-//! copied to our component every frame.
+//! without a shader of ours (the game can't compile one). The brick itself shows plain gray (the
+//! coloring view modes' material, `view_modes` hooks `GetEditorMaterialOverride` for that) until
+//! our component is there; then its own mesh leaves the main pass (`MeshComponents::set_drawn`),
+//! since our component shows its surface (or what stands in for it) and would z-fight with it. The
+//! selection outline is copied to our component every frame.
 //!
 //! A brick is measured again when the game updates it with another place, mesh or scale (moves,
 //! resizes), and every brick when the references change (moved, rescaled, hidden with H, another
@@ -22,8 +23,8 @@
 //!
 //! While bricks are dragged, the game moves their mesh components along (and our components
 //! with them, attached), updating them every frame: each is measured again where its component
-//! is, and keeps its colors until newer ones are measured, so nothing blinks and colors catch up
-//! with the drag.
+//! is (previews only, until it stops), and keeps its colors until newer ones are measured, so
+//! nothing blinks and colors catch up with the drag.
 //!
 //! Driven by `view_modes`' hooks like the collision view mode: [`show`] after the game updates a
 //! brick in this view mode, [`remove`] after it updates one in any other, [`keep_only`] and
@@ -38,7 +39,7 @@ use std::time::{Duration, Instant};
 use brickrust::ue::coreuobject::UObjectBase;
 use model_io::{fit, loft};
 
-use self::worker::{Done, Job, Source, Worker};
+use self::worker::{Job, Source, Stage, Worker};
 use super::Editor;
 use super::collision::mesh as shapes_mesh;
 use super::tooltip::{Hover, number};
@@ -94,10 +95,11 @@ struct Shown {
     source: Option<Arc<Source>>,
     /// Its latest job's serial.
     serial: u64,
-    /// The serial of the job whose colors our component shows: older results are thrown away.
-    drawn: u64,
+    /// The serial and stage of the measure whose colors our component shows: older results are
+    /// thrown away, and a job's fine measure replaces its preview.
+    drawn: (u64, Stage),
     /// Whether the brick's own mesh is out of the view's main pass: our component shows its
-    /// surface, so the brick's hidden material would z-fight with it.
+    /// surface, so the brick's own mesh would z-fight with it.
     parent_undrawn: bool,
 }
 
@@ -140,7 +142,9 @@ struct State {
 /// A round of measures after the references changed, for the log.
 struct Round {
     since: Instant,
-    built: usize,
+    /// Bricks whose preview, and whose fine measure, is in.
+    previewed: usize,
+    refined: usize,
     /// Time spent measuring, added over the worker's threads.
     measuring: Duration,
     /// Time spent on the game thread making the meshes.
@@ -226,10 +230,7 @@ pub unsafe fn describe(editor: &Editor, hover: &Hover) -> Vec<String> {
     };
     // SAFETY: as above.
     match unsafe { references::fit_distance(editor.editor, hover.at(point.entry)) } {
-        Some(distance) => vec![format!(
-            "Distance to the reference: {} cm",
-            number(distance)
-        )],
+        Some(distance) => vec![format!("Distance: {} cm", number(distance))],
         None => vec!["No reference model to measure against".to_owned()],
     }
 }
@@ -266,7 +267,7 @@ pub unsafe fn show(code: &EditorCode, brick: *mut UObjectBase) {
                     pose: None,
                     source: None,
                     serial: 0,
-                    drawn: 0,
+                    drawn: (0, Stage::Preview),
                     parent_undrawn: false,
                 }
             }
@@ -416,7 +417,8 @@ fn check_references() {
     state.settling = None;
     state.round = Some(Round {
         since: now,
-        built: 0,
+        previewed: 0,
+        refined: 0,
         measuring: Duration::ZERO,
         building: Duration::ZERO,
     });
@@ -533,10 +535,7 @@ impl Code {
         }
         // SAFETY: per the contract.
         let source = match unsafe { self.models.triangles_of_body_setup(body_setup) } {
-            Ok(triangles) => Source {
-                exact: true,
-                ..oriented(triangles.vertices, triangles.triangles)
-            },
+            Ok(triangles) => oriented(triangles.vertices, triangles.triangles),
             // SAFETY: per the contract.
             Err(reason) => match unsafe { self.collision.shapes(body_setup) } {
                 // SAFETY: per the contract.
@@ -630,14 +629,18 @@ impl Code {
             let building = Instant::now();
             // Not only the latest: while a brick is dragged, it has moved on by the time its
             // measure is done, and each one done brings its colors closer.
-            if done.serial > shown.drawn {
-                shown.drawn = done.serial;
-                // SAFETY: per the contract.
-                unsafe { self.show_colors(&mut shown, &done, material) };
+            let measure = (done.serial, done.stage);
+            if measure > shown.drawn {
+                shown.drawn = measure;
+                // Without a mesh, the fine measure is just like the preview shown.
+                if let Some(sampled) = &done.sampled {
+                    // SAFETY: per the contract.
+                    unsafe { self.show_colors(&mut shown, sampled, material) };
+                }
             }
             put(brick, shown);
             if latest {
-                self.count_built(done.took, building.elapsed());
+                self.count_built(done.stage, done.took, building.elapsed());
             }
             if started.elapsed() >= BUILD_BUDGET {
                 break;
@@ -649,7 +652,12 @@ impl Code {
     ///
     /// # Safety
     /// `material` must be null or a live material. Game thread only.
-    unsafe fn show_colors(&self, shown: &mut Shown, done: &Done, material: *mut UObjectBase) {
+    unsafe fn show_colors(
+        &self,
+        shown: &mut Shown,
+        sampled: &fit::Sampled,
+        material: *mut UObjectBase,
+    ) {
         let (Some(parent), Some(pose)) = (shown.parent.get(), shown.pose) else {
             return;
         };
@@ -670,7 +678,6 @@ impl Code {
                     colors
                 }
             };
-            let sampled = &done.sampled;
             self.procedural.set_section(
                 colors,
                 &sampled.positions,
@@ -682,19 +689,18 @@ impl Code {
                 self.components.set_material(colors, 0, material);
             }
             self.components.copy_custom_depth(parent, colors);
-            // Our component is the brick's surface: the brick's own mesh underneath, in the hidden
-            // material, is not needed and z-fights with it. The outline comes from our component.
-            // The brick keeps its mesh until ours is there, and for good when ours only stands in
-            // for its surface (a spinner's is swept again from its collision, which can be off).
-            let undrawn = shown.source.as_ref().is_some_and(|source| source.exact);
-            if undrawn != shown.parent_undrawn && self.components.set_drawn(parent, !undrawn) {
-                shown.parent_undrawn = undrawn;
+            // Our component shows the brick's surface (or what stands in for it): the brick's own
+            // mesh underneath (gray) isn't needed and would z-fight with it. The outline comes
+            // from our component.
+            if !shown.parent_undrawn && self.components.set_drawn(parent, false) {
+                shown.parent_undrawn = true;
             }
         }
     }
 
-    /// Counts a brick built in the current round, and logs the round once it's over.
-    fn count_built(&self, measuring: Duration, building: Duration) {
+    /// Counts a brick measured in the current round, and logs when every brick is previewed and
+    /// when the round is over (every brick refined).
+    fn count_built(&self, stage: Stage, measuring: Duration, building: Duration) {
         let mut state = STATE.lock().unwrap_or_else(PoisonError::into_inner);
         let threads = state
             .worker
@@ -704,16 +710,27 @@ impl Code {
         let Some(round) = &mut state.round else {
             return;
         };
-        round.built += 1;
         round.measuring += measuring;
         round.building += building;
         let all = SHOWN.lock().map_or(0, |shown| shown.len());
-        if round.built >= all {
-            let ms = |duration: Duration| duration.as_secs_f64() * 1000.0;
+        let ms = |duration: Duration| duration.as_secs_f64() * 1000.0;
+        match stage {
+            Stage::Preview => {
+                round.previewed += 1;
+                if round.previewed == all {
+                    log!(
+                        "Reference fit: {all} bricks previewed in {:.0} ms",
+                        ms(round.since.elapsed())
+                    );
+                }
+            }
+            Stage::Fine => round.refined += 1,
+        }
+        if round.refined >= all {
             log!(
-                "Reference fit: {} bricks shown in {:.0} ms (measuring {:.0} ms over {threads} \
+                "Reference fit: {} bricks refined in {:.0} ms (measuring {:.0} ms over {threads} \
                  threads, building {:.0} ms)",
-                round.built,
+                round.refined,
                 ms(round.since.elapsed()),
                 ms(round.measuring),
                 ms(round.building)
@@ -807,11 +824,7 @@ fn oriented(positions: Vec<[f32; 3]>, mut corners: Vec<[u32; 3]>) -> Source {
             triangle.swap(1, 2);
         }
     }
-    Source {
-        positions,
-        corners,
-        exact: false,
-    }
+    Source { positions, corners }
 }
 
 /// A brick's box (`[min, max]`) as a surface, for bricks without complex collision.

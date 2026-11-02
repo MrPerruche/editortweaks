@@ -11,7 +11,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use brickrust::ue::fproperty::FProperty;
 
 use super::limits::{self, Edit};
-use crate::framework::hook;
+use crate::framework::{hook, timings};
 use crate::game::numeric_property::{NumericRange, NumericValue};
 use crate::game::scalable_brick::{self, ConstraintBrickSizeFn};
 use crate::prelude::*;
@@ -54,10 +54,15 @@ pub(super) fn on_engine_init() {
 }
 
 unsafe extern "C" fn detour(brick: *mut c_void) {
+    let _span = timings::span("property_limits::brick_size::detour");
     let original = *ORIGINAL.get().expect("hook recorded before use");
     let Some(&property) = BRICK_SIZE.get() else {
         // SAFETY: forwards the caller's argument unchanged.
-        return unsafe { original(brick) };
+        return unsafe {
+            timings::game(scalable_brick::CONSTRAINT_BRICK_SIZE.name, || {
+                original(brick)
+            })
+        };
     };
     let property = property as *const FProperty;
 
@@ -69,13 +74,17 @@ unsafe extern "C" fn detour(brick: *mut c_void) {
             .cast::<[f32; 3]>();
         let wanted = *size;
         if !wanted.iter().all(|c| c.is_finite()) {
-            return original(brick);
+            return timings::game(scalable_brick::CONSTRAINT_BRICK_SIZE.name, || {
+                original(brick)
+            });
         }
 
         let vanilla = game_range(original, brick, size);
         let max = vanilla.max.data;
         let Some(edit) = Edit::new(property, brick, &vanilla, 3) else {
-            return original(brick);
+            return timings::game(scalable_brick::CONSTRAINT_BRICK_SIZE.name, || {
+                original(brick)
+            });
         };
         let (limits, rule) = limits::resolve(&edit);
         let mut value = wanted;
@@ -130,10 +139,14 @@ unsafe fn game_range(
     unsafe {
         let wanted = *size;
         *size = [f32::MAX; 3];
-        original(brick);
+        timings::game(scalable_brick::CONSTRAINT_BRICK_SIZE.name, || {
+            original(brick)
+        });
         let max = *size;
         *size = [f32::MIN; 3];
-        original(brick);
+        timings::game(scalable_brick::CONSTRAINT_BRICK_SIZE.name, || {
+            original(brick)
+        });
         let min = *size;
         *size = wanted;
         NumericRange {

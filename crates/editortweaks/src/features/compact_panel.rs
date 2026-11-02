@@ -44,7 +44,7 @@ pub static COMPACT_PANEL: Choice = Choice::new(
             name: "Compact",
         },
     ],
-    0,
+    1,
 );
 
 /// The options of [`COMPACT_PANEL`].

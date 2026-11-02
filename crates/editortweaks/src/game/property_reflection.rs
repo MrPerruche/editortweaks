@@ -25,7 +25,7 @@ use brickrust::ue::fmalloc;
 use brickrust::ue::fname::FName;
 use brickrust::ue::tarray::TArray;
 
-use crate::framework::settings::{Choice, Setting, Toggle};
+use crate::framework::settings::{Choice, Count, Setting, Toggle};
 use crate::framework::sig::{CodeShape, FunctionSig, StringRefSig, VtableSig};
 use crate::game::kismet::{self, Texts};
 use crate::game::numeric_property::NumericValue;
@@ -84,6 +84,8 @@ pub trait Number: Sync {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
 pub enum Unit {
+    /// A whole number, shown without decimals.
+    Integer = 1,
     /// A fraction shown as a percentage (0.5 is 50 %).
     Percent = 2,
     /// Degrees.
@@ -123,6 +125,13 @@ pub trait List: Sync {
     }
 }
 
+/// A row's name made each time a panel lists it, for rows showing what changes (a list's entries):
+/// [`Row::labelled`]. Its functions run on the game thread, whenever a panel lists the row.
+pub trait Label: Sync {
+    /// The name now, or `None` to leave the row out.
+    fn label(&self) -> Option<String>;
+}
+
 /// How many items a list can have: the game sets an item's index as a byte.
 pub const MAX_ITEMS: usize = 256;
 
@@ -159,6 +168,33 @@ impl List for Choice {
     }
 }
 
+impl Number for Count {
+    fn values(&self) -> Vec<f32> {
+        vec![self.get() as f32]
+    }
+
+    fn set_values(&self, values: &[f32]) {
+        if let Some(value) = values.first() {
+            // The slider gives any float: a count is the nearest whole number (negatives and
+            // NaN give 0, which `set` raises to the smallest).
+            self.set(value.round() as u32);
+        }
+    }
+
+    fn range(&self) -> (f32, f32) {
+        (self.min as f32, self.max as f32)
+    }
+
+    fn unit(&self) -> Unit {
+        Unit::Integer
+    }
+
+    /// One slider, not a size's axes: no lock, no value order button.
+    fn alike(&self) -> bool {
+        false
+    }
+}
+
 /// `FNumericBrickPropertyValue`: up to three components, `count` of them used.
 #[repr(C)]
 #[derive(Clone, Copy, PartialEq)]
@@ -179,6 +215,7 @@ impl From<Setting> for Value {
         match setting {
             Setting::Toggle(toggle) => Value::Check(toggle),
             Setting::Choice(choice) => Value::List(choice),
+            Setting::Count(count) => Value::Number(count),
         }
     }
 }
@@ -232,7 +269,9 @@ const EDIT_INFO_DESCRIPTION: usize = 0x80;
 /// 0xF03A30, the reads at 0xF03D83) passes to its combo box: `MaxListItems` (our name; `int32`)
 /// shows the items side by side when there are at most that many, else a dropdown; -1, the
 /// default, always side by side, 0 always a dropdown (as the siren brick's type sets it). A flag
-/// before it makes the widget pass 0 instead (false by default; what else it does is unknown).
+/// before it makes the widget pass 0 instead (false by default). It also makes the row read-only,
+/// shown by the game's text widget instead, empty for ours ("Type something"; seen in game
+/// 2026-10-29): never set it.
 const EDIT_INFO_LIST_FLAG: usize = 0xB1;
 const EDIT_INFO_MAX_LIST_ITEMS: usize = 0xB4;
 
@@ -533,6 +572,7 @@ impl Rows {
             name: texts.text(name),
             description: texts.text(description),
             when: None,
+            label: None,
         })
     }
 
@@ -558,12 +598,21 @@ impl Rows {
                 object: &raw mut (*row.shared).property,
                 controller: &raw mut (*row.shared).controller,
             };
+            // A labelled row's name is made now, and given back once the game copied it.
+            let label = row.label.and_then(|label| label.label());
+            let made = match (&label, texts()) {
+                (Some(name), Ok(texts)) => Some(texts.text(name)),
+                _ => None,
+            };
             let info = (self.add_property)(
                 reflection,
                 (&raw const shared).cast(),
                 row.key.as_ptr(),
-                &row.name,
+                made.as_ref().unwrap_or(&row.name),
             );
+            if let Some(made) = made {
+                made.release();
+            }
             if info.is_null() {
                 return info;
             }
@@ -669,6 +718,8 @@ pub struct Row {
     description: Text,
     /// Whether the row is listed now (always without).
     when: Option<fn() -> bool>,
+    /// Its name made each time it's listed, instead of `name`.
+    label: Option<&'static dyn Label>,
 }
 
 impl Row {
@@ -681,9 +732,18 @@ impl Row {
         }
     }
 
+    /// The row, named by `label` each time a panel lists it (and left out while it gives none).
+    pub fn labelled(self, label: &'static dyn Label) -> Self {
+        Self {
+            label: Some(label),
+            ..self
+        }
+    }
+
     /// Whether a panel listing its rows now lists this one.
     pub fn is_listed(&self) -> bool {
         self.when.is_none_or(|when| when())
+            && self.label.is_none_or(|label| label.label().is_some())
     }
 }
 

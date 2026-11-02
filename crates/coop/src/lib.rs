@@ -10,6 +10,7 @@ pub mod limits;
 pub mod message;
 pub mod ops;
 pub mod order;
+pub mod presence;
 pub mod session;
 pub mod tcp;
 pub mod transport;

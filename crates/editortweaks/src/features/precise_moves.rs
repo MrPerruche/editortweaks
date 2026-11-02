@@ -37,7 +37,7 @@ use std::sync::{Mutex, Once, OnceLock, PoisonError};
 
 use brickrust::ue::coreuobject::UObjectBase;
 
-use crate::framework::hook;
+use crate::framework::{hook, timings};
 use crate::game::editor_object::Vector;
 use crate::game::move_mode::{
     self, Adjustment, ApplyInputFn, Move, MoveMode, MoveTransform, SanitizeFn, Sanitized,
@@ -133,9 +133,14 @@ unsafe extern "C" fn sanitize_detour(
     object: *const UObjectBase,
     moved: *const MoveTransform,
 ) -> *mut Sanitized {
+    let _span = timings::span("precise_moves::sanitize_detour");
     let original = *ORIGINAL_SANITIZE.get().expect("hook recorded before use");
     // SAFETY: the original function with its own arguments.
-    let result = unsafe { original(mode, out, object, moved) };
+    let result = unsafe {
+        timings::game(move_mode::SANITIZE.name, || {
+            original(mode, out, object, moved)
+        })
+    };
     if let Some(found) = found() {
         // SAFETY: the game's own arguments: a live move mode and editor object, the transform the
         // move gives the object, and the result the original just wrote.
@@ -145,13 +150,14 @@ unsafe extern "C" fn sanitize_detour(
 }
 
 unsafe extern "C" fn apply_input_detour(mode: *mut UObjectBase) {
+    let _span = timings::span("precise_moves::apply_input_detour");
     let original = *ORIGINAL_APPLY_INPUT
         .get()
         .expect("hook recorded before use");
     // SAFETY: the game's own argument, a live move mode.
     let before = found().and_then(|found| unsafe { found.current(mode) });
     // SAFETY: the original function with its own argument.
-    unsafe { original(mode) };
+    unsafe { timings::game(move_mode::APPLY_INPUT.name, || original(mode)) };
     if let (Some(found), Some(before)) = (found(), before) {
         // SAFETY: as above.
         unsafe { replace_fold(found, mode, &before) };

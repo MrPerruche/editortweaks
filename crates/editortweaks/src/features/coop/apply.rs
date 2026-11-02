@@ -18,12 +18,14 @@
 //! vehicle comes with its bricks' groups. The objects a load makes are matched to the op's coop ids
 //! in order; another count (e.g. the game adding mirror counterparts) means the editor drifted.
 
+use std::collections::HashMap;
+
 use ::coop::vehicle::Vehicle;
 use ::coop::{CoopId, GroupKind, Groups, Op, Transform, Value};
 
 use super::changes::{self, Object};
 use super::log::coop_log;
-use super::{Game, adopt, objects, remember_all_groups, remember_all_values};
+use super::{Game, adopt, objects, place_of, remember_all_groups, remember_all_values};
 use crate::features::property_limits;
 use crate::game::brick_editor::{MOVED, NO_UNDO_STEP, PROPERTY_CHANGED, UNMODIFIED};
 use crate::game::brick_groups::{BrickGroups, GROUPS_CHANGED};
@@ -115,6 +117,58 @@ impl Target<'_> {
             drifted: created.len() != ids.len(),
             ..Outcome::default()
         }
+    }
+
+    /// Finds the session's vehicle in this editor, new since the player left the last one (to
+    /// test the vehicle, say), whose bricks were `known`: the editor's objects must be as many,
+    /// each where one of them was (property values hold pointers, so they're not compared: audits
+    /// find what else differs). The order may differ: the game's loader puts seats first. Bricks
+    /// at one place are paired in the order they come. They then get their coop ids again, and
+    /// their groups (the game's loader renumbers them). `Ok(true)`: in another order than the
+    /// session's (members are to get this one). `Err` says what differs.
+    pub fn refit(&self, known: &[changes::Known]) -> Result<bool, String> {
+        // SAFETY: the editor is live (it's ticking); game thread.
+        let objects = unsafe { objects(self.game, self.editor) };
+        if objects.len() != known.len() {
+            return Err(format!(
+                "{} objects here, {} in the session",
+                objects.len(),
+                known.len()
+            ));
+        }
+        // The known bricks by rounded location, in reverse: the last fitting one is the first.
+        let mut at: HashMap<[i64; 3], Vec<&changes::Known>> = HashMap::new();
+        for brick in known.iter().rev() {
+            if let Some(place) = &brick.place {
+                at.entry(rounded(place)).or_default().push(brick);
+            }
+        }
+        let mut found = Vec::with_capacity(objects.len());
+        for (index, &object) in objects.iter().enumerate() {
+            // SAFETY: the editor's live objects; game thread.
+            let place = unsafe { place_of(self.game, object) }
+                .ok_or_else(|| format!("object {index} has no place"))?;
+            let bricks = at.get_mut(&rounded(&place));
+            let brick = bricks.and_then(|bricks| {
+                let at = bricks
+                    .iter()
+                    .rposition(|brick| brick.place.is_some_and(|was| same_place(&was, &place)))?;
+                Some(bricks.remove(at))
+            });
+            found.push(brick.ok_or_else(|| format!("object {index} is elsewhere"))?);
+        }
+        changes::watch(self.editor, self.component);
+        let ids: Vec<CoopId> = found.iter().map(|brick| brick.id).collect();
+        let reordered = !ids.iter().eq(known.iter().map(|brick| &brick.id));
+        // SAFETY: as above.
+        unsafe {
+            adopt(self.game, &objects, &ids);
+            changes::remember_order(&objects);
+        }
+        let groups: Vec<Groups> = found.iter().map(|brick| brick.groups).collect();
+        changes::applying(|| self.operation(|| self.regroup_all(&objects, &groups)));
+        remember_all_groups(self.game);
+        Ok(reordered)
     }
 
     /// Makes an edit not made in this editor. `theirs`: a peer's, which must be one the panel
@@ -498,4 +552,17 @@ fn unfit(archive: &[u8], count: usize) -> Option<String> {
         }
         Ok(_) => None,
     }
+}
+
+/// A place's location to a tenth of a centimetre, to find the bricks that may be there.
+fn rounded(place: &Transform) -> [i64; 3] {
+    place.location.map(|cm| (cm * 10.0).round() as i64)
+}
+
+/// Whether two places are one, but for float rounding (a vehicle saved and loaded again).
+fn same_place(a: &Transform, b: &Transform) -> bool {
+    let close = |a: [f32; 3], b: [f32; 3], within: f32| {
+        a.iter().zip(b).all(|(a, b)| (a - b).abs() <= within)
+    };
+    close(a.location, b.location, 0.05) && close(a.rotation, b.rotation, 0.05)
 }

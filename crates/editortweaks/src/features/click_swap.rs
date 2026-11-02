@@ -23,6 +23,7 @@ use brickrust::ue::fname::FName;
 use super::keybinds;
 use crate::framework::hook;
 use crate::framework::settings::Toggle;
+use crate::framework::timings;
 use crate::game::kismet;
 use crate::game::player_input::{self, InputKeyFn, Key, ViewTargets};
 use crate::platform::keyboard;
@@ -103,6 +104,7 @@ unsafe extern "C" fn input_key(
     amount: f32,
     gamepad: bool,
 ) -> bool {
+    let _span = timings::span("click_swap::input_key");
     let original = *ORIGINAL.get().expect("hook recorded before use");
     // SAFETY: the function's own argument: the caller's live copy of the key. Before the swap
     // below, which only touches mouse buttons: the keybinds want the physical key.
@@ -129,7 +131,11 @@ unsafe extern "C" fn input_key(
         }
     }
     // SAFETY: the caller's arguments, the key maybe renamed.
-    unsafe { original(input, key, event, amount, gamepad) }
+    unsafe {
+        timings::game(player_input::INPUT_KEY.name, || {
+            original(input, key, event, amount, gamepad)
+        })
+    }
 }
 
 fn same(a: &FName, b: &FName) -> bool {

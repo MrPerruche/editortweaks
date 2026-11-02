@@ -34,5 +34,9 @@ pub extern "C" fn mod_info() -> ModInfo {
 /// Called once by the loader, before the engine initializes.
 #[unsafe(no_mangle)]
 pub extern "C" fn mod_init() {
+    // A test build past its expiry date starts nothing.
+    if !framework::expiry::allows_start() {
+        return;
+    }
     framework::lifecycle::start(features::ALL, features::SETTINGS);
 }

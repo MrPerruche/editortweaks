@@ -13,7 +13,7 @@ use std::sync::OnceLock;
 use brickrust::ue::coreuobject::UObjectBase;
 use brickrust::ue::uclass::UClass;
 
-use crate::framework::hook;
+use crate::framework::{hook, timings};
 use crate::game::reflection;
 use crate::game::view_target::{self, CameraSpeedFn, SpeedParams};
 use crate::prelude::*;
@@ -86,9 +86,14 @@ fn engine_init() -> Result<(), String> {
 }
 
 unsafe extern "C" fn camera_speed(interface: *mut c_void) -> f32 {
+    let _span = timings::span("camera_speed::camera_speed");
     let original = *ORIGINAL.get().expect("hook recorded before use");
     // SAFETY: the caller's view target, alive during the call.
-    unsafe { editor_speed(interface).unwrap_or_else(|| original(interface)) }
+    unsafe {
+        editor_speed(interface).unwrap_or_else(|| {
+            timings::game(view_target::CAMERA_SPEED.name, || original(interface))
+        })
+    }
 }
 
 /// The speed of the editor's camera, if `interface` is the editor's.

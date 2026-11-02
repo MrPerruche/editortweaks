@@ -13,6 +13,8 @@ use std::sync::OnceLock;
 
 use windows_sys::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress};
 
+use crate::framework::timings;
+
 const DLL: &str = "steam_api64.dll";
 
 /// `SteamNetworkingIdentity` (136 bytes): a type, a size, and a union holding the SteamID64 first.
@@ -136,6 +138,33 @@ impl PeerConnection {
     }
 }
 
+/// `FriendGameInfo_t` (24 bytes, Valve's `isteamfriends.h`): what game a friend is in. Every field
+/// is naturally aligned, so the layout is the same under the SDK's `pack(4)` and `pack(8)`. Only
+/// the game id is read.
+#[repr(C)]
+struct FriendGameInfo {
+    game_id: u64,
+    _game_ip: u32,
+    _game_port: u16,
+    _query_port: u16,
+    _lobby: u64,
+}
+
+const _: () = assert!(size_of::<FriendGameInfo>() == 24);
+
+/// `k_EFriendFlagImmediate`: the "regular" friends of the friends list.
+const FRIEND_FLAG_IMMEDIATE: i32 = 4;
+
+/// A `CGameID` holds the app id in its low 24 bits (the rest is type and mod).
+const GAME_ID_APP_MASK: u64 = 0x00FF_FFFF;
+
+/// A Steam friend.
+#[derive(Clone, Debug)]
+pub struct Friend {
+    pub id: u64,
+    pub name: String,
+}
+
 type Interface = *mut c_void;
 
 /// The functions, resolved once.
@@ -144,8 +173,15 @@ struct Api {
     user: Interface,
     friends: Interface,
     utils: Interface,
+    steam_utils: Interface,
     get_steam_id: unsafe extern "C" fn(user: Interface) -> u64,
     get_persona_name: unsafe extern "C" fn(friends: Interface) -> *const c_char,
+    get_app_id: unsafe extern "C" fn(steam_utils: Interface) -> u32,
+    friend_count: unsafe extern "C" fn(friends: Interface, flags: i32) -> i32,
+    friend_by_index: unsafe extern "C" fn(friends: Interface, index: i32, flags: i32) -> u64,
+    friend_game_played:
+        unsafe extern "C" fn(friends: Interface, friend: u64, info: *mut FriendGameInfo) -> bool,
+    friend_persona_name: unsafe extern "C" fn(friends: Interface, friend: u64) -> *const c_char,
     send: unsafe extern "C" fn(
         messages: Interface,
         to: *const Identity,
@@ -217,6 +253,8 @@ unsafe fn interface(module: *mut c_void, name: &CStr) -> Result<Interface, Strin
 }
 
 fn resolve() -> Result<Api, String> {
+    // The networking interfaces' first use starts Steam's networking.
+    let _span = timings::span("steam::resolve");
     let wide: Vec<u16> = DLL.encode_utf16().chain([0]).collect();
     // SAFETY: a NUL-terminated name.
     let module = unsafe { GetModuleHandleW(wide.as_ptr()) };
@@ -232,8 +270,14 @@ fn resolve() -> Result<Api, String> {
             user: interface(module, c"SteamAPI_SteamUser_v023")?,
             friends: interface(module, c"SteamAPI_SteamFriends_v018")?,
             utils: interface(module, c"SteamAPI_SteamNetworkingUtils_SteamAPI_v004")?,
+            steam_utils: interface(module, c"SteamAPI_SteamUtils_v010")?,
             get_steam_id: export(module, c"SteamAPI_ISteamUser_GetSteamID")?,
             get_persona_name: export(module, c"SteamAPI_ISteamFriends_GetPersonaName")?,
+            get_app_id: export(module, c"SteamAPI_ISteamUtils_GetAppID")?,
+            friend_count: export(module, c"SteamAPI_ISteamFriends_GetFriendCount")?,
+            friend_by_index: export(module, c"SteamAPI_ISteamFriends_GetFriendByIndex")?,
+            friend_game_played: export(module, c"SteamAPI_ISteamFriends_GetFriendGamePlayed")?,
+            friend_persona_name: export(module, c"SteamAPI_ISteamFriends_GetFriendPersonaName")?,
             send: export(
                 module,
                 c"SteamAPI_ISteamNetworkingMessages_SendMessageToUser",
@@ -289,6 +333,47 @@ impl Steam {
         }
     }
 
+    /// The app id Steam runs this game as.
+    pub fn app_id(self) -> u32 {
+        // SAFETY: the resolved function with the `ISteamUtils` interface it belongs to.
+        unsafe { (self.0.get_app_id)(self.0.steam_utils) }
+    }
+
+    /// The friends (regular friends list entries) who are playing the game with `app_id` right now.
+    pub fn friends_playing(self, app_id: u32) -> Vec<Friend> {
+        // SAFETY: the resolved function with the friends interface it belongs to.
+        let count = unsafe { (self.0.friend_count)(self.0.friends, FRIEND_FLAG_IMMEDIATE) };
+        let mut playing = Vec::new();
+        for index in 0..count.max(0) {
+            // SAFETY: as above; `index` is below the friend count.
+            let id =
+                unsafe { (self.0.friend_by_index)(self.0.friends, index, FRIEND_FLAG_IMMEDIATE) };
+            let mut info = FriendGameInfo {
+                game_id: 0,
+                _game_ip: 0,
+                _game_port: 0,
+                _query_port: 0,
+                _lobby: 0,
+            };
+            // SAFETY: `info` is the 24 bytes Steam fills in when it returns true.
+            let in_game = unsafe { (self.0.friend_game_played)(self.0.friends, id, &mut info) };
+            if !in_game || info.game_id & GAME_ID_APP_MASK != u64::from(app_id) {
+                continue;
+            }
+            // SAFETY: as above; the name is a NUL-terminated string Steam keeps (or null).
+            let name = unsafe {
+                let name = (self.0.friend_persona_name)(self.0.friends, id);
+                if name.is_null() {
+                    String::new()
+                } else {
+                    CStr::from_ptr(name).to_string_lossy().into_owned()
+                }
+            };
+            playing.push(Friend { id, name });
+        }
+        playing
+    }
+
     /// Makes every peer-to-peer connection created from now on go only through Valve's relay
     /// (SDR), so a peer never learns our IP address. Returns whether Steam accepted the setting
     /// (it is read back); coop must not talk to anyone when it didn't.
@@ -301,6 +386,7 @@ impl Steam {
     /// SteamSockets) become relay-only too, until the game exits.
     /// See `docs/re/coop/steam-api.md`, "Relay only".
     pub fn force_relay(self) -> bool {
+        let _span = timings::span("steam::force_relay");
         // SAFETY: the resolved function with the utils interface it belongs to; the value is
         // copied during the call.
         let accepted =

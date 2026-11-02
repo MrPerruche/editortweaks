@@ -27,6 +27,7 @@ use brickrust::ue::coreuobject::UObjectBase;
 
 use crate::framework::hook;
 use crate::framework::sig::SigMatch;
+use crate::framework::timings;
 use crate::game::editor_camera::{
     ADD_CAMERA_MOVEMENT_INPUT, GET_CAMERA_VIEW_POINT, MOVE_MODE_CAMERA, UPDATE_VIEW_ROTATION,
 };
@@ -332,9 +333,14 @@ unsafe extern "C" fn view_point_detour(
     location: *mut [f32; 3],
     rotation: *mut [f32; 3],
 ) {
+    let _span = timings::span("editor_frame::view_point_detour");
     let original = *ORIGINAL_VIEW_POINT.get().expect("hook recorded before use");
     // SAFETY: the original function with its own arguments.
-    unsafe { original(interface, location, rotation) };
+    unsafe {
+        timings::game(GET_CAMERA_VIEW_POINT.name, || {
+            original(interface, location, rotation)
+        })
+    };
     let (Some(frame), Some(&offset)) = (frame_of(interface), RELATIVE_LOCATION.get()) else {
         return;
     };
@@ -352,12 +358,17 @@ unsafe extern "C" fn update_rotation_detour(
     rotation: *mut [f32; 3],
     delta: f32,
 ) {
+    let _span = timings::span("editor_frame::update_rotation_detour");
     let original = *ORIGINAL_UPDATE_ROTATION
         .get()
         .expect("hook recorded before use");
     let Some(frame) = frame_of(interface) else {
         // SAFETY: the original function with its own arguments.
-        return unsafe { original(interface, rotation, delta) };
+        return unsafe {
+            timings::game(UPDATE_VIEW_ROTATION.name, || {
+                original(interface, rotation, delta)
+            })
+        };
     };
     // The result is the rotator of the turned rotation nearest the one given, so a camera that
     // goes over the top (see `features/free_pitch`: pitch beyond ±90°, no roll) keeps its form,
@@ -381,7 +392,9 @@ unsafe extern "C" fn update_rotation_detour(
         if !same {
             rotation.write_unaligned(local_given);
         }
-        original(interface, rotation, delta);
+        timings::game(UPDATE_VIEW_ROTATION.name, || {
+            original(interface, rotation, delta)
+        });
         // A changed rotator comes back as the one nearest the world's it replaces.
         let back = |now: [f32; 3], local: [f32; 3], world: [f32; 3]| {
             if now == local {
@@ -400,6 +413,7 @@ unsafe extern "C" fn update_rotation_detour(
 }
 
 unsafe extern "C" fn movement_input_detour(editor: *mut u8, axis: u32, value: f32) {
+    let _span = timings::span("editor_frame::movement_input_detour");
     let original = *ORIGINAL_MOVEMENT_INPUT
         .get()
         .expect("hook recorded before use");
@@ -407,14 +421,23 @@ unsafe extern "C" fn movement_input_detour(editor: *mut u8, axis: u32, value: f3
         // SAFETY: the game calls this on its live editor, the turned one; the original function
         // with its own arguments.
         Some(frame) => unsafe {
-            with_presented_rotation(editor, &frame, || original(editor, axis, value))
+            with_presented_rotation(editor, &frame, || {
+                timings::game(ADD_CAMERA_MOVEMENT_INPUT.name, || {
+                    original(editor, axis, value)
+                })
+            })
         },
         // SAFETY: the original function with its own arguments.
-        None => unsafe { original(editor, axis, value) },
+        None => unsafe {
+            timings::game(ADD_CAMERA_MOVEMENT_INPUT.name, || {
+                original(editor, axis, value)
+            })
+        },
     }
 }
 
 unsafe extern "C" fn tick_mode_detour(mode: *mut UObjectBase, delta: f32) {
+    let _span = timings::span("editor_frame::tick_mode_detour");
     let original = *ORIGINAL_TICK_MODE.get().expect("hook recorded before use");
     // SAFETY: the game calls this on a live move mode, on the game thread.
     let frame = current().filter(|frame| unsafe { is_inside(mode, frame.editor) });
@@ -422,10 +445,14 @@ unsafe extern "C" fn tick_mode_detour(mode: *mut UObjectBase, delta: f32) {
         // SAFETY: the mode is inside the turned editor, which is live while its mode ticks; the
         // original function with its own arguments.
         Some(frame) => unsafe {
-            with_presented_rotation(frame.editor as *mut u8, &frame, || original(mode, delta))
+            with_presented_rotation(frame.editor as *mut u8, &frame, || {
+                timings::game("UBrickEditorMoveMode::TickMode", || original(mode, delta))
+            })
         },
         // SAFETY: the original function with its own arguments.
-        None => unsafe { original(mode, delta) },
+        None => unsafe {
+            timings::game("UBrickEditorMoveMode::TickMode", || original(mode, delta))
+        },
     }
 }
 

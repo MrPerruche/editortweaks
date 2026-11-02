@@ -15,7 +15,7 @@ use std::sync::{Once, OnceLock};
 use brickrust::ue::coreuobject::UObjectBase;
 use core::ffi::c_void;
 
-use crate::framework::hook;
+use crate::framework::{hook, timings};
 use crate::game::actuator::{self, Actuators, SetArrowFn, UpdateEditorVisualizationFn};
 use crate::game::editor_object::Vector;
 use crate::math::Quat;
@@ -85,6 +85,7 @@ impl Feature for ActuatorArrows {
 /// Draws `actuator`'s arrows with its limits on their usual sides, turning around the arrows of
 /// those that crossed zero.
 unsafe extern "C" fn update_detour(actuator: *mut UObjectBase) {
+    let _span = timings::span("actuator_arrows::update_detour");
     let original = *UPDATE_EDITOR_VISUALIZATION
         .get()
         .expect("hook recorded before use");
@@ -92,10 +93,14 @@ unsafe extern "C" fn update_detour(actuator: *mut UObjectBase) {
     // thread, and its limits are put back right after.
     unsafe {
         let Some(actuators) = ACTUATORS.get() else {
-            return original(actuator);
+            return timings::game(actuator::UPDATE_EDITOR_VISUALIZATION.name, || {
+                original(actuator)
+            });
         };
         if !actuators.is_linear(actuator) {
-            return original(actuator);
+            return timings::game(actuator::UPDATE_EDITOR_VISUALIZATION.name, || {
+                original(actuator)
+            });
         }
         let [max, min] = actuators.limits(actuator);
         let turning = Turning {
@@ -103,11 +108,15 @@ unsafe extern "C" fn update_detour(actuator: *mut UObjectBase) {
             contraction: min < 0.0,
         };
         if !turning.extension && !turning.contraction {
-            return original(actuator);
+            return timings::game(actuator::UPDATE_EDITOR_VISUALIZATION.name, || {
+                original(actuator)
+            });
         }
         actuators.set_limits(actuator, [-max.abs(), min.abs()]);
         TURNING.set(Some(turning));
-        original(actuator);
+        timings::game(actuator::UPDATE_EDITOR_VISUALIZATION.name, || {
+            original(actuator)
+        });
         TURNING.set(None);
         actuators.set_limits(actuator, [max, min]);
         FIRST_TURN.call_once(|| {
@@ -126,6 +135,7 @@ unsafe extern "C" fn set_arrow_detour(
     arrow_type: u8,
     color_style: u8,
 ) {
+    let _span = timings::span("actuator_arrows::set_arrow_detour");
     let original = *SET_ARROW.get().expect("hook recorded before use");
     // SAFETY: the game's call, passed on; `location` and `rotation` point to its values, or to
     // ours, which live until the call returns.
@@ -138,26 +148,30 @@ unsafe extern "C" fn set_arrow_detour(
             })
         });
         if turning.is_none() {
-            return original(
+            return timings::game(actuator::SET_ARROW.name, || {
+                original(
+                    captures,
+                    location,
+                    rotation,
+                    angle,
+                    size,
+                    arrow_type,
+                    color_style,
+                )
+            });
+        };
+        let rotation = turned_around(*rotation);
+        timings::game(actuator::SET_ARROW.name, || {
+            original(
                 captures,
                 location,
-                rotation,
+                &rotation,
                 angle,
                 size,
                 arrow_type,
                 color_style,
-            );
-        };
-        let rotation = turned_around(*rotation);
-        original(
-            captures,
-            location,
-            &rotation,
-            angle,
-            size,
-            arrow_type,
-            color_style,
-        );
+            )
+        });
     }
 }
 

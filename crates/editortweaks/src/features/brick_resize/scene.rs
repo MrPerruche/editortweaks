@@ -9,7 +9,7 @@ use super::draw::PixelSize;
 use super::geometry::{self, Bounds, Frame, Ray, Vec3};
 use super::model::{BrickModel, Element, Pointing};
 use super::parts::{self, Part};
-use super::spinner::SpinnerBrick;
+use super::spinner::{self, SpinnerBrick};
 use crate::game::weak_object::WeakObject;
 
 /// A brick and its box.
@@ -55,11 +55,14 @@ pub struct View {
     pub pixels: PixelSize,
 }
 
-/// What the mouse points at on a brick: a part of its box, or of its model.
+/// What the mouse points at on a brick: a part of its box, or of its model; on a spinner, one of
+/// its own pieces (what snapping and moves see of it unless the model key is held: its sides, caps,
+/// rims, corners and hub rather than its model's facets).
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum Piece {
     Box(Part),
     Model(Element),
+    Spinner(spinner::Part),
 }
 
 /// A piece of a brick the mouse points at.

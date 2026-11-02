@@ -17,6 +17,7 @@ use brickrust::ue::tarray::TArray;
 
 use crate::framework::hook;
 use crate::framework::sig::{self, FunctionSig, SigMatch};
+use crate::framework::timings;
 
 /// `bool FBrickConnectionGenerator::ForEachConnection(const FParams&, TFunctionRef<void(const
 /// FFoundConnection&)>)` (the name from BRMK 0x42D410's stat, the parameter types ours; game RVA
@@ -394,19 +395,20 @@ unsafe extern "C" fn finder_detour(
     params: *const c_void,
     callback: *const FunctionRef,
 ) -> bool {
+    let _span = timings::span("game::brick_connections::finder_detour");
     let original = *ORIGINAL_FINDER.get().expect("hook recorded before use");
     let recording = FOUND.with_borrow(Option::is_some);
     // SAFETY: the game's call, passed on, with its callback or ours wrapping it; ours lives on
     // this stack frame for the whole call.
     unsafe {
         if !recording {
-            return original(generator, params, callback);
+            return timings::game(FINDER.name, || original(generator, params, callback));
         }
         let wrapper = FunctionRef {
             call: record,
             callable: callback.cast_mut().cast(),
         };
-        original(generator, params, &wrapper)
+        timings::game(FINDER.name, || original(generator, params, &wrapper))
     }
 }
 

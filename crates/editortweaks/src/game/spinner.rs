@@ -7,7 +7,8 @@
 //! ([`brick_property::post_modify`], the brick's own `PostModifyBrickProperty`, BRMK 0x167890).
 //! While dragging (interactive) the brick only redraws its mesh; a final change also rebuilds its
 //! connectors and collision, and takes a thickness wider than the radii allow down to them
-//! (`SpinnerRadius` changed) and an angle under 1 degree up to it (`SpinnerAngle` changed).
+//! (`SpinnerRadius` changed) and an angle under 1 degree up to it (`SpinnerAngle` changed). A
+//! changed `SpinnerShape` makes it rebuild its mesh for the new cross-section, nothing else.
 
 use core::ffi::c_void;
 use std::sync::OnceLock;
@@ -35,6 +36,7 @@ pub struct Values {
 /// A value a change can name.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Property {
+    Shape,
     Size,
     Radius,
     Angle,
@@ -52,7 +54,7 @@ pub struct Spinners {
     /// `SpinnerBrick`.
     class: *const UStruct,
     /// `SpinnerShape`, a one-byte enum.
-    shape: usize,
+    shape: Field,
     /// `SpinnerSize` and `SpinnerRadius` (`FVector2D`s), `SpinnerAngle` (a float).
     size: Field,
     radius: Field,
@@ -68,8 +70,6 @@ unsafe impl Sync for Spinners {}
 impl Spinners {
     pub fn find() -> Result<Self, String> {
         let class = reflection::find_class("SpinnerBrick").ok_or("class SpinnerBrick not found")?;
-        let shape = reflection::field_offset(class, "SpinnerShape", "EnumProperty", 1)
-            .or_else(|_| reflection::field_offset(class, "SpinnerShape", "ByteProperty", 1))?;
         let field = |name: &'static str, kind: &'static str, size: i32| -> Result<Field, String> {
             let property = reflection::field(class, name, kind, size)?;
             // SAFETY: `field` only returns live property records.
@@ -81,6 +81,8 @@ impl Spinners {
             };
             Ok(Field { offset, name })
         };
+        let shape = field("SpinnerShape", "EnumProperty", 1)
+            .or_else(|_| field("SpinnerShape", "ByteProperty", 1))?;
         Ok(Self {
             class: class.cast(),
             shape,
@@ -109,7 +111,7 @@ impl Spinners {
         unsafe {
             let at = |offset: usize| brick.cast::<u8>().add(offset);
             Values {
-                shape: at(self.shape).read(),
+                shape: at(self.shape.offset).read(),
                 size: at(self.size.offset).cast::<[f32; 2]>().read_unaligned(),
                 radius: at(self.radius.offset).cast::<[f32; 2]>().read_unaligned(),
                 angle: at(self.angle.offset).cast::<f32>().read_unaligned(),
@@ -117,9 +119,10 @@ impl Spinners {
         }
     }
 
-    /// Gives `brick` the size, radius and angle of `values` (not its shape) and tells it about
-    /// each of `changed`, `interactive`ly (while dragging) or not; returns the values it kept.
-    /// `None` if the brick can't be told (its property interface wasn't found).
+    /// Gives `brick` the size, radius and angle of `values`, and its shape too if that's one of
+    /// `changed` (else the shape stays as it is), and tells it about each of `changed`,
+    /// `interactive`ly (while dragging) or not; returns the values it kept. `None` if the brick
+    /// can't be told (its property interface wasn't found).
     ///
     /// # Safety
     /// `brick` must be a live spinner in the editor. Game thread only.
@@ -141,6 +144,9 @@ impl Spinners {
                 }
             };
             let at = |offset: usize| brick.cast::<u8>().add(offset);
+            if changed.contains(&Property::Shape) {
+                at(self.shape.offset).write(values.shape);
+            }
             at(self.size.offset)
                 .cast::<[f32; 2]>()
                 .write_unaligned(values.size);
@@ -151,13 +157,19 @@ impl Spinners {
                 .cast::<f32>()
                 .write_unaligned(values.angle);
             let interface = brick.cast::<u8>().add(offset).cast::<c_void>();
-            // The radius first: on a final change the brick fits the thickness to it, which the
-            // size written then keeps.
-            for property in [Property::Radius, Property::Size, Property::Angle] {
+            // The shape first, then the radius: on a final change the brick fits the thickness to
+            // it, which the size written then keeps.
+            for property in [
+                Property::Shape,
+                Property::Radius,
+                Property::Size,
+                Property::Angle,
+            ] {
                 if !changed.contains(&property) {
                     continue;
                 }
                 let name = match property {
+                    Property::Shape => self.shape.name,
                     Property::Size => self.size.name,
                     Property::Radius => self.radius.name,
                     Property::Angle => self.angle.name,

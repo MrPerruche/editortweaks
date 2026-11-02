@@ -382,6 +382,13 @@ fn sample_messages() -> Vec<Message> {
             slot: 2,
             ids: vec![id(0, 1), id(2, 1)],
         },
+        Message::Camera {
+            slot: 2,
+            view: Some(coop::presence::View {
+                location: [-40.0, 0.0, 120.0],
+                forward: [1.0, 0.0, 0.0],
+            }),
+        },
         Message::Leave,
         Message::Kick,
         Message::Close,
@@ -715,7 +722,7 @@ fn samples_cover_every_message_kind() {
         .map(|m| m.encode(1)[HEADER_LEN - 5])
         .collect();
     kinds.sort_unstable();
-    assert_eq!(kinds, (0..=18).collect::<Vec<u8>>());
+    assert_eq!(kinds, (0..=19).collect::<Vec<u8>>());
     for message in sample_messages() {
         assert_eq!(
             Message::decode(&message.encode(7)),
@@ -1042,6 +1049,7 @@ impl Rig {
                 HostSettings {
                     code: CODE.into(),
                     max_members: 8,
+                    approve: false,
                 },
                 HOST_BRICKS as usize,
             )
@@ -1529,6 +1537,7 @@ fn idle_and_joining_sessions_survive_junk() {
                 HostSettings {
                     code: "x".into(),
                     max_members: 1,
+                    approve: false,
                 },
                 0,
             )

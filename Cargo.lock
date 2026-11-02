@@ -95,6 +95,7 @@ dependencies = [
  "brickrust",
  "brickworks",
  "coop",
+ "memchr",
  "model_io",
  "windows-sys",
 ]

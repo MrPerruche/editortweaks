@@ -54,13 +54,11 @@ pub unsafe fn game_pointer(object: *mut UObjectBase) -> Option<FWeakObjectPtr> {
 /// 1.11.6 exports it from CoreUObject): the object's serial number, given now if it has none, as
 /// `FWeakObjectPtr::operator=(const UObject*)` (game 0x137FD40, its only caller) does before
 /// storing it. Found by its fatal message.
-#[cfg(feature = "coop")]
 const ALLOCATE_SERIAL: crate::framework::sig::StringRefSig = crate::framework::sig::StringRefSig {
     name: "FUObjectArray::AllocateSerialNumber",
     text: "UObject serial numbers overflowed (trying to allocate serial number %d).",
 };
 
-#[cfg(feature = "coop")]
 type AllocateSerialFn =
     unsafe extern "C" fn(array: *mut brickrust::ue::coreuobject::FUObjectArray, index: i32) -> i32;
 
@@ -69,7 +67,6 @@ type AllocateSerialFn =
 ///
 /// # Safety
 /// `object` must be a live object. Game thread only.
-#[cfg(feature = "coop")]
 pub unsafe fn new_game_pointer(object: *mut UObjectBase) -> Result<FWeakObjectPtr, String> {
     use std::sync::OnceLock;
     static ALLOCATE: OnceLock<Result<usize, String>> = OnceLock::new();
@@ -121,7 +118,6 @@ impl WeakObject {
 
     /// `object`, last seen at slot `index` of the object array (its `internal_index`), alive or
     /// not: nothing is read.
-    #[cfg(feature = "coop")]
     pub fn at(object: *mut UObjectBase, index: i32) -> Self {
         Self { object, index }
     }

@@ -1,6 +1,6 @@
 //! Reordering the vehicle editor's objects as its panel does for seat and camera order
 //! (`FObjectOrderBrickProperty`): coop applies someone else's reorder this way
-//! (`docs/re/coop/change-hooks.md`, section 5); only in builds with the `coop` feature.
+//! (`docs/re/coop/change-hooks.md`, section 5).
 //!
 //! `bool UBrickEditorInterfaceComponent::ReorderBrickEditorObject(UBrickEditorObject* Object,
 //! const UClass* Class, int32 NewIndex)` (BRMK 0xD7AC0, game 1.11.7 RVA 0xCFFFC0) takes the objects

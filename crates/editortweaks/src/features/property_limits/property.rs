@@ -14,7 +14,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use super::limits::{self, Edit, Limits, Rule};
 use crate::features::{axis_permutations, slider_drag, slider_formulas};
-use crate::framework::hook;
+use crate::framework::{hook, timings};
 use crate::game::numeric_property::{
     self, ClampValueFn, Container, GetValueRangeFn, NumericRange, NumericValue,
 };
@@ -90,6 +90,7 @@ unsafe extern "C" fn clamp_value_detour(
     container: *const c_void,
     input: *const NumericValue,
 ) -> *mut NumericValue {
+    let _span = timings::span("property_limits::clamp_value_detour");
     let original = *CLAMP_VALUE.get().expect("hook recorded before use");
     // SAFETY: `input` is the caller's value, valid for the whole call.
     let input = unsafe { &*input };
@@ -102,7 +103,11 @@ unsafe extern "C" fn clamp_value_detour(
     };
     let input = per_object.as_ref().unwrap_or(input);
     // SAFETY: forwards the caller's arguments, with only the input value possibly replaced.
-    let call_original = || unsafe { original(property, out, container, input) };
+    let call_original = || unsafe {
+        timings::game(numeric_property::CLAMP_VALUE.name, || {
+            original(property, out, container, input)
+        })
+    };
 
     if !super::slider::active() || !all_finite(input) {
         return call_original();
@@ -137,9 +142,14 @@ unsafe extern "C" fn get_value_range_detour(
     out: *mut NumericRange,
     container: *const c_void,
 ) -> *mut NumericRange {
+    let _span = timings::span("property_limits::get_value_range_detour");
     let original = *GET_VALUE_RANGE.get().expect("hook recorded before use");
     // SAFETY: forwards the caller's arguments unchanged.
-    let result = unsafe { original(property, out, container) };
+    let result = unsafe {
+        timings::game(numeric_property::GET_VALUE_RANGE.name, || {
+            original(property, out, container)
+        })
+    };
     let panel = CLAMPING.with_borrow_mut(|clamping| {
         // Outside of `ClampValue` (the panel asking for the sliders' range), or for another
         // property: leave the range alone.

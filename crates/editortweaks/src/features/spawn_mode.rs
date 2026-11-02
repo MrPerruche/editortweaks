@@ -22,6 +22,7 @@ use core::ffi::c_void;
 use super::settings_list::{self, Rework};
 use crate::framework::hook;
 use crate::framework::settings::{Alternative, Choice, Setting};
+use crate::framework::timings;
 use crate::game::property_reflection::Row;
 use crate::game::vehicle_spawn::{
     self, ExitEditorFn, PinVehicle, RestartAtFn, SpawnOption, SpawnRequest,
@@ -168,10 +169,17 @@ fn rework(field: &str) -> Rework {
 
 /// Marks the spawn request `ExitEditor` makes as the editor's.
 unsafe extern "C" fn exit_editor_detour(controller: *mut UObjectBase, saved: *const c_void) {
+    let _span = timings::span("spawn_mode::exit_editor_detour");
     let original = *EXIT_ORIGINAL.get().expect("hook recorded before use");
     let was_exiting = EXITING_EDITOR.swap(true, Ordering::Relaxed);
+    // While the editor still holds the vehicle: coop keeps a copy of a session's.
+    super::coop::editor_closing();
     // SAFETY: the game's own arguments, passed on.
-    unsafe { original(controller, saved) };
+    unsafe {
+        timings::game(vehicle_spawn::EXIT_EDITOR.name, || {
+            original(controller, saved)
+        })
+    };
     EXITING_EDITOR.store(was_exiting, Ordering::Relaxed);
     // SAFETY: the controller is live, and this is the game thread.
     unsafe { super::editor_lighting::restore(controller) };
@@ -180,6 +188,7 @@ unsafe extern "C" fn exit_editor_detour(controller: *mut UObjectBase, saved: *co
 /// Gives the editor's spawn request the spawn mode's option, and pins the root brick afterwards
 /// for softpin.
 unsafe extern "C" fn restart_at_detour(controller: *mut UObjectBase, request: *mut u8) -> u8 {
+    let _span = timings::span("spawn_mode::restart_at_detour");
     let original = *RESTART_ORIGINAL.get().expect("hook recorded before use");
     // Taken: only the first request after `ExitEditor` started is the editor's.
     let from_editor = EXITING_EDITOR.swap(false, Ordering::Relaxed);
@@ -194,7 +203,11 @@ unsafe extern "C" fn restart_at_detour(controller: *mut UObjectBase, request: *m
         unsafe { spawning.request.set_option(request, mode.option()) };
     }
     // SAFETY: the game's own arguments, passed on.
-    let result = unsafe { original(controller, request) };
+    let result = unsafe {
+        timings::game(vehicle_spawn::RESTART_AT.name, || {
+            original(controller, request)
+        })
+    };
     if let Some(spawning) = editor_spawn
         && mode == Mode::Softpin
         && spawning.request.succeeded(result)

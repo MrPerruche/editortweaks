@@ -11,13 +11,14 @@ publish.workspace = true
 crate-type = ["cdylib"]
 
 [features]
-# Coop building, work in progress (`docs/re/coop/`): off by default, so release builds contain
-# none of it. `et.py build --coop` / `install --coop` turn it on.
-coop = ["dep:coop"]
+# What only coop testing needs: the drift key, the local test (two games on one PC) and the
+# Steam self-send probe. `et.py build --coop-test`.
+coop-test = []
 
 [dependencies]
 brickrust.workspace = true
 brickworks.workspace = true
+memchr = "2.8.3"
 model_io = { path = "../model_io" }
-coop = { path = "../coop", optional = true }
+coop = { path = "../coop" }
 windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_System_Diagnostics_Debug", "Win32_System_LibraryLoader", "Win32_System_Memory", "Win32_System_Threading", "Win32_UI_Controls_Dialogs", "Win32_UI_Input_KeyboardAndMouse", "Win32_UI_WindowsAndMessaging"] }

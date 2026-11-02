@@ -42,7 +42,7 @@ use self::isolation::{Isolated, Isolation};
 use self::placement::{GaragePlace, Landing, Pose, VehicleBox};
 use super::editor_frame;
 use super::keybinds;
-use crate::framework::hook;
+use crate::framework::{hook, timings};
 use crate::game::actor::{self, Actors};
 use crate::game::brick_editor::{self, BrickEditor};
 use crate::game::editor_camera::{self, EditorCamera};
@@ -267,17 +267,23 @@ fn hook_undo_redo() -> Result<(), String> {
 }
 
 unsafe extern "C" fn undo_detour(context: *mut c_void, stack: *mut c_void, result: *mut c_void) {
+    let _span = timings::span("map_in_editor::undo_detour");
     BOX_DIRTY.store(true, Ordering::Relaxed);
     let original = *ORIGINAL_UNDO.get().expect("hook recorded before use");
     // SAFETY: the thunk's own arguments, passed on.
-    unsafe { original(context, stack, result) }
+    timings::game("UBaseEditorInputComponent::execAction_Undo", || unsafe {
+        original(context, stack, result)
+    })
 }
 
 unsafe extern "C" fn redo_detour(context: *mut c_void, stack: *mut c_void, result: *mut c_void) {
+    let _span = timings::span("map_in_editor::redo_detour");
     BOX_DIRTY.store(true, Ordering::Relaxed);
     let original = *ORIGINAL_REDO.get().expect("hook recorded before use");
     // SAFETY: the thunk's own arguments, passed on.
-    unsafe { original(context, stack, result) }
+    timings::game("UBaseEditorInputComponent::execAction_Redo", || unsafe {
+        original(context, stack, result)
+    })
 }
 
 fn mark_box_dirty() {

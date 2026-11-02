@@ -125,6 +125,42 @@ pub fn unwatch() {
     with(|changes| *changes = Changes::default());
 }
 
+/// Stops watching the editor (the player left it: its objects are gone), but remembers every
+/// brick, to find them again in the next editor ([`remembered`]). Nothing that names its objects
+/// may be used until then.
+pub fn detach() {
+    with(|changes| changes.watched = None);
+}
+
+/// Watches `editor` (with its interface component) again, after [`detach`]: the same editor, which
+/// only paused, its objects as they were.
+pub fn rewatch(editor: Object, component: Object) {
+    with(|changes| changes.watched = Some(Watched { editor, component }));
+}
+
+/// A brick as coop last knew it.
+pub struct Known {
+    pub id: CoopId,
+    pub place: Option<Transform>,
+    pub groups: Groups,
+}
+
+/// Every brick with a coop id as last remembered, in object order.
+pub fn remembered() -> Vec<Known> {
+    with(|changes| {
+        changes
+            .order
+            .iter()
+            .filter(|id| changes.objects.contains_key(id))
+            .map(|&id| Known {
+                id,
+                place: changes.places.get(&id).copied(),
+                groups: changes.groups.get(&id).copied().unwrap_or_default(),
+            })
+            .collect()
+    })
+}
+
 /// Gives `objects` the coop `ids`, in order (their places: [`place`]). They're new, so last in
 /// the object order.
 pub fn assign(objects: &[Object], ids: &[CoopId]) {

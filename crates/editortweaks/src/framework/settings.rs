@@ -1,14 +1,15 @@
-//! The mod's settings: switches and choices that change how features behave, shown in the game's
+//! The mod's settings: switches, choices and counts that change how features behave, shown in the game's
 //! options under "Editor tweaks" (`features::settings_menu`) and kept in `EditorTweaks.ini` next to
 //! the game's own config files.
 //!
 //! A feature declares each setting as a `static` next to the code it changes ([`Toggle`],
-//! [`Choice`]) and reads it where it uses it, so a change applies at once. Which settings the menu
+//! [`Choice`], [`Count`]) and reads it where it uses it, so a change applies at once. Which settings the menu
 //! shows, and in what order, is listed in `features::SETTINGS`.
 
+use std::borrow::Cow;
 use std::fs;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, Ordering};
 
 /// A setting that is on or off.
 pub struct Toggle {
@@ -95,11 +96,56 @@ impl Choice {
     }
 }
 
-/// A setting of either kind.
+/// A setting that is a whole number from `min` to `max`, shown as a slider.
+pub struct Count {
+    /// Its key in `EditorTweaks.ini`: never rename it, or players lose what they chose.
+    pub key: &'static str,
+    /// Its name and description in the menu.
+    pub name: &'static str,
+    pub description: &'static str,
+    pub min: u32,
+    pub max: u32,
+    value: AtomicU32,
+}
+
+impl Count {
+    /// `default` must be within `min` and `max`.
+    pub const fn new(
+        key: &'static str,
+        name: &'static str,
+        description: &'static str,
+        min: u32,
+        max: u32,
+        default: u32,
+    ) -> Self {
+        assert!(min <= default && default <= max);
+        Self {
+            key,
+            name,
+            description,
+            min,
+            max,
+            value: AtomicU32::new(default),
+        }
+    }
+
+    pub fn get(&self) -> u32 {
+        self.value.load(Ordering::Relaxed)
+    }
+
+    /// Sets the number, or the nearest one from `min` to `max` if it is outside.
+    pub fn set(&self, value: u32) {
+        self.value
+            .store(value.clamp(self.min, self.max), Ordering::Relaxed);
+    }
+}
+
+/// A setting of any kind.
 #[derive(Clone, Copy)]
 pub enum Setting {
     Toggle(&'static Toggle),
     Choice(&'static Choice),
+    Count(&'static Count),
 }
 
 impl Setting {
@@ -107,6 +153,7 @@ impl Setting {
         match self {
             Setting::Toggle(toggle) => toggle.key,
             Setting::Choice(choice) => choice.key,
+            Setting::Count(count) => count.key,
         }
     }
 
@@ -114,6 +161,7 @@ impl Setting {
         match self {
             Setting::Toggle(toggle) => toggle.name,
             Setting::Choice(choice) => choice.name,
+            Setting::Count(count) => count.name,
         }
     }
 
@@ -121,15 +169,17 @@ impl Setting {
         match self {
             Setting::Toggle(toggle) => toggle.description,
             Setting::Choice(choice) => choice.description,
+            Setting::Count(count) => count.description,
         }
     }
 
     /// The value as `EditorTweaks.ini` writes it.
-    fn saved(&self) -> &'static str {
+    fn saved(&self) -> Cow<'static, str> {
         match self {
-            Setting::Toggle(toggle) if toggle.get() => "True",
-            Setting::Toggle(_) => "False",
-            Setting::Choice(choice) => choice.options[usize::from(choice.get())].key,
+            Setting::Toggle(toggle) if toggle.get() => "True".into(),
+            Setting::Toggle(_) => "False".into(),
+            Setting::Choice(choice) => choice.options[usize::from(choice.get())].key.into(),
+            Setting::Count(count) => count.get().to_string().into(),
         }
     }
 
@@ -155,6 +205,14 @@ impl Setting {
                 }
                 found.is_some()
             }
+            Setting::Count(count) => match saved.parse::<u32>() {
+                Ok(number) => {
+                    // A number out of range is still a number: `set` takes the nearest one.
+                    count.set(number);
+                    true
+                }
+                Err(_) => false,
+            },
         }
     }
 }
@@ -164,7 +222,7 @@ pub struct Section {
     pub title: &'static str,
     pub settings: &'static [Setting],
     /// Settings saved with these but not in the menu: each is changed elsewhere (a row of the
-    /// feature's own panel).
+    /// feature's own panel), or only in `EditorTweaks.ini` (too rarely wanted to show).
     pub unlisted: &'static [Setting],
 }
 

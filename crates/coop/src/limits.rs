@@ -2,9 +2,16 @@
 //! with time. The rates are far above what a person can do (holding Ctrl+Z, moving thousands of
 //! bricks twice a second), so only a broken or hostile client meets them. What a member does past
 //! one gets it kicked from the session (and it can't join again): too many bytes, messages, bricks
-//! made or other changes. Selections, hellos and object orders past theirs are dropped: nothing
+//! made or other changes. Selections, cameras, hellos and object orders past theirs are dropped: nothing
 //! waits for them. Snapshots past theirs are sent later: the member waits for its snapshot, but
 //! making one takes the subhost's editor a while on a big vehicle.
+//!
+//! The other way, a member doesn't trust its subhost either: the subhost relays every player's
+//! edits, so its allowance is a member's times [`rates::HOST_SCALE`] (the most players a session
+//! holds), a ceiling only a broken or hostile subhost meets, and its snapshots are held to twice
+//! what a subhost sends one member. Past either, the member leaves. What really protects a
+//! member's game from a subhost sending more than it can apply is [`Workload`], measured by the
+//! mod.
 
 use std::collections::{HashMap, HashSet};
 
@@ -16,6 +23,15 @@ use crate::ops::Op;
 pub struct Rate {
     pub per_second: f64,
     pub burst: f64,
+}
+
+impl Rate {
+    fn scaled(self, by: f64) -> Self {
+        Self {
+            per_second: self.per_second * by,
+            burst: self.burst * by,
+        }
+    }
 }
 
 pub mod rates {
@@ -46,6 +62,11 @@ pub mod rates {
         per_second: 10.0,
         burst: 30.0,
     };
+    /// Camera views a member shows the others (dropped past it).
+    pub const CAMERAS: Rate = Rate {
+        per_second: 20.0,
+        burst: 40.0,
+    };
     /// Hellos from any peer, each answered (dropped past it).
     pub const HELLOS: Rate = Rate {
         per_second: 1.0,
@@ -63,6 +84,17 @@ pub mod rates {
     };
     /// Wrong join codes a peer may send before it can't join any more.
     pub const WRONG_CODES: u8 = 5;
+
+    /// A member's allowance for its subhost: a member's rates (bytes, messages, bricks made, other
+    /// changes, selections, cameras) times this, the most players a session holds (the mod's
+    /// `CoopMaxPlayers` setting goes up to 32), since the subhost relays every player's edits.
+    pub const HOST_SCALE: f64 = 32.0;
+    /// Snapshots a member takes from its subhost: twice [`SNAPSHOTS`], which a subhost holds
+    /// itself to for each member (joining, asking again, another vehicle shared).
+    pub const HOST_SNAPSHOTS: Rate = Rate {
+        per_second: 0.4,
+        burst: 6.0,
+    };
 }
 
 /// What a member sent too much of, which got it kicked.
@@ -72,6 +104,8 @@ pub enum Flood {
     Messages,
     Made,
     Changes,
+    /// Snapshots (from the subhost only: a member asks for its own).
+    Snapshots,
 }
 
 /// A bucket: full, it holds `burst`; it refills by `per_second`. Times are milliseconds.
@@ -121,34 +155,52 @@ impl Bucket {
 /// One peer's buckets.
 #[derive(Debug, Clone)]
 pub(crate) struct Allowance {
+    /// What the shared rates are multiplied by: 1 for a member, [`rates::HOST_SCALE`] for a
+    /// member's subhost.
+    scale: f64,
     bytes: Bucket,
     messages: Bucket,
     made: Bucket,
     changes: Bucket,
     selections: Bucket,
+    cameras: Bucket,
     hellos: Bucket,
     orders: Bucket,
     snapshots: Bucket,
+    host_snapshots: Bucket,
     wrong_codes: u8,
 }
 
 impl Allowance {
     fn new(now: u64) -> Self {
+        Self::scaled(now, 1.0)
+    }
+
+    fn scaled(now: u64, scale: f64) -> Self {
+        let full = |rate: Rate| Bucket::full(rate.scaled(scale), now);
         Self {
-            bytes: Bucket::full(rates::BYTES, now),
-            messages: Bucket::full(rates::MESSAGES, now),
-            made: Bucket::full(rates::MADE, now),
-            changes: Bucket::full(rates::CHANGES, now),
-            selections: Bucket::full(rates::SELECTIONS, now),
+            scale,
+            bytes: full(rates::BYTES),
+            messages: full(rates::MESSAGES),
+            made: full(rates::MADE),
+            changes: full(rates::CHANGES),
+            selections: full(rates::SELECTIONS),
+            cameras: full(rates::CAMERAS),
             hellos: Bucket::full(rates::HELLOS, now),
             orders: Bucket::full(rates::ORDERS, now),
             snapshots: Bucket::full(rates::SNAPSHOTS, now),
+            host_snapshots: Bucket::full(rates::HOST_SNAPSHOTS, now),
             wrong_codes: 0,
         }
     }
 
+    fn rate(&self, rate: Rate) -> Rate {
+        rate.scaled(self.scale)
+    }
+
     pub fn bytes(&mut self, now: u64, n: usize) -> bool {
-        self.bytes.take(rates::BYTES, now, n as f64)
+        let rate = self.rate(rates::BYTES);
+        self.bytes.take(rate, now, n as f64)
     }
 
     pub fn hello(&mut self, now: u64) -> bool {
@@ -156,7 +208,18 @@ impl Allowance {
     }
 
     pub fn selection(&mut self, now: u64) -> bool {
-        self.selections.take(rates::SELECTIONS, now, 1.0)
+        let rate = self.rate(rates::SELECTIONS);
+        self.selections.take(rate, now, 1.0)
+    }
+
+    pub fn camera(&mut self, now: u64) -> bool {
+        let rate = self.rate(rates::CAMERAS);
+        self.cameras.take(rate, now, 1.0)
+    }
+
+    /// A snapshot from the subhost: whether it's within [`rates::HOST_SNAPSHOTS`].
+    pub fn host_snapshot(&mut self, now: u64) -> bool {
+        self.host_snapshots.take(rates::HOST_SNAPSHOTS, now, 1.0)
     }
 
     pub fn order(&mut self, now: u64) -> bool {
@@ -170,7 +233,12 @@ impl Allowance {
 
     /// A message from a member, with `ops` if it's an edit: what it sent too much of, if anything.
     pub fn message(&mut self, now: u64, ops: &[Op]) -> Result<(), Flood> {
-        if !self.messages.take(rates::MESSAGES, now, 1.0) {
+        let (messages, made_rate, changes_rate) = (
+            self.rate(rates::MESSAGES),
+            self.rate(rates::MADE),
+            self.rate(rates::CHANGES),
+        );
+        if !self.messages.take(messages, now, 1.0) {
             return Err(Flood::Messages);
         }
         let (mut made, mut changes) = (0, 0);
@@ -180,10 +248,10 @@ impl Allowance {
                 _ => changes += 1,
             }
         }
-        if made > 0 && !self.made.take(rates::MADE, now, made as f64) {
+        if made > 0 && !self.made.take(made_rate, now, made as f64) {
             return Err(Flood::Made);
         }
-        if changes > 0 && !self.changes.take(rates::CHANGES, now, changes as f64) {
+        if changes > 0 && !self.changes.take(changes_rate, now, changes as f64) {
             return Err(Flood::Changes);
         }
         Ok(())
@@ -200,7 +268,11 @@ impl Allowance {
 #[derive(Debug, Default)]
 pub(crate) struct Limits {
     peers: HashMap<PeerId, Allowance>,
+    /// Member: our subhost's allowance (made when it first sends something).
+    host: Option<Allowance>,
     pub banned: HashSet<PeerId>,
+    /// Who the subhost's player banned, until when ([`crate::Session::tick`]'s clock).
+    pub banned_until: HashMap<PeerId, u64>,
 }
 
 impl Limits {
@@ -213,6 +285,12 @@ impl Limits {
             .or_insert_with(|| Allowance::new(now))
     }
 
+    /// Member: our subhost's allowance.
+    pub fn host(&mut self, now: u64) -> &mut Allowance {
+        self.host
+            .get_or_insert_with(|| Allowance::scaled(now, rates::HOST_SCALE))
+    }
+
     /// Whether it remembers so many peers it should forget some ([`Limits::prune`]).
     pub fn crowded(&self) -> bool {
         self.peers.len() > Self::PEERS
@@ -221,6 +299,36 @@ impl Limits {
     /// Forgets the peers not in `keep`.
     pub fn prune(&mut self, keep: &[PeerId]) {
         self.peers.retain(|peer, _| keep.contains(peer));
+    }
+}
+
+/// How much of a member's time goes to applying what its subhost sends (snapshots loaded, edits
+/// made): a leaky bucket of busy milliseconds, drained by [`Workload::SHARE`] of the time that
+/// passes. Past [`Workload::SLACK`], the game spent most of a long while on the subhost's traffic
+/// (a subhost sending more than this game can apply, hostile or not), and the member leaves
+/// rather than stay frozen. A big vehicle loading (joining, a resync, another one shared) or a
+/// big paste takes seconds at once and passes; the game stuck for most of a minute doesn't.
+#[derive(Debug, Clone, Default)]
+pub struct Workload {
+    level: f64,
+    at: Option<u64>,
+}
+
+impl Workload {
+    /// The share of the time the game may spend on the subhost's traffic for as long as it likes.
+    pub const SHARE: f64 = 0.5;
+    /// Busy milliseconds past that share it may build up: one 20 s load at once, or about 40 s of
+    /// the game doing nothing else.
+    pub const SLACK: f64 = 20_000.0;
+
+    /// The game spent `busy` milliseconds on the subhost's traffic, finishing at `now` (any
+    /// clock in milliseconds): whether that's now too much.
+    pub fn spent(&mut self, now: u64, busy: u64) -> bool {
+        let at = *self.at.get_or_insert(now);
+        let passed = now.saturating_sub(at) as f64;
+        self.at = Some(at.max(now));
+        self.level = (self.level - passed * Self::SHARE).max(0.0) + busy as f64;
+        self.level > Self::SLACK
     }
 }
 
@@ -283,6 +391,62 @@ mod tests {
         assert_eq!(allowance.message(0, &moves), Err(Flood::Changes));
         // A second later, room again.
         assert_eq!(allowance.message(1000, &moves), Ok(()));
+    }
+
+    #[test]
+    fn a_subhost_may_send_what_every_player_may_and_no_more() {
+        let mut host = Allowance::scaled(0, rates::HOST_SCALE);
+        // As many messages as every player at their fastest...
+        for _ in 0..(rates::MESSAGES.burst * rates::HOST_SCALE) as usize {
+            assert_eq!(host.message(0, &[]), Ok(()));
+        }
+        assert_eq!(host.message(0, &[]), Err(Flood::Messages));
+        // ...and bytes, but snapshots only twice what it sends one member.
+        assert!(host.bytes(0, 32 * (32 << 20)));
+        assert!(!host.bytes(0, 1));
+        for _ in 0..rates::HOST_SNAPSHOTS.burst as usize {
+            assert!(host.host_snapshot(0));
+        }
+        assert!(!host.host_snapshot(0));
+        assert!(host.host_snapshot(2500));
+        assert!(!host.host_snapshot(2500));
+    }
+
+    #[test]
+    fn what_a_subhost_lets_out_to_a_member_always_gets_in() {
+        let mut sent = Bucket::full(rates::SNAPSHOTS, 0);
+        let mut taken = Allowance::scaled(0, rates::HOST_SCALE);
+        let mut now = 0;
+        for _ in 0..1000 {
+            now = sent.take_due(rates::SNAPSHOTS, now, 1.0);
+            assert!(taken.host_snapshot(now), "at {now}");
+        }
+    }
+
+    #[test]
+    fn big_loads_pass_but_a_game_kept_busy_leaves() {
+        // One 15 s load, then normal play: fine.
+        let mut work = Workload::default();
+        assert!(!work.spent(15_000, 15_000));
+        for frame in 1..=10_000u64 {
+            assert!(!work.spent(15_000 + frame * 16, 1));
+        }
+        // Two 10 s loads 10 s apart (joining, then a resync): fine.
+        let mut work = Workload::default();
+        assert!(!work.spent(10_000, 10_000));
+        assert!(!work.spent(30_000, 10_000));
+        // Busy 90 % of every frame: leaves within a minute, not in the first 20 s.
+        let mut work = Workload::default();
+        let left = (1..=10_000u64)
+            .map(|frame| frame * 100)
+            .find(|&now| work.spent(now, 90))
+            .expect("left");
+        assert!((20_000..60_000).contains(&left), "{left}");
+        // Half the time, forever: stays.
+        let mut work = Workload::default();
+        for frame in 1..=100_000u64 {
+            assert!(!work.spent(frame * 100, 50));
+        }
     }
 
     #[test]

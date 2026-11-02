@@ -16,7 +16,7 @@ use std::sync::{Once, OnceLock};
 use brickrust::ue::coreuobject::UObjectBase;
 use core::ffi::c_void;
 
-use crate::framework::hook;
+use crate::framework::{hook, timings};
 use crate::game::actuator::{self, SetArrowFn as LinearSetArrowFn};
 use crate::game::axle::{self, Axles, SetArrowFn, UpdateEditorVisualizationFn};
 use crate::game::editor_object::Vector;
@@ -100,6 +100,7 @@ impl Feature for SuspensionArrows {
 
 /// Draws `brick`'s arrows, with the suspension's if it's an axle with one.
 unsafe extern "C" fn update_detour(brick: *mut UObjectBase) {
+    let _span = timings::span("suspension_arrows::update_detour");
     let original = *UPDATE_EDITOR_VISUALIZATION
         .get()
         .expect("hook recorded before use");
@@ -107,14 +108,14 @@ unsafe extern "C" fn update_detour(brick: *mut UObjectBase) {
     // thread, and its steering angle is put back right after.
     unsafe {
         let Some(axles) = AXLES.get() else {
-            return original(brick);
+            return timings::game(axle::UPDATE_EDITOR_VISUALIZATION.name, || original(brick));
         };
         if !axles.is_axle(brick) {
-            return original(brick);
+            return timings::game(axle::UPDATE_EDITOR_VISUALIZATION.name, || original(brick));
         }
         let travel = axles.suspension_length(brick);
         if travel <= 0.0 {
-            return original(brick);
+            return timings::game(axle::UPDATE_EDITOR_VISUALIZATION.name, || original(brick));
         }
         let steering = axles.steering_angle(brick);
         let hide_steering = steering.abs() <= STEERING_THRESHOLD;
@@ -125,7 +126,7 @@ unsafe extern "C" fn update_detour(brick: *mut UObjectBase) {
             travel,
             hide_steering,
         }));
-        original(brick);
+        timings::game(axle::UPDATE_EDITOR_VISUALIZATION.name, || original(brick));
         DRAWING.set(None);
         if hide_steering {
             axles.set_steering_angle(brick, steering);
@@ -144,10 +145,15 @@ unsafe extern "C" fn set_arrow_detour(
     size: f32,
     color_style: u8,
 ) {
+    let _span = timings::span("suspension_arrows::set_arrow_detour");
     let original = *SET_ARROW.get().expect("hook recorded before use");
     let (Some(axles), Some(&set_any_arrow)) = (AXLES.get(), SET_ANY_ARROW.get()) else {
         // SAFETY: the game's call, passed on.
-        return unsafe { original(captures, location, rotation, angle, size, color_style) };
+        return unsafe {
+            timings::game("UAxleBrick::UpdateEditorVisualization arrow lambda", || {
+                original(captures, location, rotation, angle, size, color_style)
+            })
+        };
     };
     // SAFETY: the game's call; both lambdas take the same captures (the axle's editor params, arrow
     // counter and arrow class, and the axle), and `location` and `rotation` point to its values.

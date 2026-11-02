@@ -16,7 +16,7 @@ use std::cell::Cell;
 use std::sync::OnceLock;
 
 use super::limits::SAFE_MAX;
-use crate::framework::hook;
+use crate::framework::{hook, timings};
 use crate::game::color_picker::{self, ColorPickers};
 use crate::game::slider::{self, RangeFields, SetValueInternalFn, ValueFields};
 use crate::prelude::*;
@@ -112,6 +112,7 @@ unsafe extern "C" fn detour(
     broadcast: usize,
     event_type: usize,
 ) -> u8 {
+    let _span = timings::span("property_limits::slider::detour");
     // Drags and arrow keys send interactive changes; typed values and mouse releases commit.
     let dragged = (event_type as u8 == slider::INTERACTIVE).then_some(this);
     let previous = DRAGGED.replace(dragged);
@@ -140,7 +141,11 @@ unsafe fn set_value(
 ) -> u8 {
     let original = *ORIGINAL.get().expect("hook recorded before use");
     // SAFETY: forwards the caller's arguments, with only the value possibly replaced.
-    let call = |value: f32| unsafe { original(this, value, clamp_and_snap, broadcast, event_type) };
+    let call = |value: f32| unsafe {
+        timings::game(slider::SET_VALUE_INTERNAL.name, || {
+            original(this, value, clamp_and_snap, broadcast, event_type)
+        })
+    };
 
     let Some(range) = RANGE.get() else {
         return call(value);

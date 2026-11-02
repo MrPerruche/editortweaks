@@ -3,6 +3,7 @@
 use std::sync::OnceLock;
 
 use crate::framework::settings::{self, Section};
+use crate::framework::timings;
 use crate::prelude::*;
 
 /// Features whose `on_load` succeeded. Set once by [`start`].
@@ -54,6 +55,7 @@ fn active() -> &'static [&'static dyn Feature] {
 
 fn on_engine_init() {
     log!("engine initialized");
+    timings::start();
     for feature in active() {
         feature.on_engine_init();
     }
@@ -61,6 +63,7 @@ fn on_engine_init() {
 
 fn on_map_load() {
     for feature in active() {
+        let _span = timings::span(feature.id());
         feature.on_map_load();
     }
 }

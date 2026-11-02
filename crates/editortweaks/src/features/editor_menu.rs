@@ -17,7 +17,7 @@ use brickrust::ue::coreuobject::UObjectBase;
 use brickrust::ue::fname::FName;
 
 use super::keybinds::{self, Keybind};
-use crate::framework::hook;
+use crate::framework::{hook, timings};
 use crate::game::brick_editor;
 use crate::game::input_help::{self, ExecuteActionFn, InputHelp, PopulateFn, UpdateActionsFn};
 use crate::game::weak_object::WeakObject;
@@ -133,11 +133,16 @@ fn same(a: &FName, b: &FName) -> bool {
 
 /// A dashboard adds its widgets: after the top bar's, the menu.
 unsafe extern "C" fn populate(dashboard: *mut UObjectBase) {
+    let _span = timings::span("editor_menu::populate");
     let Some(original) = ORIGINAL_POPULATE.get() else {
         return;
     };
     // SAFETY: forwards the caller's argument.
-    unsafe { original(dashboard) };
+    unsafe {
+        timings::game("UDashboardWidget::PopulateDashboard", || {
+            original(dashboard)
+        })
+    };
     let Some(game) = GAME.get() else {
         return;
     };
@@ -190,11 +195,12 @@ fn remember_input(editor: *mut UObjectBase, _delta: f32) {
 /// again when the input stack changed): for the menu, ours, whenever the game's listed its own
 /// (none) in their place.
 unsafe extern "C" fn update_actions(help: *mut UObjectBase, force: bool) {
+    let _span = timings::span("editor_menu::update_actions");
     let Some(original) = ORIGINAL_UPDATE_ACTIONS.get() else {
         return;
     };
     // SAFETY: forwards the caller's arguments.
-    unsafe { original(help, force) };
+    unsafe { timings::game("UInputHelpWidget::UpdateActions", || original(help, force)) };
     let (Some(game), Some(menu)) = (GAME.get(), keybinds::menu_category()) else {
         return;
     };
@@ -232,12 +238,17 @@ unsafe extern "C" fn execute_action(
     name: *const FName,
     params: *const u8,
 ) -> *mut u8 {
+    let _span = timings::span("editor_menu::execute_action");
     let Some(original) = ORIGINAL_EXECUTE.get() else {
         return result;
     };
     // SAFETY: forwards the caller's arguments: it writes the result (`State` 2 for ours, which no
     // component binds).
-    let returned = unsafe { original(component, result, name, params) };
+    let returned = unsafe {
+        timings::game(input_help::EXECUTE_ACTION.name, || {
+            original(component, result, name, params)
+        })
+    };
     let Some(game) = GAME.get() else {
         return returned;
     };

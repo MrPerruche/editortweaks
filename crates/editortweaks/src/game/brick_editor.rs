@@ -8,12 +8,14 @@
 //! inlined where used, so [`Operations`] does what the game's code does, with the field and vtable
 //! offsets read from one of the game's own operations.
 
+use std::panic::Location;
 use std::sync::{Mutex, OnceLock, PoisonError};
 
 use brickrust::ue::coreuobject::UObjectBase;
 
 use crate::framework::hook;
 use crate::framework::sig::{FunctionSig, SigMatch};
+use crate::framework::timings;
 use crate::game::reflection;
 
 /// `void ABrickEditor::Tick(float DeltaSeconds)` (BRMK 0xEFA30, game RVA 0xD0B0C0): every frame
@@ -33,10 +35,12 @@ pub type TickFn = unsafe extern "C" fn(editor: *mut UObjectBase, delta: f32);
 pub type AfterTick = fn(editor: *mut UObjectBase, delta: f32);
 
 static ORIGINAL_TICK: OnceLock<TickFn> = OnceLock::new();
-static AFTER_TICK: Mutex<Vec<AfterTick>> = Mutex::new(Vec::new());
+/// The callbacks, with where they were asked for (see [`caller_name`]).
+static AFTER_TICK: Mutex<Vec<(AfterTick, &'static str)>> = Mutex::new(Vec::new());
 
 /// Runs `callback` after every `ABrickEditor::Tick`, in the order features asked. The loader allows
 /// one hook per function, so features share this one; the first call installs it.
+#[track_caller]
 pub fn after_tick(callback: AfterTick) -> Result<(), String> {
     if ORIGINAL_TICK.get().is_none() {
         let tick = TICK.resolve()?;
@@ -46,20 +50,32 @@ pub fn after_tick(callback: AfterTick) -> Result<(), String> {
     AFTER_TICK
         .lock()
         .unwrap_or_else(PoisonError::into_inner)
-        .push(callback);
+        .push((callback, caller_name(Location::caller())));
     Ok(())
 }
 
+/// Where a callback was asked for, as timings name it: `brick_resize/mod.rs:236`. Made once per
+/// callback, so kept for good.
+fn caller_name(caller: &'static Location<'static>) -> &'static str {
+    let file = caller.file().replace('\\', "/");
+    let file = file
+        .rsplit_once("features/")
+        .map_or(&*file, |(_, rest)| rest);
+    String::leak(format!("{file}:{}", caller.line()))
+}
+
 unsafe extern "C" fn tick_detour(editor: *mut UObjectBase, delta: f32) {
+    timings::editor_frame();
     let original = *ORIGINAL_TICK.get().expect("hook recorded before use");
     // SAFETY: the original function with its own arguments.
-    unsafe { original(editor, delta) };
+    timings::game(TICK.name, || unsafe { original(editor, delta) });
     // Copied out, so that a callback may ask for more without a deadlock.
     let callbacks = AFTER_TICK
         .lock()
         .unwrap_or_else(PoisonError::into_inner)
         .clone();
-    for callback in callbacks {
+    for (callback, name) in callbacks {
+        let _span = timings::span(name);
         callback(editor, delta);
     }
 }
@@ -118,13 +134,11 @@ pub const PROPERTY_CHANGED: u32 = 0x20;
 /// dropped), as undo and redo do themselves: `test byte [op+0x14], 1` (game 0xCF3CA2,
 /// `docs/re/coop/change-hooks.md`, section 5).
 /// Only coop uses it.
-#[cfg(feature = "coop")]
 pub const NO_UNDO_STEP: u8 = 1;
 
 /// An operation's bit that keeps `PostModify` from marking the vehicle modified (`test byte
 /// [op+0x14], 2` at game 0xCF39DC). Loading a whole vehicle sets it (game 0xCEF44F, see
 /// `game::vehicle_changes::keeping_selection`). Only coop uses it.
-#[cfg(feature = "coop")]
 pub const UNMODIFIED: u8 = 2;
 
 type PostModifyFn = unsafe extern "C" fn(editor: *mut UObjectBase, operation: *const Operation);
@@ -267,7 +281,6 @@ impl BrickEditor {
     ///
     /// # Safety
     /// As for [`Self::operation`].
-    #[cfg(feature = "coop")]
     pub unsafe fn clear_open_bits(&self, editor: *mut UObjectBase, bits: u8) {
         // SAFETY: per the contract; the open operation is the outermost one, live on the stack of
         // whoever opened it until `PostModify` (see `operation_with`).

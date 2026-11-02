@@ -104,10 +104,21 @@ pub enum Orientation {
 }
 
 impl Orientation {
-    /// How the brick's `piece` lies, if it's a face or an edge.
-    pub fn of(placed: &Placed, piece: Piece) -> Option<Self> {
+    /// How the brick's `piece` lies at `point` (in the vehicle: a spinner's curved pieces lie
+    /// differently along them), if it's a face or an edge.
+    pub fn of(placed: &Placed, piece: Piece, point: Vec3) -> Option<Self> {
         let frame = &placed.frame;
         match piece {
+            Piece::Spinner(part) => {
+                let local = placed
+                    .spinner
+                    .as_ref()?
+                    .orientation(part, frame.local(point))?;
+                Some(match local {
+                    Self::Face(normal) => Self::Face(frame.direction(normal)),
+                    Self::Edge(along) => Self::Edge(frame.direction(along)),
+                })
+            }
             Piece::Box(part) => match part.dimensions_fixed() {
                 1 => Some(Self::Face(frame.direction(part.sides.map(f64::from)))),
                 2 => {
@@ -134,10 +145,17 @@ impl Orientation {
 
 /// The point of the brick's `piece` grabbed with the mouse on `ray`, `under` the mouse on the
 /// brick: a corner or vertex itself, an edge's point nearest the ray, or the point under the mouse
-/// on a face.
+/// on a face (see [`super::spinner::SpinnerBrick::grabbed_point`] for a spinner's own pieces).
 pub fn grabbed_point(placed: &Placed, piece: Piece, ray: &Ray, under: Vec3) -> Vec3 {
     let frame = &placed.frame;
     let ends = match piece {
+        Piece::Spinner(part) => {
+            let Some(brick) = &placed.spinner else {
+                return under;
+            };
+            let local = brick.grabbed_point(part, &frame.local_ray(ray), frame.local(under));
+            return frame.point(local);
+        }
         Piece::Box(part) => {
             let corners = part.corners(&placed.bounds);
             match corners[..] {

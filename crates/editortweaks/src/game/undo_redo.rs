@@ -1,5 +1,4 @@
-//! The editor's undo and redo, for coop to take over (only in builds with the `coop` feature). The
-//! game's undo loads a snapshot of the whole vehicle, which in a coop session would also undo
+//! The editor's undo and redo, for coop to take over. The game's undo loads a snapshot of the whole vehicle, which in a coop session would also undo
 //! everyone else's work since (`docs/re/coop/design.md`, "Undo").
 //!
 //! `void ABrickEditor::UndoRedo(bool bUndo)` (BRMK 0xF4740, game 1.11.7 RVA 0xD0E300) is what both
@@ -14,6 +13,7 @@ use brickrust::ue::coreuobject::UObjectBase;
 
 use crate::framework::hook;
 use crate::framework::sig::FunctionSig;
+use crate::framework::timings;
 
 pub const UNDO_REDO: FunctionSig = FunctionSig {
     name: "ABrickEditor::UndoRedo",
@@ -41,10 +41,11 @@ pub fn take_over(callback: TakeOver) -> Result<(), String> {
 }
 
 unsafe extern "C" fn detour(editor: *mut UObjectBase, undo: bool) {
+    let _span = timings::span("game::undo_redo::detour");
     if TAKE_OVER.get().is_some_and(|take| take(editor, !undo)) {
         return;
     }
     let original = *ORIGINAL.get().expect("hook recorded before use");
     // SAFETY: the original function with its own arguments.
-    unsafe { original(editor, undo) }
+    unsafe { timings::game(UNDO_REDO.name, || original(editor, undo)) }
 }

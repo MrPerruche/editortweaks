@@ -1,6 +1,6 @@
 //! The vehicle editor's archive: some of its objects (or all of them) saved to bytes and loaded
 //! back, the way its files, undo steps and duplicates are; and objects deleted. Coop sends
-//! vehicles and new bricks this way (`docs/re/coop/`); only in builds with the `coop` feature.
+//! vehicles and new bricks this way (`docs/re/coop/`).
 //!
 //! Found statically in game 1.11.7 (build 25831956) against BRMK 1.11.6
 //! (`docs/re/coop/archive-addresses.md`). A `.brv` file is exactly what `SaveObjectsToArchive`

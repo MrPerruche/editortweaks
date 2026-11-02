@@ -105,6 +105,17 @@ pub struct DragSelect;
 static GAME: OnceLock<Game> = OnceLock::new();
 static STATE: Mutex<State> = Mutex::new(State::new());
 
+/// Whether a box is being dragged: it restyles the bricks' outlines meanwhile, so other features
+/// leave them alone (`game::outline_cases`). Busy (asked from inside this feature's tick) counts
+/// as dragging.
+pub fn dragging() -> bool {
+    match STATE.try_lock() {
+        Ok(state) => state.drag.is_some(),
+        Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned.into_inner().drag.is_some(),
+        Err(std::sync::TryLockError::WouldBlock) => true,
+    }
+}
+
 static LOG_STARTED: Once = Once::new();
 static LOG_SELECTED: Once = Once::new();
 static LOG_NO_LINES: Once = Once::new();

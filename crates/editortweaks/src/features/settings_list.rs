@@ -35,6 +35,7 @@ use brickrust::ue::fname::FName;
 use crate::features::{SETTINGS, number_rows};
 use crate::framework::hook;
 use crate::framework::settings::{self, Setting};
+use crate::framework::timings;
 use crate::game::kismet;
 use crate::game::property_reflection::{
     self, ADD_PROPERTY, AddPropertyFn, REFLECT_USER_SETTINGS, ReflectFn, Reflection, Row, Rows,
@@ -278,6 +279,7 @@ pub fn save() {
 /// The game's settings list: adds the sections of each listing whose tag the panel asks for, or
 /// only those of a listing replacing them.
 unsafe extern "C" fn reflect(user_settings: *const c_void, reflection: *mut Reflection) {
+    let _span = timings::span("settings_list::reflect");
     let Some(original) = ORIGINAL.get() else {
         return;
     };
@@ -285,7 +287,11 @@ unsafe extern "C" fn reflect(user_settings: *const c_void, reflection: *mut Refl
         Ok(rows) => rows,
         Err(_) => {
             // SAFETY: forwards the caller's arguments.
-            unsafe { original(user_settings, reflection) };
+            unsafe {
+                timings::game(REFLECT_USER_SETTINGS.name, || {
+                    original(user_settings, reflection)
+                })
+            };
             return;
         }
     };
@@ -307,7 +313,11 @@ unsafe extern "C" fn reflect(user_settings: *const c_void, reflection: *mut Refl
             list(rows, reflection, listing);
             return;
         }
-        list_reworked(reflection, || original(user_settings, reflection));
+        list_reworked(reflection, || {
+            timings::game(REFLECT_USER_SETTINGS.name, || {
+                original(user_settings, reflection)
+            })
+        });
         for listing in listings {
             if listing.replacing.is_none() && shown(listing) {
                 list(rows, reflection, listing);
@@ -364,9 +374,14 @@ unsafe extern "C" fn add_property(
     name: *const FString,
     display_name: *const Text,
 ) -> *mut u8 {
+    let _span = timings::span("settings_list::add_property");
     let original = *ADD_ORIGINAL.get().expect("hook recorded before use");
     // SAFETY: forwards the caller's arguments unchanged.
-    let add = || unsafe { original(reflection, property, name, display_name) };
+    let add = || unsafe {
+        timings::game(ADD_PROPERTY.name, || {
+            original(reflection, property, name, display_name)
+        })
+    };
     let reworks = REWORKING.with_borrow(|state| state.as_ref().map(|state| state.reworks.clone()));
     let Some(reworks) = reworks else {
         return add();

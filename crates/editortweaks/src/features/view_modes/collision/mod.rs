@@ -1,5 +1,5 @@
 //! The "Collision" view mode: bricks' collision shapes (their hitboxes), drawn solid with each
-//! brick's own material and color, over the bricks made see-through.
+//! brick's own material and color, in place of the bricks.
 //!
 //! The shapes are the simple collision PhysX simulates contacts with (`game::collision`), scaled
 //! like the game scales them. Each brick gets a static mesh component showing them
@@ -9,10 +9,12 @@
 //! (custom depth, copied every frame). Brick types whose material deforms the mesh (wheels,
 //! spinners, flaps) would deform the shapes too: theirs show a plain version of it
 //! (`game::brick_materials`). The meshes are built at run time (`game::mesh_builder`), one per
-//! brick type and, for round shapes, scale. The brick itself shows the game's hidden
-//! material (dithered, as hidden bricks look): where it sticks out of its shapes, it doesn't
-//! collide, and a brick showing only that has no collision at all. The shapes are drawn 1 mm
-//! outward (`mesh::OUTSET`) so that faces on the brick's surface don't z-fight with it.
+//! brick type and, for round shapes, scale. The brick's own mesh leaves the main pass
+//! (`MeshComponents::set_drawn`; the outline stays), so only its shapes show. A brick without
+//! collision at all shows the game's hidden material (dithered, as hidden bricks look) instead.
+//! With [`SEE_THROUGH_BRICKS`], every brick shows that under its shapes: where it sticks out of
+//! them, it doesn't collide; the shapes are then drawn 1 mm outward (`mesh::OUTSET`) so that faces
+//! on the brick's surface don't z-fight with it.
 //!
 //! Driven by `view_modes`' hooks: [`show`] after the game updates a brick in this view mode
 //! (switching to it, edits, moves), [`remove`] after it updates one in any other, [`keep_only`]
@@ -40,7 +42,13 @@ use crate::prelude::*;
 /// The most brick types whose shapes are logged (the first time each is shown).
 const MAX_LOGGED_TYPES: usize = 64;
 
+/// Whether bricks show, dithered, under their shapes (else only their shapes show). Also so when
+/// bricks can't be taken out of the main pass.
+const SEE_THROUGH_BRICKS: bool = false;
+
 struct Code {
+    /// [`SEE_THROUGH_BRICKS`], or bricks can't be taken out of the main pass.
+    see_through: bool,
     collision: Collision,
     builder: MeshBuilder,
     components: MeshComponents,
@@ -74,6 +82,8 @@ struct Shown {
     made: Option<(u64, Vector)>,
     /// Its own material, as last seen (once the brick shows the hidden material, it's only here).
     material: Option<WeakObject>,
+    /// Whether its mesh component is out of the view's main pass (its shapes show it).
+    parent_undrawn: bool,
 }
 
 // SAFETY: weak pointers to game objects, only resolved on the game thread.
@@ -81,10 +91,12 @@ unsafe impl Send for Shown {}
 
 /// Finds the game code the view mode needs (after engine init).
 pub fn find() -> Result<(), String> {
+    let components = MeshComponents::find()?;
     let code = Code {
+        see_through: SEE_THROUGH_BRICKS || !components.can_outline_only(),
         collision: Collision::find()?,
         builder: MeshBuilder::find()?,
-        components: MeshComponents::find()?,
+        components,
         materials: BrickMaterials::find()
             .inspect_err(|reason| log!("shapes keep their bricks' own materials: {reason}"))
             .ok(),
@@ -138,6 +150,7 @@ pub unsafe fn show(code: &EditorCode, bricks: &Bricks, brick: *mut UObjectBase) 
                     shapes: None,
                     made: None,
                     material: None,
+                    parent_undrawn: false,
                 }
             }
         };
@@ -215,17 +228,23 @@ pub unsafe fn keep_only(editor_bricks: &[*mut UObjectBase]) {
     }
 }
 
-/// Destroys a removed brick's shapes component, if it's still there.
+/// Destroys a removed brick's shapes component, if it's still there, and gives the brick its mesh
+/// back.
 ///
 /// # Safety
 /// Game thread only.
 unsafe fn destroy(shown: Shown) {
-    let (Some(found), Some(shapes)) = (CODE.get(), shown.shapes.and_then(|shapes| shapes.get()))
-    else {
-        return;
-    };
-    // SAFETY: per the contract; a live component we made.
-    unsafe { found.components.destroy(shapes) };
+    let Some(found) = CODE.get() else { return };
+    if shown.parent_undrawn
+        && let Some(parent) = shown.parent.get()
+    {
+        // SAFETY: per the contract; a live component (checked through its weak pointer).
+        unsafe { found.components.set_drawn(parent, true) };
+    }
+    if let Some(shapes) = shown.shapes.and_then(|shapes| shapes.get()) {
+        // SAFETY: per the contract; a live component we made.
+        unsafe { found.components.destroy(shapes) };
+    }
 }
 
 /// Takes `brick`'s entry out (no lock is held while calling the game, which may call our hooks
@@ -252,7 +271,8 @@ fn put(brick: *mut UObjectBase, shown: Shown) {
 
 impl Code {
     /// Makes or changes `brick`'s shapes component if its shapes or scale changed. Returns
-    /// whether it made a new one (which shows its mesh's material until [`Code::update_look`]).
+    /// whether it made a new one (which shows its mesh's material until [`Code::update_look`]) or
+    /// removed it (the brick must then show itself again, see [`Code::update_look`]).
     ///
     /// # Safety
     /// `brick` must be a live brick in the editor and `component` its mesh component. Game thread
@@ -315,7 +335,7 @@ impl Code {
                 }
                 shown.shapes = None;
                 shown.made = Some((key, scale));
-                return false;
+                return current.is_some();
             }
             let material = self.components.material(component, 0);
             let Some(mesh) = self.mesh(
@@ -379,7 +399,12 @@ impl Code {
         if cached.is_some() {
             return cached;
         }
-        let built = mesh::drawn(shapes, mesh_scale);
+        // Pushed out only to show over the brick.
+        let built = if self.see_through {
+            mesh::drawn(shapes, mesh_scale)
+        } else {
+            mesh::triangles(shapes, mesh_scale)
+        };
         log_type(static_mesh, "shapes", || {
             describe(shapes, scale, built.flat_hulls)
         });
@@ -400,8 +425,8 @@ impl Code {
     }
 
     /// Gives `brick`'s shapes component the brick's material (or its plain version, see
-    /// [`BrickMaterials::plain_version`]) and custom primitive data, and the brick the hidden
-    /// material.
+    /// [`BrickMaterials::plain_version`]) and custom primitive data, and takes the brick out of
+    /// the main pass, or gives it the hidden material (see-through, or without shapes).
     ///
     /// # Safety
     /// `brick` must be a live brick in the editor and `component` its mesh component. Game thread
@@ -419,14 +444,17 @@ impl Code {
             let components = &self.components;
             let hidden = bricks.hidden_material(code, brick);
             let current = components.material(component, 0);
+            let shapes = shown.shapes.as_ref().and_then(WeakObject::get);
+            // Dithered under its shapes, or alone without any (nothing else would show it).
+            let see_through = self.see_through || shapes.is_none();
             // The brick's own material, unless it's hidden (H: the game gives it the hidden
             // material, and so do we) or showing ours already (a move only updates its data).
             let material = if code.is_hidden(brick) {
                 hidden
             } else if !current.is_null() && current != hidden {
                 shown.material = Some(WeakObject::new(current));
-                for slot in 0..components.material_count(component) {
-                    if !hidden.is_null() {
+                if see_through && !hidden.is_null() {
+                    for slot in 0..components.material_count(component) {
                         components.set_material(component, slot, hidden);
                     }
                 }
@@ -438,7 +466,12 @@ impl Code {
                     .and_then(WeakObject::get)
                     .unwrap_or(current)
             };
-            let Some(shapes) = shown.shapes.as_ref().and_then(WeakObject::get) else {
+            // Only its shapes show it otherwise; its outline stays.
+            let undrawn = !see_through;
+            if undrawn != shown.parent_undrawn && components.set_drawn(component, !undrawn) {
+                shown.parent_undrawn = undrawn;
+            }
+            let Some(shapes) = shapes else {
                 return;
             };
             let look = match &self.materials {

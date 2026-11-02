@@ -38,7 +38,6 @@ use super::{Editor, tooltip};
 use crate::features::editor_buttons::{self, Button, Click, Press};
 use crate::features::mouse_moves::{self, Handling, Movement};
 use crate::features::ortho_view;
-use crate::framework::settings::Toggle;
 use crate::game::editor_object::{self, Places, Selection, Transform, Vector};
 use crate::game::lift_surface::{self, LiftSurfaces};
 use crate::game::mesh_component::MeshComponents;
@@ -49,14 +48,6 @@ use crate::game::ui_library::{self, UnitConversion};
 use crate::game::weak_object::WeakObject;
 use crate::math::{self, Quat};
 use crate::prelude::*;
-
-/// Whether the Physics view mode shows the centers of lift and thrust.
-pub static CENTERS: Toggle = Toggle::new(
-    "PhysicsCenters",
-    "Centers of lift and thrust",
-    "In the Physics view mode, the centers of lift in pitch (blue) and yaw (green) and of thrust (magenta) show next to the center of mass. Lift behind the mass keeps the nose into the airflow.",
-    true,
-);
 
 /// The markers' colors (the material's `Color`, linear RGB); the center of mass is orange
 /// (1, 0.096, 0). Free to change.
@@ -138,8 +129,8 @@ struct State {
     editor: Option<WeakObject>,
     markers: [Option<Marker>; 4],
     /// What the centers were worked out for: the editor's generation, its selection, and whether
-    /// [`CENTERS`] and [`LIFT_DRAG`] were shown.
-    key: Option<(u64, u64, bool, bool)>,
+    /// [`LIFT_DRAG`] was shown.
+    key: Option<(u64, u64, bool)>,
     centers: Centers,
     /// Counts the times the centers were worked out, for the tooltip.
     revision: u64,
@@ -365,20 +356,11 @@ pub fn after_tick(editor: *mut UObjectBase, _delta: f32) {
             return;
         }
         let (selected, selection) = code.selected(&view);
-        let (centers_on, forces_on) = (
-            CENTERS.get(),
-            lift_drag::shown() && code.lift_drag.is_some(),
-        );
-        let key = (super::generation(), selection, centers_on, forces_on);
+        let forces_on = lift_drag::shown() && code.lift_drag.is_some();
+        let key = (super::generation(), selection, forces_on);
         if state.key != Some(key) {
             state.key = Some(key);
-            let (mut found, inputs, ball) = code.centers(&view, selected);
-            if !centers_on {
-                found = Centers {
-                    selected,
-                    ..Centers::default()
-                };
-            }
+            let (found, inputs, ball) = code.centers(&view, selected);
             state.centers = found;
             if let Some(lift_drag) = &code.lift_drag {
                 state.lift_drag.set_inputs(lift_drag, inputs, ball);

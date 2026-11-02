@@ -20,7 +20,7 @@ use brickrust::ue::tarray::TArray;
 use brickrust::ue::uclass::UStruct;
 
 use crate::framework::sig;
-use crate::game::reflection::{self, Function, Parameters};
+use crate::game::reflection::{self, Function, Parameters, SingleCall};
 use crate::game::text::Text;
 use crate::game::world;
 
@@ -124,6 +124,26 @@ impl ButtonPanels {
         }
     }
 
+    /// The buttons `panel` shows, to reorder them.
+    ///
+    /// # Safety
+    /// As for [`Self::buttons`]; only reorder the elements (the panel owns the array).
+    unsafe fn buttons_mut<'a>(&self, panel: *mut UObjectBase) -> &'a mut [*mut UObjectBase] {
+        // SAFETY: per the contract; the field is an array of button pointers.
+        unsafe {
+            let array = &*panel
+                .cast::<u8>()
+                .add(self.buttons)
+                .cast::<TArray<*mut UObjectBase>>();
+            match usize::try_from(array.num) {
+                Ok(count) if count > 0 && !array.data.is_null() => {
+                    core::slice::from_raw_parts_mut(array.data, count)
+                }
+                _ => &mut [],
+            }
+        }
+    }
+
     /// Whether `button` is one of the buttons `panel` shows (it may have been pooled and reused by
     /// another panel since it was made).
     ///
@@ -156,6 +176,160 @@ impl ButtonPanels {
             let made = reflection::take::<*mut UObjectBase>(&parameters, self.button_made);
             (!made.is_null()).then_some(made)
         }
+    }
+}
+
+/// Where a button panel's buttons show: each in a cell of the panel's grid (its `ButtonPanel`, a
+/// `UGridPanel`), row `index / NumButtonsPerRow` and column `index % NumButtonsPerRow` (all in row
+/// 0 if that's 0), as `UMenuButtonPanelWidget::AddButton` places them (BRMK 0x3A8800) when
+/// `CreateButton` makes them, in order. To check a panel shows its buttons in their order and put
+/// back what doesn't (`docs/re/settings-menu.md`, "Buttons").
+pub struct ButtonGrid {
+    /// Offsets of `UMenuButtonPanelWidget::ButtonPanel` (the grid) and `NumButtonsPerRow`.
+    grid: usize,
+    per_row: usize,
+    /// Offsets of `UWidget::Slot` and `UPanelSlot::Parent`.
+    slot: usize,
+    parent: usize,
+    /// `UGridSlot`, its `Row` and `Column`, and their setters (which tell the grid).
+    grid_slot: *const UStruct,
+    row: usize,
+    column: usize,
+    set_row: SingleCall,
+    set_column: SingleCall,
+    /// `UWidget::Visibility`, `SetVisibility`, and `ESlateVisibility`'s `Collapsed` and `Visible`.
+    visibility: usize,
+    set_visibility: SingleCall,
+    collapsed: u8,
+    visible: u8,
+}
+
+// SAFETY: reflection records that live for the whole game; only used on the game thread.
+unsafe impl Send for ButtonGrid {}
+unsafe impl Sync for ButtonGrid {}
+
+impl ButtonGrid {
+    /// Finds everything. After engine init (reflection).
+    pub fn find() -> Result<Self, String> {
+        let class = |name| reflection::find_class(name).ok_or(format!("class {name} not found"));
+        let panel = class("MenuButtonPanelWidget")?;
+        let widget = class("Widget")?;
+        let grid_slot = class("GridSlot")?;
+        let int = |class, name| reflection::field_offset(class, name, "IntProperty", 4);
+        let visibility = |entry: &str| -> Result<u8, String> {
+            let entry = format!("ESlateVisibility::{entry}");
+            let value = reflection::enum_value("ESlateVisibility", &entry)?;
+            u8::try_from(value).map_err(|_| format!("{entry} is {value}"))
+        };
+        Ok(Self {
+            grid: reflection::field_offset(panel, "ButtonPanel", "ObjectProperty", 8)?,
+            per_row: int(panel, "NumButtonsPerRow")?,
+            slot: reflection::field_offset(widget, "Slot", "ObjectProperty", 8)?,
+            parent: reflection::field_offset(class("PanelSlot")?, "Parent", "ObjectProperty", 8)?,
+            grid_slot: grid_slot.cast(),
+            row: int(grid_slot, "Row")?,
+            column: int(grid_slot, "Column")?,
+            set_row: SingleCall::find(grid_slot, "SetRow", "InRow", "IntProperty", 4)?,
+            set_column: SingleCall::find(grid_slot, "SetColumn", "InColumn", "IntProperty", 4)?,
+            visibility: reflection::field_offset(widget, "Visibility", "EnumProperty", 1)?,
+            set_visibility: SingleCall::find(
+                widget,
+                "SetVisibility",
+                "InVisibility",
+                "EnumProperty",
+                1,
+            )?,
+            collapsed: visibility("Collapsed")?,
+            visible: visibility("Visible")?,
+        })
+    }
+
+    /// Checks that `panel` shows its buttons in their order, `last` (those of them that are
+    /// there) after the others, and puts back what doesn't: the order, then each button's cell and
+    /// visibility. What was wrong, empty if nothing; a button shown twice isn't put back.
+    ///
+    /// # Safety
+    /// `panel` must be a live button panel that isn't making buttons now. Game thread only.
+    pub unsafe fn put_in_order(
+        &self,
+        panels: &ButtonPanels,
+        panel: *mut UObjectBase,
+        last: &[*mut UObjectBase],
+    ) -> Vec<String> {
+        let mut wrong = Vec::new();
+        // SAFETY: per the contract; the buttons are live widgets (the panel holds them), each
+        // field read at its reflected offset, and a widget's slot and its parent are live objects.
+        unsafe {
+            let buttons = panels.buttons_mut(panel);
+            for (at, button) in buttons.iter().enumerate() {
+                if let Some(first) = buttons[..at].iter().position(|other| other == button) {
+                    wrong.push(format!("button {at} is button {first} too"));
+                }
+            }
+            if !wrong.is_empty() {
+                return wrong;
+            }
+            let wanted: Vec<_> = buttons
+                .iter()
+                .copied()
+                .filter(|button| !last.contains(button))
+                .chain(
+                    last.iter()
+                        .copied()
+                        .filter(|button| buttons.contains(button)),
+                )
+                .collect();
+            if wanted != buttons {
+                let ours: Vec<String> = buttons
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, button)| last.contains(button))
+                    .map(|(at, _)| at.to_string())
+                    .collect();
+                wrong.push(format!(
+                    "the page's buttons were {} of {}",
+                    ours.join(", "),
+                    buttons.len()
+                ));
+                buttons.copy_from_slice(&wanted);
+            }
+            let grid = field::<*mut UObjectBase>(panel, self.grid);
+            let per_row = field::<i32>(panel, self.per_row);
+            for (at, &button) in buttons.iter().enumerate() {
+                let at_i32 = i32::try_from(at).unwrap_or(i32::MAX);
+                let (row, column) = if per_row > 0 {
+                    (at_i32 / per_row, at_i32 % per_row)
+                } else {
+                    (0, at_i32)
+                };
+                let slot = field::<*mut UObjectBase>(button, self.slot);
+                if slot.is_null() || !reflection::is_a(slot, self.grid_slot) {
+                    wrong.push(format!("button {at} isn't in a grid"));
+                    continue;
+                }
+                if field::<*mut UObjectBase>(slot, self.parent) != grid {
+                    wrong.push(format!("button {at} is in another grid"));
+                    continue;
+                }
+                let shown = (
+                    field::<i32>(slot, self.row),
+                    field::<i32>(slot, self.column),
+                );
+                if shown != (row, column) {
+                    wrong.push(format!(
+                        "button {at} was in row {}, column {}",
+                        shown.0, shown.1
+                    ));
+                    self.set_row.call(slot, row);
+                    self.set_column.call(slot, column);
+                }
+                if field::<u8>(button, self.visibility) == self.collapsed {
+                    wrong.push(format!("button {at} was hidden"));
+                    self.set_visibility.call(button, self.visible);
+                }
+            }
+        }
+        wrong
     }
 }
 
@@ -324,11 +498,13 @@ impl Menus {
 /// the active widget). The window manager is `UWorld::OwningGameInstance`'s `WindowManagerWidget`
 /// (reflected on `UBrickGameInstance`, as `game::zoom_notification` finds it). The menu widget's
 /// `NativeConstruct` (BRMK 0x3D3E20) then opens its root context (`InGameMenu`, or `MainMenu` in
-/// the main menu) with `OpenMenu`.
+/// the main menu) with `OpenMenu`. While it's open, the menu is the window manager's
+/// `ActiveWidget` (reflected).
 pub struct WindowManager {
     game_instance: usize,
     brick_game_instance: *const UStruct,
     window_manager: usize,
+    active_widget: usize,
     set_menu_open: Function,
     open_value: usize,
 }
@@ -361,6 +537,7 @@ impl WindowManager {
             game_instance: object(class("World")?, "OwningGameInstance")?,
             brick_game_instance: brick_game_instance.cast(),
             window_manager: object(brick_game_instance, "WindowManagerWidget")?,
+            active_widget: object(window_manager, "ActiveWidget")?,
             open_value,
             set_menu_open,
         })
@@ -371,26 +548,50 @@ impl WindowManager {
     /// # Safety
     /// Game thread only.
     pub unsafe fn open_menu(&self) -> bool {
+        // SAFETY: on the game thread.
+        let Some(manager) = (unsafe { self.manager() }) else {
+            return false;
+        };
+        let mut parameters = Parameters::new();
+        // SAFETY: a live window manager; the parameter is written at its reflected offset.
+        unsafe {
+            reflection::put(&mut parameters, self.open_value, true);
+            self.set_menu_open.call(manager, &mut parameters);
+        }
+        true
+    }
+
+    /// Whether `widget` (a menu) is the one showing, open.
+    ///
+    /// # Safety
+    /// Game thread only.
+    pub unsafe fn is_active(&self, widget: *mut UObjectBase) -> bool {
+        // SAFETY: on the game thread; the field is an object pointer of the manager's class.
+        unsafe {
+            self.manager().is_some_and(|manager| {
+                field::<*mut UObjectBase>(manager, self.active_widget) == widget
+            })
+        }
+    }
+
+    /// The current world's window manager.
+    ///
+    /// # Safety
+    /// Game thread only.
+    unsafe fn manager(&self) -> Option<*mut UObjectBase> {
         // SAFETY: on the game thread; each object comes from a reflected object property of the
-        // one before (the game instance's class checked), and the parameter is written at its
-        // reflected offset.
+        // one before (the game instance's class checked).
         unsafe {
             let world = world::current();
             if world.is_null() {
-                return false;
+                return None;
             }
             let instance = field::<*mut UObjectBase>(world, self.game_instance);
             if instance.is_null() || !reflection::is_a(instance, self.brick_game_instance) {
-                return false;
+                return None;
             }
             let manager = field::<*mut UObjectBase>(instance, self.window_manager);
-            if manager.is_null() {
-                return false;
-            }
-            let mut parameters = Parameters::new();
-            reflection::put(&mut parameters, self.open_value, true);
-            self.set_menu_open.call(manager, &mut parameters);
-            true
+            (!manager.is_null()).then_some(manager)
         }
     }
 }

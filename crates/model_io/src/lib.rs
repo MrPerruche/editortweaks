@@ -7,6 +7,7 @@
 //! [`ImportSettings`].
 
 pub mod companions;
+pub mod curve;
 pub mod cooked;
 pub mod export;
 pub mod fit;

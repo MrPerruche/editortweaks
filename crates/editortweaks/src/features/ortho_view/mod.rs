@@ -56,7 +56,7 @@ use brickrust::ue::coreuobject::UObjectBase;
 use super::editor_frame;
 use super::keybinds;
 use super::mouse_moves::{self, Handling, Movement};
-use crate::framework::hook;
+use crate::framework::{hook, timings};
 use crate::game::camera_manager::{self, ApplyCameraModifiersFn, ViewInfo, ViewTargets};
 use crate::game::editor_camera::{self, EditorCamera, EditorCode};
 use crate::game::editor_input::{self, CameraFlags, ZoomSteps};
@@ -334,10 +334,13 @@ fn optional<T>(found: Result<T, String>, without: &str) -> Option<T> {
 }
 
 unsafe extern "C" fn apply_camera_modifiers(manager: *mut UObjectBase, delta: f32, view: *mut u8) {
+    let _span = timings::span("ortho_view::apply_camera_modifiers");
     let original = *ORIGINAL.get().expect("hook recorded before use");
     // SAFETY: the game's own arguments: the live camera manager and the view it's making.
     unsafe {
-        original(manager, delta, view);
+        timings::game(camera_manager::APPLY_CAMERA_MODIFIERS.name, || {
+            original(manager, delta, view)
+        });
         if let Some(parts) = PARTS.get() {
             let mut state = STATE.lock().unwrap_or_else(PoisonError::into_inner);
             parts.follow(&mut state, manager, delta, view);
@@ -351,6 +354,7 @@ unsafe extern "C" fn apply_camera_modifiers(manager: *mut UObjectBase, delta: f3
 }
 
 unsafe extern "C" fn zoom_changed(overlay: *mut UObjectBase, ratio: f32) {
+    let _span = timings::span("ortho_view::zoom_changed");
     let original = *ORIGINAL_ZOOM_CHANGED
         .get()
         .expect("hook recorded before use");
@@ -361,7 +365,9 @@ unsafe extern "C" fn zoom_changed(overlay: *mut UObjectBase, ratio: f32) {
     unsafe {
         match labelled {
             Some((tooltip, label)) => tooltip.show(overlay, ratio, &label.text(tooltip)),
-            None => original(overlay, ratio),
+            None => timings::game(zoom_notification::ZOOM_CHANGED.name, || {
+                original(overlay, ratio)
+            }),
         }
     }
 }
@@ -403,6 +409,7 @@ fn take_pan(movement: &Movement) -> Handling {
 }
 
 unsafe extern "C" fn zoom_in_detour(context: *mut c_void, stack: *mut c_void, result: *mut c_void) {
+    let _span = timings::span("ortho_view::zoom_in_detour");
     let original = *ORIGINAL_ZOOM_IN.get().expect("hook recorded before use");
     // SAFETY: the thunk's own arguments, passed on.
     unsafe { zoom_step(context, stack, result, original, true) }
@@ -413,6 +420,7 @@ unsafe extern "C" fn zoom_out_detour(
     stack: *mut c_void,
     result: *mut c_void,
 ) {
+    let _span = timings::span("ortho_view::zoom_out_detour");
     let original = *ORIGINAL_ZOOM_OUT.get().expect("hook recorded before use");
     // SAFETY: the thunk's own arguments, passed on.
     unsafe { zoom_step(context, stack, result, original, false) }
@@ -466,7 +474,12 @@ unsafe fn zoom_step(
                 return;
             }
         }
-        original(context, stack, result);
+        let game_name = if zoom_in {
+            "UBaseInputComponent::execAction_ZoomInStep"
+        } else {
+            "UBaseInputComponent::execAction_ZoomOutStep"
+        };
+        timings::game(game_name, || original(context, stack, result));
     }
 }
 

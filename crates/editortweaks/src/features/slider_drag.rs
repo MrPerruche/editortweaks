@@ -10,7 +10,9 @@
 //!   Ctrl or Alt): values only stop at the property's own limits (`property_limits` and its rules, some of which
 //!   stop drags before typed values: `drag_min`). In absolute mode (the value under the cursor),
 //!   dragging past an end carries on proportionally. Arrow keys still stop at the ends. The color
-//!   picker's sliders still stop there (`property_limits::is_color_slider`).
+//!   picker's sliders still stop there (`property_limits::is_color_slider`). So an absolute drag
+//!   doesn't stop where the (hidden) cursor meets the screen's edge, the cursor is moved back from
+//!   the edges, and the drag sees it where it would be without that ([`CursorShift`]).
 //!
 //! How: the slider's mouse move handler (`game::slider_drag`) is hooked. Its clamp to the slider's
 //! range is removed from its code (or put back, as the setting says when a drag moves);
@@ -30,12 +32,14 @@ use super::keybinds;
 use super::property_limits;
 use crate::framework::hook;
 use crate::framework::settings::Toggle;
+use crate::framework::timings;
 use crate::game::numeric_property::NumericValue;
 use crate::game::property_widget::{self, PropertyWidgets};
 use crate::game::slate::{self, Geometry, PointerEvent};
 use crate::game::slider::{self, RangeFields, SetValueInternalFn, ValueFields};
 use crate::game::slider_drag::{self, MouseDrag, MouseMoveFn};
 use crate::game::weak_object::WeakObject;
+use crate::platform::cursor;
 use crate::platform::keyboard;
 use crate::platform::timer::ThreadTimer;
 use crate::prelude::*;
@@ -66,6 +70,12 @@ const ALT_DRAG_CONTROL_FACTOR: f32 = 1.0 / 4.0;
 const ALT_DRAG_INTERVAL_MS: u32 = 10;
 /// The longest time an Alt-drag step covers, in seconds, so a hitch doesn't make the value jump.
 const MAX_STEP_SECONDS: f32 = 0.1;
+/// During a drag, the cursor is moved back once it's this close to the left or right edge of where
+/// it can go, as a share of that width ...
+const EDGE_SHARE: f32 = 1.0 / 8.0;
+/// ... to this far from that edge: still on the same side of the screen (the panel's), where it
+/// shows again after the drag.
+const EDGE_RETURN_SHARE: f32 = 1.0 / 4.0;
 
 pub struct SliderDrag;
 
@@ -102,6 +112,19 @@ thread_local! {
     static IN_DRAG_STEP: Cell<bool> = const { Cell::new(false) };
     /// The last value a property stored during the drag step that runs.
     static LAST_STORE: Cell<Option<Store>> = const { Cell::new(None) };
+    /// How far the drag's cursor was moved back from the screen's edges, if it was.
+    static CURSOR_SHIFT: Cell<Option<CursorShift>> = const { Cell::new(None) };
+}
+
+/// How far the cursor of a drag was moved back from the screen's edges ([`keep_cursor_off_edges`]):
+/// the drag sees it that much further ([`with_shifted_cursor`]), where it would be without that.
+#[derive(Clone, Copy)]
+struct CursorShift {
+    /// In pixels along X: where the drag sees the cursor minus where it is.
+    offset: f32,
+    /// The modifier keys held then. Shift and Control choose between the absolute and the relative
+    /// drag, so with others, the drag may have changed modes and the cursor's place starts anew.
+    modifier_keys: u16,
 }
 
 struct AltDrag {
@@ -235,29 +258,51 @@ unsafe extern "C" fn on_mouse_move(
     geometry: *const Geometry,
     event: *const PointerEvent,
 ) -> *mut c_void {
+    let _span = timings::span("slider_drag::on_mouse_move");
     let original = *MOUSE_MOVE.get().expect("hook recorded before use");
     // SAFETY: forwards the caller's arguments (the event possibly changed, see below).
-    let call = || unsafe { original(slider, reply, geometry, event) };
+    let call = || unsafe {
+        timings::game(slider_drag::DRAGGING_CHECK.name, || {
+            original(slider, reply, geometry, event)
+        })
+    };
 
     let Some(sliders) = SLIDERS.get() else {
         return call();
     };
     // SAFETY: NativeOnMouseMove is a UBrickSliderWidget member, so `slider` is one.
     if !unsafe { sliders.drag.is_dragging(slider) } {
+        // A drag starts with moves that aren't dragging yet: its cursor wasn't moved back.
+        CURSOR_SHIFT.set(None);
         return call();
     }
     // SAFETY: on the game thread, before NativeOnMouseMove runs.
-    unsafe { sync_limits(sliders) };
+    let lifted = unsafe { sync_limits(sliders) };
     // SAFETY: the caller's event and geometry, valid during the call.
-    let (moved, width) = unsafe { ((*event).cursor_delta[0], (*geometry).absolute_width()) };
+    let (moved, width, modifier_keys) = unsafe {
+        (
+            (*event).cursor_delta[0],
+            (*geometry).absolute_width(),
+            (*event).modifier_keys,
+        )
+    };
     if !keybinds::KEEP_DRAGGING_SLIDERS.is_held() {
         ALT_DRAG.take();
-        let reply = drag_step(sliders, slider, call);
+        // SAFETY: the caller's event: only this thread uses it during the call, and it's restored
+        // before returning.
+        let reply =
+            unsafe { with_shifted_cursor(event.cast_mut(), || drag_step(sliders, slider, call)) };
+        // Without lifted limits, an absolute drag stops at the slider's end, on screen.
+        if lifted {
+            keep_cursor_off_edges(modifier_keys);
+        }
         // SAFETY: a live slider being dragged, on the game thread.
         unsafe { keep_color_drag_in_range(sliders, slider) };
         return reply;
     }
 
+    // An Alt-drag is relative: the game keeps the cursor over the slider.
+    CURSOR_SHIFT.set(None);
     alt_drag_moved(slider, moved, width);
     // SAFETY: the caller's event: only this thread uses it during the call, and it's restored
     // before returning.
@@ -298,6 +343,72 @@ unsafe fn as_still_shift_drag<R>(event: *mut PointerEvent, call: impl FnOnce() -
         let result = call();
         ((*event).modifier_keys, (*event).cursor_delta) = saved;
         result
+    }
+}
+
+/// Runs `call` with `event`'s cursor where it would be if [`keep_cursor_off_edges`] hadn't moved it:
+/// an absolute drag carries on from there. A relative drag doesn't read it.
+///
+/// # Safety
+/// `event` must be a valid event that nothing else uses during `call`, other than through it.
+unsafe fn with_shifted_cursor<R>(event: *mut PointerEvent, call: impl FnOnce() -> R) -> R {
+    // SAFETY: per the contract.
+    unsafe {
+        let shift = CURSOR_SHIFT
+            .get()
+            .filter(|shift| shift.modifier_keys == (*event).modifier_keys);
+        CURSOR_SHIFT.set(shift);
+        let Some(shift) = shift else {
+            return call();
+        };
+        let saved = (*event).screen_space_position;
+        (*event).screen_space_position[0] += shift.offset;
+        let result = call();
+        (*event).screen_space_position = saved;
+        result
+    }
+}
+
+/// Moves the (hidden) cursor of a drag back once it nears the left or right edge of where it can
+/// go, where it would stop: an absolute drag then goes on as far as the mouse does. Remembers how
+/// far for [`with_shifted_cursor`].
+fn keep_cursor_off_edges(modifier_keys: u16) {
+    let (Some((x, y)), Some((left, right))) = (cursor::position(), cursor::horizontal_bounds())
+    else {
+        return;
+    };
+    let Some(target) = off_edge(x, left, right) else {
+        return;
+    };
+    if cursor::set_position(target, y) {
+        let offset = CURSOR_SHIFT
+            .get()
+            .filter(|shift| shift.modifier_keys == modifier_keys)
+            .map_or(0.0, |shift| shift.offset);
+        CURSOR_SHIFT.set(Some(CursorShift {
+            offset: offset + (x - target) as f32,
+            modifier_keys,
+        }));
+    }
+}
+
+/// Where to move a cursor at `x` that can go from `left` to `right` (exclusive), if it's near
+/// either edge (see [`EDGE_SHARE`]).
+fn off_edge(x: i32, left: i32, right: i32) -> Option<i32> {
+    let width = (right - left) as f32;
+    let (near, back) = (
+        (width * EDGE_SHARE) as i32,
+        (width * EDGE_RETURN_SHARE) as i32,
+    );
+    if near < 1 || back <= near {
+        return None;
+    }
+    if x < left + near {
+        Some(left + back)
+    } else if x >= right - near {
+        Some(right - back)
+    } else {
+        None
     }
 }
 
@@ -522,5 +633,24 @@ pub(crate) fn stored(requested: &NumericValue, stored: &NumericValue) {
             requested: *requested,
             stored: *stored,
         }));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cursor_near_an_edge_goes_back_on_that_side() {
+        // A 1920 pixel wide screen: within 240 of an edge, back to 480 from it.
+        assert_eq!(off_edge(960, 0, 1920), None);
+        assert_eq!(off_edge(240, 0, 1920), None);
+        assert_eq!(off_edge(239, 0, 1920), Some(480));
+        assert_eq!(off_edge(1919, 0, 1920), Some(1440));
+        assert_eq!(off_edge(1680, 0, 1920), Some(1440));
+        // A second monitor left of the main one.
+        assert_eq!(off_edge(-1920, -1920, 1920), Some(-1440));
+        // No room to move.
+        assert_eq!(off_edge(0, 0, 4), None);
     }
 }

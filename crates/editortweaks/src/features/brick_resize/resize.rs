@@ -51,6 +51,8 @@ impl Grip {
         match piece {
             Piece::Box(part) => Some(Self::of_box(part, bounds)),
             Piece::Model(element) => Self::of_model(element, bounds, model?),
+            // Spinners have no size: they change by their own values (`super::spinner`).
+            Piece::Spinner(_) => None,
         }
     }
 

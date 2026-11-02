@@ -12,9 +12,10 @@
 //! How (`game::editor_view`): each one is a new entry of the game's view mode enum, which the view
 //! mode cycle reads. In the coloring ones, bricks get the material of the game's group view modes
 //! (hooking `GetEditorMaterialOverride`) and our colors in its custom primitive data (after the
-//! function writing the game's). Collision keeps the bricks' materials and adds meshes; Reference fit
-//! gives bricks the hidden material and adds meshes. A view mode works out every brick's colors at once ([`Coloring`]), kept
-//! until the editor changes: after every change the editor re-pairs mirrored bricks
+//! function writing the game's). Collision and Reference fit add meshes, and take the bricks' own out
+//! of the main pass where those show them; Reference fit paints bricks plain gray (as the coloring
+//! ones do) until its meshes are there. A view mode works out every brick's colors at once
+//! ([`Coloring`]), kept until the editor changes: after every change the editor re-pairs mirrored bricks
 //! (`UpdateMirroredObjects`), and then bricks whose colors changed are repainted. The game names
 //! view modes from a fixed list, so ours are added to it: the panel's list shows them, and their
 //! names after Z aren't "Invalid". Hiding bricks or showing them again (H, Alt + H) isn't an edit:
@@ -38,7 +39,7 @@ mod strength;
 mod tooltip;
 
 /// The Physics view mode's settings.
-pub(crate) use physics::{CENTERS, LIFT_DRAG};
+pub(crate) use physics::LIFT_DRAG;
 /// For the shot preview's tooltip: the AP unit and how numbers read.
 pub(crate) use strength::{AP_DAMAGE, AP_PENETRATION, break_off_damage};
 /// The tooltips setting, shared with the shot preview.
@@ -53,7 +54,7 @@ use std::sync::{Mutex, Once, OnceLock, PoisonError};
 use brickrust::ue::coreuobject::UObjectBase;
 use core::ffi::c_void;
 
-use crate::framework::hook;
+use crate::framework::{hook, timings};
 use crate::game::brick_editor;
 use crate::game::editor_view::{
     self, Bricks, EditorCode, MaterialOverrideFn, PrimitiveDataFn, UpdateMirroredObjectsFn,
@@ -385,10 +386,11 @@ unsafe fn shown(
 }
 
 unsafe extern "C" fn material_override(brick: *mut UObjectBase) -> *mut UObjectBase {
+    let _span = timings::span("view_modes::material_override");
     let original = *MATERIAL_OVERRIDE.get().expect("hook recorded before use");
     // SAFETY: the game's call, passed on; then `brick` is the live brick it asked about.
     unsafe {
-        let material = original(brick);
+        let material = timings::game(editor_view::MATERIAL_OVERRIDE.name, || original(brick));
         // Hidden bricks keep the game's material for them.
         if !material.is_null() {
             return material;
@@ -396,7 +398,7 @@ unsafe extern "C" fn material_override(brick: *mut UObjectBase) -> *mut UObjectB
         match shown(brick) {
             Some((code, views, view)) => match view.look {
                 Look::Colors(_) => views.bricks.color_material(code, brick),
-                Look::Fit => views.bricks.hidden_material(code, brick),
+                Look::Fit => views.bricks.color_material(code, brick),
                 Look::Collision => material,
             },
             None => material,
@@ -410,10 +412,13 @@ unsafe extern "C" fn primitive_data(
     transform: *const c_void,
     relative: *const c_void,
 ) {
+    let _span = timings::span("view_modes::primitive_data");
     let original = *PRIMITIVE_DATA.get().expect("hook recorded before use");
     // SAFETY: the game's call, passed on; then `brick` is the live brick it updated.
     unsafe {
-        original(brick, component, transform, relative);
+        timings::game(editor_view::PRIMITIVE_DATA.name, || {
+            original(brick, component, transform, relative)
+        });
         match shown(brick) {
             Some((code, views, view)) => match view.look {
                 Look::Colors(_) => {
@@ -427,6 +432,8 @@ unsafe extern "C" fn primitive_data(
                 }
                 Look::Fit => {
                     collision::remove(brick);
+                    // Gray until it's measured, when our component shows it instead.
+                    views.bricks.paint(brick, PLAIN);
                     fit::show(code, brick);
                 }
             },
@@ -441,10 +448,13 @@ unsafe extern "C" fn primitive_data(
 /// Lists our view modes with the game's: in the editor panel's view mode list, and for their names
 /// after Z (which would be "Invalid").
 unsafe extern "C" fn view_mode_items(container: *const c_void, items: *mut c_void) {
+    let _span = timings::span("view_modes::view_mode_items");
     let original = *VIEW_MODE_ITEMS.get().expect("hook recorded before use");
     // SAFETY: the game's call, passed on; then `items` holds the game's list.
     unsafe {
-        original(container, items);
+        timings::game(editor_view::VIEW_MODE_ITEMS.name, || {
+            original(container, items)
+        });
         let (Some(views), Some(list)) = (VIEWS.get(), ITEMS.get()) else {
             return;
         };
@@ -457,12 +467,15 @@ unsafe extern "C" fn view_mode_items(container: *const c_void, items: *mut c_voi
 }
 
 unsafe extern "C" fn update_mirrored_objects(editor: *mut UObjectBase) {
+    let _span = timings::span("view_modes::update_mirrored_objects");
     let original = *UPDATE_MIRRORED_OBJECTS
         .get()
         .expect("hook recorded before use");
     // SAFETY: the game's call, passed on; then `editor` is the live editor that changed.
     unsafe {
-        original(editor);
+        timings::game(editor_view::UPDATE_MIRRORED_OBJECTS.name, || {
+            original(editor)
+        });
         // The editor changed, and so may every brick's colors.
         changed();
         if let (Some(code), Some(views)) = (CODE.get(), VIEWS.get()) {

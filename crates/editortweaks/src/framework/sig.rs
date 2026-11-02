@@ -8,9 +8,14 @@
 //! checks a leaf function found another way (they aren't in `.pdata`), and a [`VtableSig`] finds a
 //! C++ class's virtual function table by the type name it reports.
 
-use std::sync::OnceLock;
+use std::collections::HashMap;
+use std::sync::{LazyLock, Mutex, OnceLock, PoisonError};
+
+use memchr::memmem;
 
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
+
+use crate::framework::timings;
 
 /// A byte pattern identifying one function in the game exe, e.g. `"48 8b ?? 0f 2f"`.
 /// Keep the `name: "...", pattern: "..."` shape: `et.py sigcheck` parses these declarations.
@@ -28,14 +33,33 @@ pub struct SigMatch {
     pub function: *const u8,
 }
 
+// SAFETY: addresses in the game exe, which stays mapped and unchanged while the game runs.
+unsafe impl Send for SigMatch {}
+
 impl FunctionSig {
     /// Address of the function containing the pattern's single match.
     pub fn resolve(&self) -> Result<*const u8, String> {
         self.locate().map(|found| found.function)
     }
 
-    /// The pattern's single match and the function containing it.
+    /// The pattern's single match and the function containing it. Scans the game's code (tens of
+    /// milliseconds) the first time only, so features may locate their signatures when needed.
     pub fn locate(&self) -> Result<SigMatch, String> {
+        /// Each signature's result, by name and pattern.
+        type Located = HashMap<(&'static str, &'static str), Result<SigMatch, String>>;
+        static LOCATED: LazyLock<Mutex<Located>> = LazyLock::new(Default::default);
+        let key = (self.name, self.pattern);
+        let located = || LOCATED.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(found) = located().get(&key) {
+            return found.clone();
+        }
+        let found = self.scan();
+        located().insert(key, found.clone());
+        found
+    }
+
+    fn scan(&self) -> Result<SigMatch, String> {
+        let _span = timings::span("sig::FunctionSig::scan");
         let pattern = parse_pattern(self.pattern).map_err(|e| format!("{}: {e}", self.name))?;
         let image = GameImage::get();
         let mut matches = image
@@ -73,6 +97,7 @@ pub struct StringRefSig {
 
 impl StringRefSig {
     pub fn resolve(&self) -> Result<*const u8, String> {
+        let _span = timings::span("sig::StringRefSig::resolve");
         let image = GameImage::get();
         let needle: Vec<Option<u8>> = self
             .text
@@ -126,6 +151,7 @@ pub struct VtableSig {
 impl VtableSig {
     /// Every table matching, in the order they lie in the exe.
     pub fn resolve(&self) -> Result<Vec<*const *const u8>, String> {
+        let _span = timings::span("sig::VtableSig::resolve");
         let image = GameImage::get();
         let needle: Vec<Option<u8>> = self.type_name.bytes().chain([0]).map(Some).collect();
         let strings: Vec<u32> = image
@@ -526,24 +552,38 @@ fn parse_pattern(pattern: &str) -> Result<Vec<Option<u8>>, String> {
 }
 
 /// Every position in `haystack` where `pattern` matches.
-fn find_all<'a>(
-    haystack: &'a [u8],
-    pattern: &'a [Option<u8>],
-) -> impl Iterator<Item = *const u8> + 'a {
-    // Anchor on the first fixed byte so most positions are rejected by a single comparison.
-    let (anchor, anchor_byte) = pattern
-        .iter()
-        .enumerate()
-        .find_map(|(i, b)| b.map(|b| (i, b)))
-        .unwrap_or((0, 0));
-    let last_start = haystack.len().saturating_sub(pattern.len());
-    (0..=last_start)
-        .filter(move |&pos| haystack[pos + anchor] == anchor_byte)
-        .filter(move |&pos| {
+fn find_all(haystack: &[u8], pattern: &[Option<u8>]) -> Vec<*const u8> {
+    // A fast substring search for the pattern's longest run of fixed bytes finds the few places
+    // worth checking whole. Searching from each hit's next byte finds overlapping hits too.
+    let (anchor, run) = longest_fixed_run(pattern);
+    let finder = memmem::Finder::new(&run);
+    let mut found = Vec::new();
+    let mut from = anchor;
+    while let Some(hit) = haystack.get(from..).and_then(|rest| finder.find(rest)) {
+        let start = from + hit - anchor;
+        let candidate = haystack.get(start..start + pattern.len());
+        if candidate.is_some_and(|candidate| {
             pattern
                 .iter()
-                .zip(&haystack[pos..])
+                .zip(candidate)
                 .all(|(want, have)| want.is_none_or(|w| w == *have))
-        })
-        .map(move |pos| haystack[pos..].as_ptr())
+        }) {
+            found.push(haystack[start..].as_ptr());
+        }
+        from += hit + 1;
+    }
+    found
+}
+
+/// Where the longest run of fixed (non-wildcard) bytes in `pattern` starts, and its bytes.
+fn longest_fixed_run(pattern: &[Option<u8>]) -> (usize, Vec<u8>) {
+    let mut best = (0, Vec::new());
+    let mut start = 0;
+    for run in pattern.split(Option::is_none) {
+        if run.len() > best.1.len() {
+            best = (start, run.iter().flatten().copied().collect());
+        }
+        start += run.len() + 1;
+    }
+    best
 }

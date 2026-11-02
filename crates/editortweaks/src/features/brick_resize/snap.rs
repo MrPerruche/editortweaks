@@ -19,18 +19,25 @@
 //! close points.
 //!
 //! Bricks are seen as for pointing at them: their models with the model key held (those that have
-//! one), else their boxes. Each right click sets one more of the bricks the mouse goes through
-//! aside, front first (back to none after the last), to reach bricks behind them.
+//! one), else their boxes. Spinners are seen by what they're built of instead (see [`Look::Spinner`]):
+//! their caps' corners and edges, their rims and the crests of their curved sides (lines along the
+//! arc, snapped to on the arc itself, halfway along them by length, and where they go furthest
+//! along the brick's X or Y axis), their hub, caps' middles and sides' middles, and their surface
+//! with its smooth normal; the model key shows their model's own facets. Each right click sets one
+//! more of the bricks the mouse goes through aside, front first (back to none after the last), to
+//! reach bricks behind them.
 
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
 use super::draw::Mark;
-use super::geometry::{self, Ray, Vec3};
+use super::geometry::{self, Frame, Ray, Vec3};
 use super::model::{BrickModel, Element};
+use super::motion::Orientation;
 use super::parts::{self, Part};
 use super::resize::Target;
 use super::scene::{Piece, Placed, Scene, View};
+use super::spinner::{self, ArcLine, Line, SpinnerBrick};
 use crate::framework::settings::{Alternative, Choice, Toggle};
 
 /// What snapping snaps to now: each kind a setting (see `super::SETTINGS`).
@@ -251,6 +258,9 @@ pub enum Kind {
     Intersection,
     /// Where an edge goes through another brick's face.
     Piercing,
+    /// Where a spinner's line along its arc is a quarter turn round (furthest along the brick's X
+    /// or Y axis, or crossing it).
+    Quadrant,
     /// Halfway along an edge.
     Midpoint,
     /// A face's center.
@@ -273,10 +283,15 @@ impl Kind {
     fn bias(self) -> f32 {
         match self {
             Kind::Corner | Kind::Intersection | Kind::Piercing => 3.0,
-            Kind::Midpoint | Kind::FaceCenter => 2.0,
+            Kind::Quadrant | Kind::Midpoint | Kind::FaceCenter => 2.0,
             Kind::Between | Kind::Fraction => 1.0,
             Kind::Edge | Kind::Seam | Kind::Face => 0.0,
         }
+    }
+
+    /// Whether it's a point of its own: not just anywhere along an edge or a seam, or on a face.
+    pub fn is_point(self) -> bool {
+        !matches!(self, Kind::Edge | Kind::Seam | Kind::Face)
     }
 
     /// The mark showing a snap point of this kind; a point on a face is marked lying on it.
@@ -285,6 +300,7 @@ impl Kind {
             Kind::Corner => Mark::Square,
             Kind::Intersection => Mark::Cross,
             Kind::Piercing => Mark::BoxedCross,
+            Kind::Quadrant => Mark::Plus,
             Kind::Midpoint => Mark::Triangle,
             Kind::FaceCenter => Mark::Circle,
             Kind::Between => Mark::TriangleDown,
@@ -300,6 +316,7 @@ impl Kind {
             Kind::Corner => "a corner",
             Kind::Intersection => "where edges cross",
             Kind::Piercing => "where an edge goes through a face",
+            Kind::Quadrant => "a quarter turn of a spinner's arc",
             Kind::Midpoint => "halfway along an edge",
             Kind::FaceCenter => "a face's center",
             Kind::Between => "halfway between crossings",
@@ -413,7 +430,9 @@ impl Snapper {
                 let shares = self
                     .crossings
                     .entry((index, edge.piece, models))
-                    .or_insert_with(|| crossings(settings, scene, models, &skip, index, edge.ends));
+                    .or_insert_with(|| {
+                        crossings(settings, scene, models, &skip, index, &edge.path)
+                    });
                 points.between(edge, shares);
             }
         }
@@ -442,17 +461,25 @@ impl Snapper {
 enum Look<'a> {
     Box(&'a geometry::Bounds),
     Model(&'a BrickModel),
+    /// A spinner, by its own pieces (see [`spinner::Part`]): its corners, lines and centers. Its
+    /// model only tells where rays and other bricks meet its surface, and the pieces there are its
+    /// own (a whole side, not a facet).
+    Spinner(&'a SpinnerBrick, &'a BrickModel),
 }
 
 impl<'a> Look<'a> {
     fn of(placed: &'a Placed, models: bool) -> Self {
-        match placed.shown_model(models) {
-            Some(model) => Look::Model(model),
-            None => Look::Box(&placed.bounds),
+        match (&placed.spinner, &placed.model) {
+            // With the model key held, a spinner's model is seen as it is, facets and all.
+            (Some(brick), Some(model)) if !models => Look::Spinner(brick, model),
+            _ => match placed.shown_model(models) {
+                Some(model) => Look::Model(model),
+                None => Look::Box(&placed.bounds),
+            },
         }
     }
 
-    /// Its corners (a box's) or vertices (a model's).
+    /// Its corners (a box's, a spinner's caps') or vertices (a model's).
     fn corners(self) -> Vec<(Piece, Vec3)> {
         match self {
             Look::Box(bounds) => Part::all(3)
@@ -462,21 +489,53 @@ impl<'a> Look<'a> {
                 .vertices()
                 .map(|(vertex, point)| (Piece::Model(Element::Vertex(vertex)), point))
                 .collect(),
+            Look::Spinner(brick, _) => brick
+                .corners()
+                .into_iter()
+                .map(|(part, point)| (Piece::Spinner(part), point))
+                .collect(),
         }
     }
 
-    /// Its edges and their ends.
-    fn edges(self) -> Vec<(Piece, [Vec3; 2])> {
+    /// Its edges (a spinner's lines: along its arc and across its caps).
+    fn edges(self) -> Vec<(Piece, Path)> {
         match self {
             Look::Box(bounds) => Part::all(2)
                 .map(|part| {
                     let corners = part.corners(bounds);
-                    (Piece::Box(part), [corners[0], corners[1]])
+                    (Piece::Box(part), Path::line([corners[0], corners[1]]))
                 })
                 .collect(),
             Look::Model(model) => model
                 .edges()
-                .map(|(edge, ends)| (Piece::Model(Element::Edge(edge)), ends))
+                .map(|(edge, ends)| (Piece::Model(Element::Edge(edge)), Path::line(ends)))
+                .collect(),
+            Look::Spinner(brick, _) => brick
+                .lines()
+                .into_iter()
+                .map(|(part, line)| {
+                    let path = match line {
+                        Line::Arc(arc) => Path::arc(arc),
+                        Line::Across(points) => Path { points, arc: None },
+                    };
+                    (Piece::Spinner(part), path)
+                })
+                .collect(),
+        }
+    }
+
+    /// Its faces' centers (a spinner's: its hub, caps' middles and sides' middles).
+    fn centers(self) -> Vec<(Piece, Vec3)> {
+        match self {
+            Look::Spinner(brick, _) => brick
+                .centers()
+                .into_iter()
+                .map(|(part, point)| (Piece::Spinner(part), point))
+                .collect(),
+            _ => self
+                .faces()
+                .into_iter()
+                .map(|face| (face.piece, face.center))
                 .collect(),
         }
     }
@@ -491,14 +550,15 @@ impl<'a> Look<'a> {
                     .map(|index| [corners[index], next(index)])
                     .collect()
             }
-            (Look::Model(model), Piece::Model(Element::Face(face))) => {
+            (Look::Model(model) | Look::Spinner(_, model), Piece::Model(Element::Face(face))) => {
                 model.face_edges(face).collect()
             }
             _ => Vec::new(),
         }
     }
 
-    /// Its faces.
+    /// Its faces (a spinner's model's facets: where other bricks go through it, and seams; see
+    /// [`Self::piece_at`] for what they are of it).
     fn faces(self) -> Vec<Face> {
         match self {
             Look::Box(bounds) => Part::all(1)
@@ -508,7 +568,7 @@ impl<'a> Look<'a> {
                     normal: part.sides.map(f64::from),
                 })
                 .collect(),
-            Look::Model(model) => model
+            Look::Model(model) | Look::Spinner(_, model) => model
                 .faces()
                 .map(|face| Face {
                     piece: Piece::Model(Element::Face(face)),
@@ -517,6 +577,22 @@ impl<'a> Look<'a> {
                 })
                 .collect(),
         }
+    }
+
+    /// The piece snapping tells for its `piece` at `point` (in the brick): on a spinner, its own
+    /// piece a facet of its model is on (see [`spinner::Part::of`]); else `piece` itself.
+    fn piece_at(self, piece: Piece, point: Vec3) -> Piece {
+        match (self, piece) {
+            (Look::Spinner(brick, model), Piece::Model(element)) => {
+                Piece::Spinner(spinner::Part::of(brick, model, element, point))
+            }
+            _ => piece,
+        }
+    }
+
+    /// Whether it's a spinner seen by its own pieces: its faces are facets of a curved surface.
+    fn is_spinner(self) -> bool {
+        matches!(self, Look::Spinner(..))
     }
 
     /// Whether `point` (in the plane of its face `face`) is on that face.
@@ -529,12 +605,15 @@ impl<'a> Look<'a> {
                         && point[axis] <= bounds.max[axis] + tolerance
                 })
             }
-            (Look::Model(model), Piece::Model(Element::Face(face))) => model.on_face(face, point),
+            (Look::Model(model) | Look::Spinner(_, model), Piece::Model(Element::Face(face))) => {
+                model.on_face(face, point)
+            }
             _ => false,
         }
     }
 
-    /// Where `ray` (in the brick) first meets it, the face there and that face's outward normal.
+    /// Where `ray` (in the brick) first meets it, the face there and that face's outward normal
+    /// (a spinner's piece there, and its surface's smooth normal).
     fn hit(self, ray: &Ray) -> Option<(f64, Piece, Vec3)> {
         match self {
             Look::Box(bounds) => {
@@ -547,8 +626,167 @@ impl<'a> Look<'a> {
                 let piece = Piece::Model(Element::Face(face));
                 (distance, piece, model.normal(face))
             }),
+            Look::Spinner(brick, model) => model.hit(ray).map(|(distance, face)| {
+                let point = geometry::along(ray, distance);
+                let part = spinner::Part::of(brick, model, Element::Face(face), point);
+                let normal = match brick.orientation(part, point) {
+                    Some(Orientation::Face(normal)) => normal,
+                    _ => model.normal(face),
+                };
+                (distance, Piece::Spinner(part), normal)
+            }),
         }
     }
+}
+
+/// An edge of a brick as snapping sees it, in the brick or in the vehicle: a straight one (its
+/// two ends), a spinner's line across a cap (its points in order), or one along its arc, whose
+/// points between its points are on the arc itself (see [`ArcLine`]). Shares of it are of its
+/// length.
+#[derive(Clone)]
+struct Path {
+    points: Vec<Vec3>,
+    /// For a line along a spinner's arc: the arc, and the brick's frame once in the vehicle.
+    arc: Option<(ArcLine, Option<Frame>)>,
+}
+
+impl Path {
+    fn line(ends: [Vec3; 2]) -> Self {
+        Self {
+            points: ends.to_vec(),
+            arc: None,
+        }
+    }
+
+    fn arc(line: ArcLine) -> Self {
+        Self {
+            points: line.points(),
+            arc: Some((line, None)),
+        }
+    }
+
+    /// It in the vehicle, from the brick at `frame`.
+    fn placed(&self, frame: &Frame) -> Self {
+        Self {
+            points: self
+                .points
+                .iter()
+                .map(|&point| frame.point(point))
+                .collect(),
+            arc: self.arc.map(|(line, _)| (line, Some(*frame))),
+        }
+    }
+
+    /// It in the brick at `frame` (from the vehicle), straight between its points.
+    fn local_to(&self, frame: &Frame) -> Self {
+        Self {
+            points: self
+                .points
+                .iter()
+                .map(|&point| frame.local(point))
+                .collect(),
+            arc: None,
+        }
+    }
+
+    /// Its segments, each with where it starts and ends along it (shares of its length).
+    fn segments(&self) -> Vec<([Vec3; 2], [f64; 2])> {
+        let lengths: Vec<f64> = self
+            .points
+            .windows(2)
+            .map(|pair| geometry::length(geometry::sub(pair[1], pair[0])))
+            .collect();
+        let total: f64 = lengths.iter().sum();
+        let mut from = 0.0;
+        self.points
+            .windows(2)
+            .zip(lengths)
+            .map(|(pair, length)| {
+                let shares = if total > 0.0 {
+                    [from / total, (from + length) / total]
+                } else {
+                    [0.0, 1.0]
+                };
+                from += length;
+                ([pair[0], pair[1]], shares)
+            })
+            .collect()
+    }
+
+    /// Its length.
+    fn length(&self) -> f64 {
+        self.points
+            .windows(2)
+            .map(|pair| geometry::length(geometry::sub(pair[1], pair[0])))
+            .sum()
+    }
+
+    /// Its point at `position` along its points (see [`geometry::closest_on_polyline`]).
+    fn at(&self, position: f64) -> Vec3 {
+        if let Some((line, frame)) = &self.arc {
+            let point = line.at(position);
+            return frame.map_or(point, |frame| frame.point(point));
+        }
+        let last = self.points.len().saturating_sub(2);
+        let index = (position.max(0.0).floor() as usize).min(last);
+        match self.points.get(index + 1) {
+            Some(&next) => geometry::lerp([self.points[index], next], position - index as f64),
+            None => self.points[0],
+        }
+    }
+
+    /// Its point `share` of its length along it, from its first point.
+    fn point_at(&self, share: f64) -> Vec3 {
+        let segments = self.segments();
+        let found = segments
+            .iter()
+            .enumerate()
+            .find(|(_, (_, [_, to]))| share <= *to)
+            .or(segments.iter().enumerate().next_back());
+        let Some((index, &(_, [from, to]))) = found else {
+            return self.points[0];
+        };
+        let within = if to > from {
+            (share - from) / (to - from)
+        } else {
+            0.0
+        };
+        self.at(index as f64 + within.clamp(0.0, 1.0))
+    }
+
+    /// Its point nearest `ray`.
+    fn nearest(&self, ray: &Ray) -> Vec3 {
+        geometry::closest_on_polyline(ray, &self.points)
+            .map_or(self.points[0], |(position, _)| self.at(position))
+    }
+}
+
+/// Where the paths `first` and `second` cross (see [`crossing`]): at each, the share of `first`'s
+/// length there, and the point.
+fn path_crossings(first: &Path, second: &Path) -> Vec<(f64, Vec3)> {
+    let others = second.segments();
+    let mut found = Vec::new();
+    for (ends, [from, to]) in first.segments() {
+        // Arcs have many segments: only those whose boxes meet are tried.
+        for (other, _) in others.iter().filter(|(other, _)| boxes_meet(ends, *other)) {
+            if let Some((share, point)) = crossing(ends, *other) {
+                found.push((from + share * (to - from), point));
+            }
+        }
+    }
+    found
+}
+
+/// Whether the boxes around the segments `first` and `second` meet (within
+/// [`CROSSING_TOLERANCE`]).
+fn boxes_meet(first: [Vec3; 2], second: [Vec3; 2]) -> bool {
+    (0..3).all(|axis| {
+        let [a, b] = [first, second].map(|ends| {
+            let [start, end] = ends.map(|end| end[axis]);
+            (start.min(end), start.max(end))
+        });
+        a.0 <= b.1 + CROSSING_TOLERANCE && b.0 <= a.1 + CROSSING_TOLERANCE
+    })
 }
 
 /// A face of a brick, in its frame.
@@ -633,8 +871,8 @@ struct NearEdge {
     /// Its brick (among those seen) and which edge.
     brick: usize,
     piece: Piece,
-    /// Its ends, in the vehicle.
-    ends: [Vec3; 2],
+    /// It, in the vehicle.
+    path: Path,
     /// Its point nearest the mouse's ray, and how far from the mouse that is (pixels).
     nearest: Vec3,
     pixels: f32,
@@ -645,16 +883,16 @@ fn near_edges(seen: &[Seen], view: &View) -> Vec<NearEdge> {
     let mut edges = Vec::new();
     for (brick, seen) in seen.iter().enumerate() {
         let frame = &seen.placed.frame;
-        for (piece, ends) in seen.look.edges() {
-            let ends = ends.map(|end| frame.point(end));
-            let nearest = geometry::closest_on_segment(&view.ray, ends[0], ends[1]);
+        for (piece, path) in seen.look.edges() {
+            let path = path.placed(frame);
+            let nearest = path.nearest(&view.ray);
             if let Some(pixels) = from_mouse(view, nearest)
                 && pixels <= POINT_PIXELS
             {
                 edges.push(NearEdge {
                     brick,
                     piece,
-                    ends,
+                    path,
                     nearest,
                     pixels,
                 });
@@ -668,10 +906,14 @@ fn near_edges(seen: &[Seen], view: &View) -> Vec<NearEdge> {
 /// other's plane), where the bricks go into each other.
 #[derive(Clone)]
 struct Seam {
-    /// The two faces (by brick, see [`Scene::get`]).
+    /// The two faces (by brick, see [`Scene::get`]; a spinner's own piece, see
+    /// [`Look::piece_at`]).
     on: [(usize, Piece); 2],
     /// Its ends, in the vehicle.
     ends: [Vec3; 2],
+    /// Whether it's on a spinner's curved surface: then it's one of many short stretches across
+    /// its facets, and has no middle worth snapping to.
+    curved: bool,
 }
 
 /// A seam near the mouse.
@@ -753,16 +995,20 @@ fn seams(first: &Seen, second: &Seen) -> Vec<Seam> {
         return Vec::new();
     }
     let second_faces = outlines(second, first);
+    let curved = first.look.is_spinner() || second.look.is_spinner();
     let mut seams = Vec::new();
     for first_face in outlines(first, second) {
         for second_face in &second_faces {
             for ends in face_seams((first, &first_face), (second, second_face)) {
+                let middle = geometry::lerp(ends, 0.5);
+                let piece = |seen: &Seen, face: &Outline| {
+                    let point = seen.placed.frame.local(middle);
+                    (seen.index, seen.look.piece_at(face.piece, point))
+                };
                 seams.push(Seam {
-                    on: [
-                        (first.index, first_face.piece),
-                        (second.index, second_face.piece),
-                    ],
+                    on: [piece(first, &first_face), piece(second, second_face)],
                     ends,
+                    curved,
                 });
             }
         }
@@ -914,7 +1160,8 @@ impl Points<'_> {
         });
     }
 
-    /// The bricks' corners and faces' centers (with those kinds on).
+    /// The bricks' corners and faces' centers (with those kinds on); a spinner's quarter turns
+    /// with its corners.
     fn of_bricks(&mut self, settings: &Snapping) {
         for brick in self.seen {
             let frame = &brick.placed.frame;
@@ -923,14 +1170,21 @@ impl Points<'_> {
                     let on = [(brick.index, piece)];
                     self.add(Kind::Corner, frame.point(corner), &on, None);
                 }
+                if let Look::Spinner(spinner, _) = brick.look {
+                    for (part, point) in spinner.quarter_points() {
+                        let on = [(brick.index, Piece::Spinner(part))];
+                        self.add(Kind::Quadrant, frame.point(point), &on, None);
+                    }
+                }
             }
             if settings.face_centers {
-                for face in brick.look.faces() {
-                    let on = [(brick.index, face.piece)];
-                    self.add(Kind::FaceCenter, frame.point(face.center), &on, None);
+                for (piece, center) in brick.look.centers() {
+                    let on = [(brick.index, piece)];
+                    self.add(Kind::FaceCenter, frame.point(center), &on, None);
                 }
-                // A spinner's hub and its caps' middles (where its connectors are).
-                if let Some(spinner) = &brick.placed.spinner {
+                // Seen by its model (the model key held), a spinner's hub and its caps' middles
+                // (where its connectors are) still count.
+                if let (Look::Model(_), Some(spinner)) = (brick.look, &brick.placed.spinner) {
                     for (element, point) in spinner.snap_points() {
                         let on: Vec<(usize, Piece)> = element
                             .map(|element| (brick.index, Piece::Model(element)))
@@ -948,14 +1202,14 @@ impl Points<'_> {
         for edge in edges {
             let on = [(self.seen[edge.brick].index, edge.piece)];
             for &(share, kind) in fractions {
-                self.add(kind, geometry::lerp(edge.ends, share), &on, None);
+                self.add(kind, edge.path.point_at(share), &on, None);
             }
         }
     }
 
     /// The points `fractions` of the way along `seams` (see [`fractions`]), with the seam they're on.
     fn along_seams(&mut self, seams: &[NearSeam], fractions: &[(f64, Kind)]) {
-        for near in seams {
+        for near in seams.iter().filter(|near| !near.seam.curved) {
             let seam = &near.seam;
             for &(share, kind) in fractions {
                 let point = geometry::lerp(seam.ends, share);
@@ -971,7 +1225,7 @@ impl Points<'_> {
                 if first.brick == second.brick {
                     continue;
                 }
-                if let Some((_, point)) = crossing(first.ends, second.ends) {
+                for (_, point) in path_crossings(&first.path, &second.path) {
                     let on = [
                         (self.seen[first.brick].index, first.piece),
                         (self.seen[second.brick].index, second.piece),
@@ -991,13 +1245,14 @@ impl Points<'_> {
                     continue;
                 }
                 let frame = &brick.placed.frame;
-                let ends = edge.ends.map(|end| frame.local(end));
-                for (face, _, point) in piercings(brick.look, &faces[position], ends) {
-                    let on = [
-                        (self.seen[edge.brick].index, edge.piece),
-                        (brick.index, face),
-                    ];
-                    self.add(Kind::Piercing, frame.point(point), &on, None);
+                for (ends, _) in edge.path.local_to(frame).segments() {
+                    for (face, _, point) in piercings(brick.look, &faces[position], ends) {
+                        let on = [
+                            (self.seen[edge.brick].index, edge.piece),
+                            (brick.index, brick.look.piece_at(face, point)),
+                        ];
+                        self.add(Kind::Piercing, frame.point(point), &on, None);
+                    }
                 }
             }
         }
@@ -1016,8 +1271,8 @@ impl Points<'_> {
             .chain(core::iter::once(1.0))
             .collect();
         for pair in stations.windows(2) {
-            let span = [pair[0], pair[1]].map(|share| geometry::lerp(edge.ends, share));
-            let middle = geometry::lerp(edge.ends, (pair[0] + pair[1]) / 2.0);
+            let span = [pair[0], pair[1]].map(|share| edge.path.point_at(share));
+            let middle = edge.path.point_at((pair[0] + pair[1]) / 2.0);
             self.add(Kind::Between, middle, &on, Some(span));
         }
     }
@@ -1146,7 +1401,7 @@ fn fractions(settings: &Snapping) -> Vec<(f64, Kind)> {
 
 /// How far `point` (in the vehicle) is from the mouse on the screen (pixels), if it's in front of
 /// the camera.
-fn from_mouse(view: &View, point: Vec3) -> Option<f32> {
+pub fn from_mouse(view: &View, point: Vec3) -> Option<f32> {
     let ray = &view.ray;
     let offset = geometry::sub(point, ray.origin);
     let along = geometry::dot(offset, ray.direction);
@@ -1234,7 +1489,7 @@ fn piercings(look: Look, faces: &[Face], ends: [Vec3; 2]) -> Vec<(Piece, f64, Ve
         .collect()
 }
 
-/// Where other bricks' edges and faces (with those kinds of crossings on) cross the edge `ends` (in
+/// Where other bricks' edges and faces (with those kinds of crossings on) cross the edge `path` (in
 /// the vehicle) of brick `index`: as shares of its length from its first end, in order, without its
 /// ends. Bricks `skip` says are left out.
 fn crossings(
@@ -1243,9 +1498,9 @@ fn crossings(
     models: bool,
     skip: impl Fn(&Placed) -> bool,
     index: usize,
-    ends: [Vec3; 2],
+    path: &Path,
 ) -> Vec<f64> {
-    let length = geometry::length(geometry::sub(ends[1], ends[0]));
+    let length = path.length();
     if length <= 0.0 {
         return Vec::new();
     }
@@ -1254,21 +1509,31 @@ fn crossings(
         if other == index || skip(placed) {
             continue;
         }
-        let ends = ends.map(|end| placed.frame.local(end));
-        if !geometry::segment_box(ends, &placed.bounds.grown(CROSSING_TOLERANCE)) {
+        let local = path.local_to(&placed.frame);
+        let segments = local.segments();
+        let reached = placed.bounds.grown(CROSSING_TOLERANCE);
+        if !segments
+            .iter()
+            .any(|&(ends, _)| geometry::segment_box(ends, &reached))
+        {
             continue;
         }
         let look = Look::of(placed, models);
         if settings.edge_intersections {
             for (_, edge) in look.edges() {
-                if let Some((share, _)) = crossing(ends, edge) {
-                    shares.push(share);
-                }
+                shares.extend(
+                    path_crossings(&local, &edge)
+                        .into_iter()
+                        .map(|(share, _)| share),
+                );
             }
         }
         if settings.face_intersections {
-            for (_, share, _) in piercings(look, &look.faces(), ends) {
-                shares.push(share);
+            let faces = look.faces();
+            for (ends, [from, to]) in &segments {
+                for (_, share, _) in piercings(look, &faces, *ends) {
+                    shares.push(from + share * (to - from));
+                }
             }
         }
     }

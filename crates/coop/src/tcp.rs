@@ -148,18 +148,25 @@ impl Connection {
         Ok(())
     }
 
-    /// Reads what arrived and appends the whole frames to `out`. An error closes the connection.
+    /// Reads what arrived and appends the whole frames to `out`. An error closes the connection,
+    /// after the frames that came before it (e.g. a leave, sent just before closing).
     fn read(&mut self, out: &mut Vec<(PeerId, Vec<u8>)>) -> io::Result<()> {
         let mut buffer = [0; 64 * 1024];
-        loop {
+        let ended = loop {
             match self.stream.read(&mut buffer) {
-                Ok(0) => return Err(ErrorKind::UnexpectedEof.into()),
+                Ok(0) => break Err(ErrorKind::UnexpectedEof.into()),
                 Ok(read) => self.received.extend_from_slice(&buffer[..read]),
-                Err(error) if error.kind() == ErrorKind::WouldBlock => break,
+                Err(error) if error.kind() == ErrorKind::WouldBlock => break Ok(()),
                 Err(error) if error.kind() == ErrorKind::Interrupted => {}
-                Err(error) => return Err(error),
+                Err(error) => break Err(error),
             }
-        }
+        };
+        self.frames(out)?;
+        ended
+    }
+
+    /// Appends the whole frames received to `out`.
+    fn frames(&mut self, out: &mut Vec<(PeerId, Vec<u8>)>) -> io::Result<()> {
         let mut start = 0;
         if self.peer.is_none() {
             let Some(handshake) = self.received.get(..12) else {
@@ -280,6 +287,24 @@ mod tests {
         }
         assert!(!host.is_connected(10));
         assert_eq!(host.take_lost(), [10]);
+    }
+
+    /// A joiner giving up sends a leave and closes at once: the host reads both.
+    #[test]
+    fn frames_before_a_close_arrive() {
+        let mut host = TcpTransport::listen(HOST, 0).unwrap();
+        let mut a = TcpTransport::connect(10, host.port().unwrap(), HOST, WAIT).unwrap();
+        a.send(HOST, b"bye", true);
+        drop(a);
+        // Closed before the host read anything: its first read gets the frame and the close.
+        std::thread::sleep(Duration::from_millis(50));
+        let mut got = Vec::new();
+        let start = std::time::Instant::now();
+        while host.take_lost().is_empty() {
+            assert!(start.elapsed() < WAIT, "the close wasn't noticed");
+            got.extend(host.receive());
+        }
+        assert_eq!(got, [(10, b"bye".to_vec())]);
     }
 
     #[test]

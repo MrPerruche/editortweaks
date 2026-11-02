@@ -6,41 +6,14 @@
 use std::cell::RefCell;
 use std::time::{Duration, Instant};
 
-use ::coop::{Event, PeerInfo, Session, transport::Transport};
+use ::coop::{Event, PeerInfo, Session};
 
 use super::log::coop_log;
-use crate::game::steam::Steam;
+use super::steam_link::SteamTransport;
+use crate::framework::timings;
 
-/// Our channel of Steam's messages ("ET"). The game itself talks over SteamSockets, not messages.
-const CHANNEL: i32 = 0x4554;
 /// How long the probe waits for its hello to itself.
 const SELF_SEND_WAIT: Duration = Duration::from_secs(15);
-
-/// Steam's messages as a coop transport. Only the peers the session expects get their sessions
-/// accepted, so strangers can't open one.
-struct SteamTransport {
-    steam: Steam,
-    expected: Vec<u64>,
-}
-
-impl Transport for SteamTransport {
-    fn send(&mut self, to: u64, bytes: &[u8], reliable: bool) {
-        if !self.steam.send(to, CHANNEL, bytes, reliable) {
-            coop_log!("Steam refused a message to {to}");
-        }
-    }
-
-    fn receive(&mut self) -> Vec<(u64, Vec<u8>)> {
-        for &peer in &self.expected {
-            self.steam.accept(peer);
-        }
-        // Steam only delivers from sessions we accepted or opened, i.e. expected peers; checking
-        // the sender anyway keeps that from depending on Steam's behaviour.
-        let mut messages = self.steam.receive(CHANNEL);
-        messages.retain(|(sender, _)| self.expected.contains(sender));
-        messages
-    }
-}
 
 struct Probe {
     session: Session,
@@ -63,49 +36,29 @@ thread_local! {
     static STATE: RefCell<State> = const { RefCell::new(State::NotStarted) };
 }
 
-/// Logs how Steam reaches `peer`, to see in game that the traffic is relayed.
-fn log_connection(steam: Steam, peer: u64) {
-    match steam.peer_connection(peer) {
-        Some(connection) => coop_log!(
-            "Steam connection to {peer}: state {}, relayed {}, relay {}, flags {:#x}",
-            connection.state,
-            connection.relayed,
-            connection.relay_pop.as_deref().unwrap_or("none"),
-            connection.flags
-        ),
-        None => coop_log!("Steam has no connection to {peer}"),
-    }
-}
-
 fn start(info: PeerInfo) -> State {
-    let steam = match Steam::get() {
-        Ok(steam) => steam,
+    let _span = timings::span("coop::probe::start");
+    // Relay only, before anything is sent: a peer must never learn our IP address. Without that
+    // guarantee coop stays off.
+    let mut transport = match SteamTransport::new(false) {
+        Ok(transport) => transport,
         Err(reason) => {
             coop_log!("Steam unavailable: {reason}");
             return State::Done;
         }
     };
-    // Before anything is sent: a peer must never learn our IP address, so Steam may only use
-    // Valve's relay. Without that guarantee coop stays off.
-    if steam.force_relay() {
-        coop_log!("Steam: direct connections disabled, relay only");
-    } else {
-        coop_log!("Steam refused relay-only mode: coop stays off, so no address can leak");
-        return State::Done;
-    }
-    let own_id = steam.own_id();
+    coop_log!("Steam: direct connections disabled, relay only");
+    let own_id = transport.steam.own_id();
     coop_log!(
         "Steam user {own_id} ({}); sending a hello to ourselves",
-        steam.own_name()
+        transport.steam.own_name()
     );
+    transport.expect(vec![own_id]);
     let mut session = Session::new(info);
     session.hello(own_id);
     State::Running(Box::new(Probe {
         session,
-        transport: SteamTransport {
-            steam,
-            expected: vec![own_id],
-        },
+        transport,
         own_id,
         sent_at: Instant::now(),
         answered: false,
@@ -130,7 +83,7 @@ pub fn tick(info: impl FnOnce() -> PeerInfo) {
                         info.mod_version,
                         info.game_version
                     );
-                    log_connection(probe.transport.steam, probe.own_id);
+                    probe.transport.log_connection(probe.own_id);
                 }
                 Event::BadMessage { peer, error } => {
                     coop_log!("unreadable Steam message from {peer}: {error}")
@@ -144,7 +97,7 @@ pub fn tick(info: impl FnOnce() -> PeerInfo) {
                 "no hello from ourselves after {} s: Steam's messages don't arrive",
                 SELF_SEND_WAIT.as_secs()
             );
-            log_connection(probe.transport.steam, probe.own_id);
+            probe.transport.log_connection(probe.own_id);
         }
         // Our hello's reply (a second hello) comes shortly after the first.
         if probe.answered && probe.sent_at.elapsed() > SELF_SEND_WAIT {

@@ -1,32 +1,38 @@
 //! The threads measuring bricks against the references ([`model_io::fit`]), so the game never waits
 //! on them: the game thread sends the references' triangles when they change and a job per brick
 //! to measure, and takes the results back when it builds their meshes. One thread receives the
-//! jobs and spreads each batch over a few more, which share the references.
+//! jobs and spreads them over a few more, which share the references.
+//!
+//! Each brick is measured twice ([`Stage`]): first a quick preview, so every brick has colors soon
+//! after a change, then finely. New jobs (a brick dragged, the references changed) always get their
+//! previews before any more bricks are refined, so the colors of what's being changed keep up.
 
 use std::collections::BTreeMap;
 use std::num::NonZeroUsize;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
-use model_io::fit::{self, Sampled, Surface};
+use model_io::fit::{self, Detail, Sampled, Surface};
 
 use crate::game::editor_object::Vector;
 use crate::math::{self, Quat};
+
+/// How many bricks each thread refines before the inbox is looked at again: the longest a new
+/// job waits is about that many fine measures.
+const REFINES_PER_LOOK: usize = 2;
 
 /// A brick's surface in its mesh's space (unscaled), wound the way the engine wants (front faces
 /// clockwise).
 pub struct Source {
     pub positions: Vec<[f32; 3]>,
     pub corners: Vec<[u32; 3]>,
-    /// Whether it's the brick's own surface (its complex collision), not a stand-in for it (its
-    /// simple shapes, a spinner swept again, its box).
-    pub exact: bool,
 }
 
 /// A brick to measure: its surface, scaled by `scale`, then placed at `location` turned by
 /// `rotation` (where its mesh component is, in the editor root's space like the references).
+#[derive(Clone)]
 pub struct Job {
     pub brick: usize,
     /// Which of the brick's jobs this is: results older than what's shown are thrown away.
@@ -37,11 +43,29 @@ pub struct Job {
     pub rotation: Vector,
 }
 
+/// Which measure of a job: the quick one comes first, and the fine one replaces it.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
+pub enum Stage {
+    Preview,
+    Fine,
+}
+
+impl Stage {
+    fn detail(self) -> &'static Detail {
+        match self {
+            Self::Preview => &Detail::PREVIEW,
+            Self::Fine => &Detail::FINE,
+        }
+    }
+}
+
 /// A brick measured: its surface, subdivided, with each vertex's distance in its U.
 pub struct Done {
     pub brick: usize,
     pub serial: u64,
-    pub sampled: Sampled,
+    pub stage: Stage,
+    /// `None` for a fine measure just like the preview, which then stays.
+    pub sampled: Option<Sampled>,
     pub took: Duration,
 }
 
@@ -102,66 +126,143 @@ impl Worker {
     }
 }
 
-fn run(inbox: &Receiver<Message>, outbox: &Sender<Done>, threads: usize) {
-    let mut surface = Surface::default();
-    while let Ok(first) = inbox.recv() {
-        // Everything waiting at once: the latest references, then the latest job of each brick
-        // (older ones would be thrown away anyway).
-        let mut jobs = BTreeMap::new();
-        for message in core::iter::once(first).chain(inbox.try_iter()) {
-            match message {
-                Message::References(triangles) => surface = Surface::new(&triangles),
-                Message::Measure(job) => {
-                    jobs.insert(job.brick, job);
-                }
+/// What's waiting to be measured, one job per brick (older ones would be thrown away anyway).
+#[derive(Default)]
+struct Queue {
+    surface: Surface,
+    previews: BTreeMap<usize, Job>,
+    /// Bricks whose preview was sent, with that preview: a fine measure just like it isn't sent.
+    refines: BTreeMap<usize, (Job, Sampled)>,
+}
+
+impl Queue {
+    fn is_empty(&self) -> bool {
+        self.previews.is_empty() && self.refines.is_empty()
+    }
+
+    fn take(&mut self, message: Message) {
+        match message {
+            Message::References(triangles) => {
+                self.surface = Surface::new(&triangles);
+                // Previewed against the old references: the game sends every brick again.
+                self.refines.clear();
+            }
+            Message::Measure(job) => {
+                self.refines.remove(&job.brick);
+                self.previews.insert(job.brick, job);
             }
         }
-        let jobs: Vec<Job> = jobs.into_values().collect();
-        if !measure_all(&jobs, &surface, outbox, threads) {
-            // The game side is gone.
+    }
+}
+
+fn run(inbox: &Receiver<Message>, outbox: &Sender<Done>, threads: usize) {
+    let mut queue = Queue::default();
+    loop {
+        if queue.is_empty() {
+            let Ok(message) = inbox.recv() else {
+                // The game side is gone.
+                return;
+            };
+            queue.take(message);
+        }
+        for message in inbox.try_iter() {
+            queue.take(message);
+        }
+        let game_side_there = if queue.previews.is_empty() {
+            refine_some(&mut queue, outbox, threads)
+        } else {
+            preview_all(&mut queue, outbox, threads)
+        };
+        if !game_side_there {
             return;
         }
     }
 }
 
-/// Measures `jobs` on up to `threads` threads, each taking the next job not taken yet, and sends
-/// the results as they're done. Whether the game side is still there to take them.
-fn measure_all(jobs: &[Job], surface: &Surface, outbox: &Sender<Done>, threads: usize) -> bool {
-    let next = AtomicUsize::new(0);
-    let measure_next = |outbox: Sender<Done>| {
-        while let Some(job) = jobs.get(next.fetch_add(1, Ordering::Relaxed)) {
-            let started = Instant::now();
-            let sampled = measure(job, surface);
-            let done = Done {
+/// Previews every brick waiting for it, and queues them to be refined. Whether the game side is
+/// still there.
+fn preview_all(queue: &mut Queue, outbox: &Sender<Done>, threads: usize) -> bool {
+    let jobs: Vec<Job> = std::mem::take(&mut queue.previews).into_values().collect();
+    let previewed = Mutex::new(Vec::with_capacity(jobs.len()));
+    let surface = &queue.surface;
+    let there = in_parallel(&jobs, threads, |job| {
+        let started = Instant::now();
+        let sampled = measure(job, surface, Stage::Preview);
+        previewed
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push((job.clone(), sampled.clone()));
+        outbox
+            .send(Done {
                 brick: job.brick,
                 serial: job.serial,
-                sampled,
+                stage: Stage::Preview,
+                sampled: Some(sampled),
                 took: started.elapsed(),
-            };
-            if outbox.send(done).is_err() {
-                return false;
-            }
-        }
-        true
-    };
-    std::thread::scope(|scope| {
-        let helpers: Vec<_> = (1..threads.min(jobs.len()))
-            .map(|_| {
-                let outbox = outbox.clone();
-                scope.spawn(move || measure_next(outbox))
             })
-            .collect();
-        let mine = measure_next(outbox.clone());
-        // Every helper is joined, even after one found the game side gone.
-        let helpers_ok: Vec<bool> = helpers
-            .into_iter()
-            .map(|helper| helper.join().unwrap_or(false))
-            .collect();
-        mine && helpers_ok.into_iter().all(|ok| ok)
+            .is_ok()
+    });
+    let previewed = previewed
+        .into_inner()
+        .unwrap_or_else(PoisonError::into_inner);
+    for (job, sampled) in previewed {
+        queue.refines.insert(job.brick, (job, sampled));
+    }
+    there
+}
+
+/// Refines a few of the bricks waiting for it ([`REFINES_PER_LOOK`] per thread), so new jobs
+/// don't wait long. Whether the game side is still there.
+fn refine_some(queue: &mut Queue, outbox: &Sender<Done>, threads: usize) -> bool {
+    let batch: Vec<(Job, Sampled)> = (0..threads * REFINES_PER_LOOK)
+        .map_while(|_| queue.refines.pop_first().map(|(_, waiting)| waiting))
+        .collect();
+    let surface = &queue.surface;
+    in_parallel(&batch, threads, |(job, preview)| {
+        let started = Instant::now();
+        let sampled = measure(job, surface, Stage::Fine);
+        outbox
+            .send(Done {
+                brick: job.brick,
+                serial: job.serial,
+                stage: Stage::Fine,
+                sampled: (sampled != *preview).then_some(sampled),
+                took: started.elapsed(),
+            })
+            .is_ok()
     })
 }
 
-fn measure(job: &Job, surface: &Surface) -> Sampled {
+/// Calls `work` with every item on up to `threads` threads, each taking the next item not taken
+/// yet, until `work` returns false (the game side is gone). Whether it never did.
+fn in_parallel<T: Sync>(items: &[T], threads: usize, work: impl Fn(&T) -> bool + Sync) -> bool {
+    let next = AtomicUsize::new(0);
+    let gone = AtomicBool::new(false);
+    let work_through = || {
+        while !gone.load(Ordering::Relaxed)
+            && let Some(item) = items.get(next.fetch_add(1, Ordering::Relaxed))
+        {
+            if !work(item) {
+                gone.store(true, Ordering::Relaxed);
+            }
+        }
+    };
+    std::thread::scope(|scope| {
+        let helpers: Vec<_> = (1..threads.min(items.len()))
+            .map(|_| scope.spawn(work_through))
+            .collect();
+        work_through();
+        // Every helper is joined; one that panicked counts as the game side gone.
+        for helper in helpers {
+            if helper.join().is_err() {
+                gone.store(true, Ordering::Relaxed);
+            }
+        }
+    });
+    !gone.load(Ordering::Relaxed)
+}
+
+fn measure(job: &Job, surface: &Surface, stage: Stage) -> Sampled {
     let rotation = Quat::from_rotator(math::widen(job.rotation));
     let location = math::widen(job.location);
     // As the engine places the brick's mesh: `parent = Rotate(scale * local) + location`.
@@ -174,5 +275,6 @@ fn measure(job: &Job, surface: &Surface) -> Sampled {
         &job.source.corners,
         &to_reference,
         surface,
+        stage.detail(),
     )
 }

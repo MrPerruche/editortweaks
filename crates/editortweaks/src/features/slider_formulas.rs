@@ -19,7 +19,7 @@ use core::ffi::c_void;
 use std::cell::RefCell;
 use std::sync::OnceLock;
 
-use crate::framework::hook;
+use crate::framework::{hook, timings};
 use crate::game::numeric_property::{self, NumericValue};
 use crate::game::property_widget::{self, PropertyWidgets, SliderComponent};
 use crate::game::reflection::NativeThunk;
@@ -125,6 +125,7 @@ unsafe extern "C" fn on_text_changed(
     stack: *mut c_void,
     result: *mut c_void,
 ) {
+    let _span = timings::span("slider_formulas::on_text_changed");
     let original = *ON_TEXT_CHANGED.get().expect("hook recorded before use");
     if let Some(sliders) = SLIDERS.get() {
         // SAFETY: the thunk's own arguments: `context` is the slider, `stack` the call's frame.
@@ -142,7 +143,11 @@ unsafe extern "C" fn on_text_changed(
         per_object: None,
     }));
     // SAFETY: forwards the caller's arguments unchanged.
-    unsafe { original(context, stack, result) };
+    unsafe {
+        timings::game("UBrickSliderWidget::execOnTextChanged", || {
+            original(context, stack, result)
+        })
+    };
     TYPING.replace(previous);
 }
 
@@ -152,9 +157,14 @@ unsafe extern "C" fn from_string(
     text: *const FString,
     existing: *const f32,
 ) -> *mut OptionalF32 {
+    let _span = timings::span("slider_formulas::from_string");
     let original = *FROM_STRING.get().expect("hook recorded before use");
     // SAFETY: forwards the caller's arguments, with only the text possibly replaced.
-    let call = |text: *const FString| unsafe { original(interface, out, text, existing) };
+    let call = |text: *const FString| unsafe {
+        timings::game(slider_text::FROM_STRING.name, || {
+            original(interface, out, text, existing)
+        })
+    };
 
     let slider = TYPING.with_borrow(|typing| typing.as_ref().map(|typing| typing.slider));
     let (Some(slider), Some(sliders)) = (slider, SLIDERS.get()) else {
@@ -254,7 +264,11 @@ impl PerObject {
         };
         // SAFETY: the original parser with its own object, as OnTextChanged calls it; it only
         // reads the string and the existing value.
-        unsafe { original(self.interface, &mut out, native.as_ptr(), &stored) };
+        unsafe {
+            timings::game(slider_text::FROM_STRING.name, || {
+                original(self.interface, &mut out, native.as_ptr(), &stored)
+            })
+        };
         (out.is_set && !out.value.is_nan()).then(|| out.value / self.factor)
     }
 }

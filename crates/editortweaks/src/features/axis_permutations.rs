@@ -30,7 +30,7 @@ use brickrust::ue::fname::FName;
 
 use super::{menu_buttons, property_limits};
 use crate::framework::hook;
-use crate::framework::settings::Toggle;
+use crate::framework::timings;
 use crate::game::kismet;
 use crate::game::menu::ButtonPanels;
 use crate::game::numeric_property::{self, NumericValue};
@@ -44,16 +44,6 @@ use crate::game::weak_object::WeakObject;
 use crate::prelude::*;
 
 pub struct AxisPermutations;
-
-/// Whether rows of two or three values get the button.
-pub static ORDER_BUTTON: Toggle = Toggle::new(
-    "ValueOrderButton",
-    "Value order button",
-    "Rows of two or three values (a brick's size, position, ...) get a button before the lock that \
-     puts the values in their next order: clicking on goes through every order and back to the \
-     first. With several bricks selected, each brick's values move alike.",
-    true,
-);
 
 /// The button's icon (the units button has `T_SwitchMode`).
 const ICON: &str = "/Game/BrickRigs/UI/Textures/Icons/T_Retry.T_Retry";
@@ -164,6 +154,7 @@ fn start() -> Result<(), String> {
 /// aren't alike (a time and a percentage, `Number::alike`) gets no buttons for several values: the
 /// Blueprint is told it has one, which only decides the lock.
 unsafe extern "C" fn update_numeric_property(row: *mut c_void, value_type: u8, num_axes: i32) {
+    let _span = timings::span("axis_permutations::update_numeric_property");
     let original = *ORIGINAL.get().expect("hook recorded before use");
     let unalike = property_reflection::number_shown().is_some_and(|number| !number.alike());
     let num_axes = if unalike { 1 } else { num_axes };
@@ -173,7 +164,11 @@ unsafe extern "C" fn update_numeric_property(row: *mut c_void, value_type: u8, n
         unsafe { game.row_updating(row.cast(), num_axes) };
     }
     // SAFETY: forwards the caller's arguments.
-    unsafe { original(row, value_type, num_axes) };
+    unsafe {
+        timings::game(property_widget::UPDATE_NUMERIC_PROPERTY.name, || {
+            original(row, value_type, num_axes)
+        })
+    };
 }
 
 /// A menu button was clicked (`menu_buttons`): ours puts its row's values in their next order.
@@ -211,7 +206,7 @@ impl Game {
             !shown.row.is(row) && shown.row.get().is_some() && shown.button.get().is_some()
         });
         let components = usize::try_from(num_axes).unwrap_or(0);
-        if !ORDER_BUTTON.get() || !COMPONENTS.contains(&components) {
+        if !COMPONENTS.contains(&components) {
             return;
         }
         // SAFETY: per the contract; the panel is live, and so is the button it makes.

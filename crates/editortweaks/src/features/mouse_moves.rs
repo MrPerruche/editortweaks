@@ -13,7 +13,7 @@ use std::sync::{Mutex, OnceLock, PoisonError};
 
 use brickrust::ue::coreuobject::UObjectBase;
 
-use crate::framework::hook;
+use crate::framework::{hook, timings};
 use crate::game::editor_input::{self, Axis, MouseMoveAxes};
 use crate::game::reflection::NativeThunk;
 
@@ -170,21 +170,27 @@ unsafe extern "C" fn mouse_move_right(
     stack: *mut c_void,
     result: *mut c_void,
 ) {
+    let _span = timings::span("mouse_moves::mouse_move_right");
     let original = *MOUSE_MOVE_RIGHT.get().expect("hook recorded before use");
     // SAFETY: the thunk's own arguments, passed on.
     unsafe {
         handle(Direction::Right, context, stack, result, || {
-            original(context, stack, result)
+            timings::game("UBaseInputComponent::execAxis_MouseMoveRight", || {
+                original(context, stack, result)
+            })
         })
     }
 }
 
 unsafe extern "C" fn mouse_move_up(context: *mut c_void, stack: *mut c_void, result: *mut c_void) {
+    let _span = timings::span("mouse_moves::mouse_move_up");
     let original = *MOUSE_MOVE_UP.get().expect("hook recorded before use");
     // SAFETY: the thunk's own arguments, passed on.
     unsafe {
         handle(Direction::Up, context, stack, result, || {
-            original(context, stack, result)
+            timings::game("UBaseInputComponent::execAxis_MouseMoveUp", || {
+                original(context, stack, result)
+            })
         })
     }
 }

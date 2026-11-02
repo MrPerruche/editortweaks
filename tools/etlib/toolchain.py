@@ -25,17 +25,21 @@ LOCAL_DIR = PROJECT_ROOT / ".local"
 VENV_DIR = PROJECT_ROOT / ".venv"
 
 
-def build_env() -> dict[str, str]:
-    """Environment for cargo: MinGW first on PATH (provides `dlltool` + `as` for raw-dylib)."""
+def build_env(expires: int | None = None) -> dict[str, str]:
+    """Environment for cargo: MinGW first on PATH (provides `dlltool` + `as` for raw-dylib), and
+    `ET_EXPIRES` (seconds since 1970) for a test build that stops loading then, never inherited."""
     if not (MINGW_BIN / "as.exe").exists():
         raise SystemExit(f"MinGW not found at {MINGW_BIN}. Run: python tools/et.py setup")
     env = dict(os.environ)
     env["PATH"] = f"{MINGW_BIN}{os.pathsep}{env.get('PATH', '')}"
+    env.pop("ET_EXPIRES", None)
+    if expires is not None:
+        env["ET_EXPIRES"] = str(expires)
     return env
 
 
-def cargo(*args: str) -> None:
-    result = subprocess.run(["cargo", *args], cwd=PROJECT_ROOT, env=build_env())
+def cargo(*args: str, expires: int | None = None) -> None:
+    result = subprocess.run(["cargo", *args], cwd=PROJECT_ROOT, env=build_env(expires))
     if result.returncode != 0:
         raise SystemExit(result.returncode)
 

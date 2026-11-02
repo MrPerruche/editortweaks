@@ -700,6 +700,7 @@ fn session_of(
             HostSettings {
                 code: "c".into(),
                 max_members: 8,
+                approve: false,
             },
             bricks,
         )
@@ -730,6 +731,7 @@ fn run(seed: u64, guests: usize, steps: usize) {
     let settings = HostSettings {
         code: "code".into(),
         max_members: 8,
+        approve: false,
     };
     let ids = players[0]
         .session
@@ -893,6 +895,7 @@ fn same_property_last_commit_wins() {
             HostSettings {
                 code: "c".into(),
                 max_members: 4,
+                approve: false,
             },
             1,
         )
@@ -944,6 +947,7 @@ fn order_converges_without_concurrent_creates() {
             HostSettings {
                 code: "c".into(),
                 max_members: 4,
+                approve: false,
             },
             4,
         )
@@ -1138,6 +1142,7 @@ fn resync_after_missed_change() {
             HostSettings {
                 code: "c".into(),
                 max_members: 4,
+                approve: false,
             },
             3,
         )
@@ -1159,6 +1164,85 @@ fn resync_after_missed_change() {
     assert!(players[1].editor.state() == players[0].editor.state());
 }
 
+/// The subhost leaves its editor (to test the vehicle): members go on editing, the subhost's
+/// session commits their edits, and the mod keeps the edits it can't make yet. Back in the editor
+/// with the same vehicle, it makes them in order and everyone agrees again, with no snapshot.
+#[test]
+fn subhost_catches_up_after_leaving_the_editor() {
+    let (net, mut players, ids) = session_of(5, 2, 4);
+    players[0].busy = true;
+    // Kept as the mod keeps them while away: the events for the editor, in order.
+    let mut missed = Vec::new();
+    edit(
+        &mut players,
+        1,
+        vec![Op::Move {
+            id: ids[0],
+            transform: place(3.0),
+        }],
+    );
+    edit(&mut players, 2, vec![Op::Delete { id: ids[1] }]);
+    for _ in 0..4 {
+        net.borrow_mut().deliver_all();
+        let host = &mut players[0];
+        transport::pump(&mut host.session, &mut host.transport);
+        missed.extend(host.session.take_events());
+        transport::pump(&mut host.session, &mut host.transport);
+        for p in &mut players[1..] {
+            p.pump();
+        }
+    }
+    assert!(missed.iter().any(|e| matches!(e, Event::Apply { .. })));
+    players[0].busy = false;
+    for event in missed {
+        if let Event::Apply { ops, .. } = event {
+            ops.iter().for_each(|op| players[0].editor.apply(op));
+        }
+    }
+    settle(&net, &mut players);
+    all_equal(&players);
+    assert_eq!(players[0].editor.bricks.len(), 3);
+}
+
+/// The subhost shares another vehicle: every member gets it, edits go on with its new ids, and
+/// an edit of the old vehicle still on its way does nothing.
+#[test]
+fn rehost_replaces_the_vehicle_everywhere() {
+    let (net, mut players, ids) = session_of(6, 2, 3);
+    // On its way when the subhost shares the other vehicle.
+    edit(
+        &mut players,
+        1,
+        vec![Op::Move {
+            id: ids[0],
+            transform: place(9.0),
+        }],
+    );
+    let mut rng = Rng(77);
+    players[0].editor = starting_vehicle(&mut rng, 5);
+    let new = players[0].session.rehost(5).unwrap();
+    assert!(new.iter().all(|id| !ids.contains(id)));
+    for ((id, _), new) in players[0].editor.bricks.iter_mut().zip(&new) {
+        *id = *new;
+    }
+    settle(&net, &mut players);
+    for p in &players[1..] {
+        assert_eq!(p.editor.ids(), new);
+    }
+    edit(
+        &mut players,
+        2,
+        vec![Op::Move {
+            id: new[4],
+            transform: place(1.0),
+        }],
+    );
+    settle(&net, &mut players);
+    for p in &players[1..] {
+        assert!(p.editor.state() == players[0].editor.state());
+    }
+}
+
 #[test]
 fn big_vehicle_snapshot_in_parts() {
     let net = MemoryNet::new();
@@ -1174,6 +1258,7 @@ fn big_vehicle_snapshot_in_parts() {
             HostSettings {
                 code: "c".into(),
                 max_members: 4,
+                approve: false,
             },
             n,
         )
@@ -1446,6 +1531,7 @@ fn hosting_with(peer: PeerId) -> (Session, SnapshotRequest, CoopId) {
     let settings = HostSettings {
         code: "c".into(),
         max_members: 8,
+        approve: false,
     };
     let ids = host.host(1, "h".into(), settings, 1).unwrap();
     host.receive(peer, &join("c").encode(0));
@@ -1583,6 +1669,7 @@ fn guessing_the_code_runs_out() {
     let settings = HostSettings {
         code: "c".into(),
         max_members: 8,
+        approve: false,
     };
     host.host(1, "h".into(), settings, 0).unwrap();
     for _ in 0..coop::limits::rates::WRONG_CODES {

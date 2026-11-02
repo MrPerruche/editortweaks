@@ -15,7 +15,7 @@ use core::ffi::c_void;
 use std::cell::Cell;
 use std::sync::OnceLock;
 
-use crate::framework::hook;
+use crate::framework::{hook, timings};
 use crate::game::slider::{self, UpdateSliderValueFn, ValueFields};
 use crate::game::slider_text::ExactText;
 use crate::game::text::{self, AsNumberFn, NumberFormattingOptions};
@@ -102,13 +102,18 @@ unsafe extern "C" fn update_slider_value(
     use_given_focus: usize,
     focused: usize,
 ) {
+    let _span = timings::span("precise_sliders::update_slider_value");
     let original = *UPDATE_SLIDER_VALUE.get().expect("hook recorded before use");
     let previous = SHOWING.replace(Some(Showing {
         slider: this,
         label: false,
     }));
     // SAFETY: forwards the caller's arguments unchanged.
-    unsafe { original(this, use_given_focus, focused) };
+    unsafe {
+        timings::game(slider::UPDATE_SLIDER_VALUE.name, || {
+            original(this, use_given_focus, focused)
+        })
+    };
     SHOWING.set(previous);
 }
 
@@ -121,6 +126,7 @@ unsafe extern "C" fn number_to_text_detour(
     always_sign: usize,
     zero_as_unlimited: usize,
 ) -> *mut c_void {
+    let _span = timings::span("precise_sliders::number_to_text_detour");
     let original = *NUMBER_TO_TEXT.get().expect("hook recorded before use");
     let showing = SHOWING.get();
     if let Some(showing) = showing {
@@ -131,15 +137,17 @@ unsafe extern "C" fn number_to_text_detour(
     }
     // SAFETY: forwards the caller's arguments unchanged.
     let result = unsafe {
-        original(
-            out,
-            value,
-            value_type,
-            max_fractional_digits,
-            show_unit,
-            always_sign,
-            zero_as_unlimited,
-        )
+        timings::game(ui_library::NUMBER_TO_TEXT.name, || {
+            original(
+                out,
+                value,
+                value_type,
+                max_fractional_digits,
+                show_unit,
+                always_sign,
+                zero_as_unlimited,
+            )
+        })
     };
     SHOWING.set(showing);
     result
@@ -151,10 +159,13 @@ unsafe extern "C" fn as_number_detour(
     options: *const NumberFormattingOptions,
     culture: *const c_void,
 ) -> *mut c_void {
+    let _span = timings::span("precise_sliders::as_number_detour");
     let original = *AS_NUMBER.get().expect("hook recorded before use");
     // SAFETY: forwards the caller's arguments, with only the value and options possibly replaced.
     let call = |value: f32, options: *const NumberFormattingOptions| unsafe {
-        original(out, value, options, culture)
+        timings::game(text::AS_NUMBER_FLOAT.name, || {
+            original(out, value, options, culture)
+        })
     };
 
     let (Some(showing), Some(sliders)) = (SHOWING.get(), SLIDERS.get()) else {

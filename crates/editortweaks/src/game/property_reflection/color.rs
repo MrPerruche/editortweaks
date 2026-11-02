@@ -16,6 +16,7 @@ use std::sync::OnceLock;
 use super::{FIELDS, Property, RawArray, Value};
 use crate::framework::hook;
 use crate::framework::sig::{CodeShape, FunctionSig, VtableSig, direct_calls};
+use crate::framework::timings;
 
 /// A color shown as the game's color picker. Its functions run on the game thread, whenever a
 /// panel lists the row or changes it: while a slider or the wheel is dragged, every frame.
@@ -174,12 +175,13 @@ unsafe fn ours(info: *const EditInfo) -> Option<(&'static Property, &'static dyn
 }
 
 unsafe extern "C" fn get_value(info: *const EditInfo, out: *mut FColor) -> bool {
+    let _span = timings::span("game::property_reflection::color::get_value");
     // SAFETY: the game passes its edit info and room for a color.
     unsafe {
         let Some((_, color)) = ours(info) else {
             return ORIGINAL_GET
                 .get()
-                .is_some_and(|original| original(info, out));
+                .is_some_and(|original| timings::game(GET_VALUE.name, || original(info, out)));
         };
         let [r, g, b, a] = color.rgba();
         let a = if color.has_alpha() { a } else { u8::MAX };
@@ -194,11 +196,14 @@ unsafe extern "C" fn write_value(
     event: u8,
     value: *const FColor,
 ) {
+    let _span = timings::span("game::property_reflection::color::write_value");
     // SAFETY: the game passes its edit info and the color picked.
     unsafe {
         let Some((property, color)) = ours(info) else {
             if let Some(original) = ORIGINAL_WRITE.get() {
-                original(info, controller, event, value);
+                timings::game(WRITE_VALUE.name, || {
+                    original(info, controller, event, value)
+                });
             }
             return;
         };
