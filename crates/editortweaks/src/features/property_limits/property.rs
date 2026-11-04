@@ -13,6 +13,7 @@ use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use super::limits::{self, Edit, Limits, Rule};
+use super::rules;
 use crate::features::{axis_permutations, slider_drag, slider_formulas};
 use crate::framework::{hook, timings};
 use crate::game::numeric_property::{
@@ -112,6 +113,13 @@ unsafe extern "C" fn clamp_value_detour(
     if !super::slider::active() || !all_finite(input) {
         return call_original();
     }
+    // SAFETY: the container of this ClampValue call, on the game thread (UI code runs there).
+    if !unsafe { super::scope::lifts(container) } {
+        let result = call_original();
+        // SAFETY: `out` is the caller's value buffer, just filled in by the original.
+        slider_drag::stored(input, unsafe { &*out });
+        return result;
+    }
     warn_if_range_overridden(property);
 
     let previous = CLAMPING.replace(Some(Clamping {
@@ -122,6 +130,17 @@ unsafe extern "C" fn clamp_value_detour(
     }));
     let result = call_original();
     let clamping = CLAMPING.replace(previous);
+
+    // This row has a range of its own, which grows with the thruster's size, and no rule can name
+    // it: it edits no reflected property.
+    // SAFETY: `property` is this call's numeric property, and `out` the caller's value buffer, just
+    // filled in by the original.
+    unsafe {
+        if numeric_property::is_row_type(property, rules::THRUST_FORCE_ROW) {
+            let force = &mut (*out).data[0];
+            *force = force.clamp(-rules::MAX_THRUST_FORCE, rules::MAX_THRUST_FORCE);
+        }
+    }
 
     // `GetValueRange` isn't called when the property doesn't clamp (its "don't clamp" attribute).
     if let Some(Resolved { edit, limits, rule }) = clamping.and_then(|c| c.resolved) {
@@ -167,7 +186,10 @@ unsafe extern "C" fn get_value_range_detour(
     if panel {
         // SAFETY: the arguments of this GetValueRange call, and the property's own range for them,
         // just filled in by the original.
-        unsafe { super::highlight::on_panel_range(property, container, &*out) };
+        unsafe {
+            super::scope::on_panel_range(container);
+            super::highlight::on_panel_range(property, container, &*out);
+        }
     }
     result
 }

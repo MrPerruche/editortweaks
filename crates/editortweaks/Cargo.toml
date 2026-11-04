@@ -11,7 +11,7 @@ publish.workspace = true
 crate-type = ["cdylib"]
 
 [features]
-# What only coop testing needs: the drift key, the local test (two games on one PC) and the
+# What only coop testing needs: the local test (two games on one PC) and the
 # Steam self-send probe. `et.py build --coop-test`.
 coop-test = []
 

@@ -824,10 +824,10 @@ fn near<'a>(
             continue;
         }
         let local = placed.frame.local_ray(ray);
-        // Its box grown by the reach at its far end.
+        // Its box grown by the reach at its far end (the camera may be inside that).
         let (center, radius) = sphere(placed);
         let far = geometry::length(geometry::sub(center, ray.origin)) + radius;
-        if geometry::ray_box(&local, &placed.bounds.grown(reach * far)).is_none() {
+        if !geometry::ray_meets_box(&local, &placed.bounds.grown(reach * far)) {
             continue;
         }
         let look = Look::of(placed, models);

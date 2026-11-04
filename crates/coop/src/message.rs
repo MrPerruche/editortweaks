@@ -14,7 +14,7 @@ pub type PeerId = u64;
 
 pub const MAGIC: [u8; 2] = *b"ET";
 /// Bumped whenever a message changes.
-pub const PROTOCOL: u16 = 6;
+pub const PROTOCOL: u16 = 7;
 /// magic + protocol + kind + session.
 pub const HEADER_LEN: usize = 2 + 2 + 1 + 4;
 
@@ -22,6 +22,8 @@ pub mod caps {
     pub const NAME: usize = 64;
     pub const CODE: usize = 32;
     pub const VERSION: usize = 64;
+    /// What a subhost's player gave as the reason of a ban, in bytes: cut to it when banning.
+    pub const BAN_REASON: usize = 200;
     pub const MEMBERS: usize = 256;
     pub const SELECTION: usize = 4096;
     /// Unpacked snapshot (`SaveToArchive` bytes).
@@ -52,7 +54,7 @@ pub struct Member {
     pub name: String,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RefuseReason {
     WrongCode,
     /// The subhost said no.
@@ -62,9 +64,11 @@ pub enum RefuseReason {
     Full,
     /// Not hosting (any more).
     NotHosting,
-    /// The subhost banned us, for this many more minutes.
+    /// The subhost banned us, for this many more minutes (`u16::MAX`: at least that many), for
+    /// the reason its player gave (may be empty).
     Banned {
         minutes: u16,
+        reason: String,
     },
 }
 
@@ -204,9 +208,10 @@ impl Message {
                 RefuseReason::GameVersion => w.u8(2),
                 RefuseReason::Full => w.u8(3),
                 RefuseReason::NotHosting => w.u8(4),
-                RefuseReason::Banned { minutes } => {
+                RefuseReason::Banned { minutes, reason } => {
                     w.u8(5);
                     w.u16(*minutes);
+                    w.str(reason);
                 }
             },
             Self::Members(members) => {
@@ -331,7 +336,10 @@ impl Message {
                 2 => RefuseReason::GameVersion,
                 3 => RefuseReason::Full,
                 4 => RefuseReason::NotHosting,
-                5 => RefuseReason::Banned { minutes: r.u16()? },
+                5 => RefuseReason::Banned {
+                    minutes: r.u16()?,
+                    reason: r.str("ban reason", caps::BAN_REASON)?,
+                },
                 tag => {
                     return Err(DecodeError::BadTag {
                         what: "refuse reason",
@@ -504,7 +512,10 @@ mod tests {
             },
             Message::JoinAccepted { slot: 3 },
             Message::JoinRefused(RefuseReason::Full),
-            Message::JoinRefused(RefuseReason::Banned { minutes: 600 }),
+            Message::JoinRefused(RefuseReason::Banned {
+                minutes: 600,
+                reason: "griefing".into(),
+            }),
             Message::Invite {
                 name: "Perru".into(),
             },

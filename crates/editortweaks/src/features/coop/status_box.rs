@@ -46,7 +46,7 @@ thread_local! {
 /// What the box says for `status`, and whether in red.
 fn label(status: &Status) -> (&'static str, bool) {
     match status.doing {
-        Doing::Alone => ("PRIVATE", false), // TODO: Change to OFFLINE after Nov. 6
+        Doing::Alone => ("OFFLINE", false),
         Doing::Hosting if status.elsewhere => (BACKGROUND, true),
         Doing::Hosting => ("HOSTING", false),
         Doing::Asking(_) => ("JOINING", false),

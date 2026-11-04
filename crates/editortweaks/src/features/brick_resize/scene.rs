@@ -77,7 +77,8 @@ pub struct Pointed {
 
 /// How the mouse points at a brick it may pick.
 enum Near {
-    /// The ray enters its box through `face`, `distance` along.
+    /// The ray goes through `face` of its box, `distance` along: entering it, or leaving it when
+    /// the camera is inside.
     Box { face: Part, distance: f64 },
     /// The mouse is on `piece`, at `point`: on its model, or beside its box or model.
     At { piece: Piece, point: Vec3 },
@@ -136,11 +137,16 @@ impl Scene {
     /// What the mouse points at: a part of a box the ray enters ([`parts::part_under`]), or an
     /// edge or corner of a box the mouse is just beside ([`parts::beside`]); with `models`, the
     /// same on bricks' models instead of their boxes where they have one (see
-    /// [`BrickModel::pointed`]). The bricks `preferred` says come first; then the nearest along the
-    /// ray, where a brick the ray meets goes ahead of edges beside others less than
-    /// [`parts::EDGE_PIXELS`] in front of it (an edge two neighbors share is the one under the
-    /// mouse's). `depth` skips that many of them, to reach bricks behind (back to the first past
-    /// the last). Bricks `skip` says are left out; `project` shows a point of the vehicle on screen.
+    /// [`BrickModel::pointed`]). With the camera inside a box (the room in a giant brick's box, or
+    /// beside a slope in it, where its mesh still shows), the mouse is on the side the ray leaves
+    /// through.
+    ///
+    /// The bricks `preferred` says come first; then those the camera isn't inside the box of (it
+    /// looks through such a brick at what's behind); then the nearest along the ray, where a brick
+    /// the ray meets goes ahead of edges beside others less than [`parts::EDGE_PIXELS`] in front of
+    /// it (an edge two neighbors share is the one under the mouse's). `depth` skips that many of
+    /// them, to reach bricks behind (back to the first past the last). Bricks `skip` says are left
+    /// out; `project` shows a point of the vehicle on screen.
     pub fn pick(
         &self,
         view: &View,
@@ -151,9 +157,9 @@ impl Scene {
         project: impl Fn(Vec3) -> Option<[f32; 2]>,
     ) -> Option<Pointed> {
         let (ray, mouse, pixels) = (&view.ray, view.mouse, view.pixels);
-        // Each brick the mouse may point at: its rank (not preferred, distance along the ray:
-        // lowest first; `false` comes before `true`), the brick, how.
-        let mut found: Vec<((bool, f64), usize, Near)> = Vec::new();
+        // Each brick the mouse may point at: its rank (not preferred, the camera inside its box,
+        // distance along the ray: lowest first; `false` comes before `true`), the brick, how.
+        let mut found: Vec<((bool, bool, f64), usize, Near)> = Vec::new();
         let edge = f64::from(parts::EDGE_PIXELS) * pixels.per_distance;
         for (index, placed) in self.bricks.iter().enumerate() {
             if skip(placed) {
@@ -167,10 +173,12 @@ impl Scene {
                 geometry::length(geometry::sub(placed.bounds.max, placed.bounds.min)) / 2.0;
             let far = geometry::length(geometry::sub(center, ray.origin)) + radius;
             let margin = edge * far;
-            if geometry::ray_box(&local, &placed.bounds.grown(margin)).is_none() {
+            // The camera may be inside this margin (the bigger the brick, the wider it is).
+            if !geometry::ray_meets_box(&local, &placed.bounds.grown(margin)) {
                 continue;
             }
             let model = placed.shown_model(models);
+            let from_inside = geometry::ray_out_of_box(&local, &placed.bounds);
             let (distance, near) = if let Some(model) = model {
                 let Some(pointing) = model.pointed(&local, &local_pixels(&placed.frame, &pixels))
                 else {
@@ -197,7 +205,7 @@ impl Scene {
                     }
                 }
             } else {
-                match geometry::ray_box(&local, &placed.bounds) {
+                match geometry::ray_box(&local, &placed.bounds).or(from_inside) {
                     Some((distance, axis, positive)) => {
                         let ahead = edge * distance;
                         let face = Part::face(axis, positive);
@@ -216,7 +224,8 @@ impl Scene {
                     }
                 }
             };
-            found.push(((!preferred(placed), distance), index, near));
+            let inside = model.is_none() && from_inside.is_some();
+            found.push(((!preferred(placed), inside, distance), index, near));
         }
         if found.is_empty() {
             return None;

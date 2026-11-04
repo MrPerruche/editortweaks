@@ -1,12 +1,12 @@
 //! Coop building: several players editing one vehicle (`docs/re/coop/`). A beta.
-//! What only testing needs (the local test, the drift key, the probe) is in `coop-test` builds
+//! What only testing needs (the local test, the probe) is in `coop-test` builds
 //! only (`--coop-test`). The protocol and the session are the `coop` crate; this is the editor side.
 //!
 //! The coop page (`ui`; Editor tweaks, Coop... in the editor's top bar) says what the player wants,
 //! kept across editors until it's done:
 //! - Host: Steam friends playing Brick Rigs may ask to join the vehicle in the editor
-//!   (`steam_link`); the player accepts or refuses each one on the page or with the accept and
-//!   refuse keys, told so by a HUD notification.
+//!   (`steam_link`); the player accepts or refuses each one on the page, told so by a HUD
+//!   notification.
 //! - Join a friend: the page lists the friends answering our hellos as hosting; the one picked is
 //!   asked to let us in, and its vehicle then replaces ours (saved first, `backup`).
 //! - With the local test setting ([`local_test`], test builds), both link two game instances on one PC over
@@ -33,8 +33,7 @@
 //! Every few seconds the subhost describes its editor in short (`coop::audit`: the brick count, the
 //! object order, digests of some bricks going round the vehicle, those edited lately first). A
 //! member at the same commit with nothing of its own on the way compares its editor: bricks that
-//! differ ask for a snapshot, an order that differs asks for the subhost's order. The drift key
-//! (`drift`) makes a member differ on purpose, to see that work.
+//! differ ask for a snapshot, an order that differs asks for the subhost's order.
 //!
 //! Each editor tick, while the editor is in its default mode (not moving or placing bricks):
 //! finished local edits go to the session, then what arrived is applied, then snapshot (and
@@ -48,8 +47,6 @@ mod cameras;
 mod changes;
 mod checks;
 mod dialogs;
-#[cfg(feature = "coop-test")]
-mod drift;
 mod local;
 mod log;
 mod notices;
@@ -59,6 +56,8 @@ mod probe;
 mod status_box;
 mod steam_link;
 mod ui;
+
+pub use self::backup::AUTOSAVE_FOLDER;
 
 use std::cell::{Cell, RefCell};
 use std::sync::OnceLock;
@@ -81,20 +80,22 @@ use self::apply::Target;
 use self::changes::{Buried, Object};
 use self::local::Role;
 use self::log::coop_log;
-use self::steam_link::SteamTransport;
+use self::steam_link::{Closed, SteamTransport};
 use crate::features::editor_menu;
-use crate::features::keybinds::{COOP_ACCEPT_JOIN, COOP_MENU, COOP_REFUSE_JOIN, Keybind};
+use crate::features::keybinds::{COOP_MENU, Keybind};
 use crate::features::settings_menu;
 use crate::framework::settings::{Count, Section, Setting, Toggle};
 use crate::framework::timings;
 use crate::game::brick_editor::{self, BrickEditor};
 use crate::game::brick_groups::{self, BrickGroups};
+use crate::game::chat::{self, Chat, Tone};
 use crate::game::editor_mode::{self, EditorModes};
 use crate::game::editor_object::SpawnTransforms;
 use crate::game::editor_view::{self, Bricks};
 use crate::game::input_sources::{self, InputSources};
 use crate::game::object_order::{self, ObjectOrder};
 use crate::game::property_values::{self, BrickValues};
+use crate::game::ugc_autosave;
 use crate::game::undo_redo;
 use crate::game::vehicle_archive::{self, VehicleArchive};
 use crate::game::vehicle_changes;
@@ -109,35 +110,26 @@ pub struct Coop;
 pub static LOCAL_TEST: Toggle = Toggle::new(
     "CoopLocalTest",
     "Coop local test",
-    "Test builds only, for testing coop on one PC: hosting and joining on the coop page (Editor \
-     tweaks, Coop... in the editor's top bar) link this game with a second one on this PC (et.py \
-     second) instead of Steam friends. Only creating, deleting, moving, reordering and grouping \
-     bricks and changing their properties are shared so far. Undo and redo undo your own edits \
-     only. Members check every few seconds that their vehicle is still the host's.",
+    "Test builds only: links this game with another one on this PC instead of Steam friends.",
     false,
 );
 
 pub static REQUEST_OPENS_PAGE: Toggle = Toggle::new(
     "CoopRequestOpensPage",
-    "Coop page on join requests",
-    "While hosting, someone asking to join opens the coop page, to let them in or not. Off: only \
-     a notification tells (Ctrl+F9 accepts, Ctrl+F10 refuses, or open the coop page yourself).",
+    "Open page on join requests",
+    "Someone asking to join opens the coop page. Off: only the message shows.",
     true,
 );
 
 /// Most players in a session we host, us included (`questions.md` Q8). Its index + 2.
 pub static MAX_PLAYERS: Count = Count::new(
     "CoopMaxPlayers",
-    "Coop: most players",
-    "How many players may build in a vehicle you host, you included. More than 4 may be unstable: \
-     coop was tested with few players, and every edit goes to everyone.",
+    "Most players",
+    "How many can build in your vehicle, you included. Above 4 may be unstable.",
     2,
     32,
     4,
 );
-
-/// Players past this may make a session unstable: hosting for more says so.
-const TESTED_PLAYERS: usize = 4;
 
 /// The feature's settings, in the options' Editor tweaks menu (the local test in test builds only).
 pub static SETTINGS: [Section; 1] = [Section {
@@ -203,6 +195,8 @@ pub struct Game {
     sources: Result<InputSources, String>,
     /// The HUD's notifications, to tell the player what coop does (or only the log, if not found).
     notes: Option<ZoomNotification>,
+    /// The game's chat, to say who came or went (or why not: then the notifications say it).
+    chat: Result<Chat, String>,
     /// What shows others' selections (or why not found: then they don't show).
     presence: Result<presence::Kit, String>,
     /// What shows others' cameras (or why not found: then they don't show, nor ours go out).
@@ -239,6 +233,9 @@ fn game() -> Option<&'static Game> {
             cameras: cameras::find().inspect_err(|reason| {
                 coop_log!("others' cameras won't show: {reason}");
             }),
+            chat: chat::find().inspect_err(|reason| {
+                coop_log!("coop's news won't show in the chat: {reason}");
+            }),
             notes: zoom_notification::code()
                 .and_then(zoom_notification::find)
                 .inspect_err(|reason| {
@@ -273,7 +270,16 @@ impl Feature for Coop {
         }
         ui::add_pages();
         editor_menu::on_click(&COOP_MENU, || PAGE_ASKED.store(true, Ordering::Relaxed));
+        if let Err(reason) = brick_editor::before_end_play(editor_ending) {
+            log!("the exiting coop autosave won't be written as the editor goes: {reason}");
+        }
         brick_editor::after_tick(after_tick)
+    }
+
+    fn on_engine_init(&self) {
+        if let Err(reason) = ugc_autosave::treat_as_autosave(backup::AUTOSAVE_FOLDER) {
+            log!("the coop autosave won't be treated as an autosave: {reason}");
+        }
     }
 }
 
@@ -296,9 +302,17 @@ enum Wire {
 
 impl Wire {
     /// Peers whose connection closed since the last call.
-    fn take_lost(&mut self) -> Vec<PeerId> {
+    fn take_lost(&mut self) -> Vec<Closed> {
         match self {
-            Wire::Local(tcp) => tcp.take_lost(),
+            // A socket doesn't say why; a player leaving says goodbye first ([`network`]).
+            Wire::Local(tcp) => tcp
+                .take_lost()
+                .into_iter()
+                .map(|peer| Closed {
+                    peer,
+                    by_peer: false,
+                })
+                .collect(),
             Wire::Steam(steam) => steam.take_lost(),
         }
     }
@@ -359,6 +373,9 @@ struct Link {
     /// Our slot once in, and every member (us too).
     own_slot: Option<Slot>,
     members: Vec<Member>,
+    /// Subhost: members whose going the player was told of (a ban, a lost connection), not to be
+    /// told again as they leave the list.
+    told_gone: Vec<PeerId>,
     /// A live `AVehicleEditor` (the one ticking), and its interface component.
     editor: Object,
     component: Object,
@@ -375,7 +392,7 @@ struct Link {
     audits_failed: u32,
     /// The session's clock starts here (its rate limits follow it).
     started: Instant,
-    /// The session's vehicle in the game's vehicle list, a clone of its autosave.
+    /// The session's vehicle in the game's vehicle list: as it started and as it's left.
     autosave: backup::AutoSave,
     /// Member: how much of the game's time goes to what the subhost sends (see [`overloaded`]).
     workload: ::coop::limits::Workload,
@@ -444,8 +461,6 @@ struct Seek {
     server_players: usize,
     /// Friends hosting that invited us, with when.
     invites: Vec<(PeerId, String, Instant)>,
-    /// What to tell the player.
-    news: Vec<String>,
 }
 
 enum State {
@@ -586,6 +601,16 @@ fn after_tick(editor: *mut UObjectBase, _delta: f32) {
     }
 }
 
+/// `editor` is about to go (the player left it, the map changed, the game is closing): the last
+/// moment its vehicle can be read.
+fn editor_ending(editor: *mut UObjectBase) {
+    let Some(Ok(game)) = GAME.get() else { return };
+    DRIVER.with(|driver| match driver.try_borrow_mut() {
+        Ok(mut driver) => driver.editor_ending(game, editor),
+        Err(_) => coop_log!("the editor went inside coop's own tick: no exiting coop autosave"),
+    });
+}
+
 /// The thread timer's tick (on the game thread, about every frame): while no editor ticks, the
 /// link goes on without one.
 fn away_tick() {
@@ -606,6 +631,17 @@ fn away_tick() {
 }
 
 impl Driver {
+    /// See [`editor_ending`]. The session itself goes on, unless the game is closing: once out of
+    /// the editor, this copy is the last there can be.
+    fn editor_ending(&mut self, game: &Game, editor: Object) {
+        if let State::Linked(link) = &mut self.state
+            && link.editor == editor
+            && link.here == Here::Editing
+        {
+            link.autosave.finish(game, link.editor, link.component);
+        }
+    }
+
     /// Does what the player clicked on the coop page.
     fn request(&mut self, game: &Game, editor: Object, request: ui::Request) {
         match request {
@@ -615,20 +651,10 @@ impl Driver {
             }
             ui::Request::Leave => {
                 if let State::Linked(link) = &mut self.state {
-                    let text = match link.role {
-                        Role::Host => "Coop: stopped hosting".to_owned(),
-                        Role::Member if link.joined => {
-                            format!("Coop: left {}'s vehicle", link.host_name)
-                        }
-                        Role::Member => {
-                            format!("Coop: cancelled the join request to {}", link.host_name)
-                        }
-                    };
                     if link.editor == editor && link.here == Here::Editing {
                         link.autosave.finish(game, link.editor, link.component);
                     }
                     stop(link, "the player left");
-                    notices::tell(&text);
                     self.state = State::Idle;
                 }
                 self.want = Want::Nothing;
@@ -638,13 +664,12 @@ impl Driver {
                     link.answers.push((peer, yes));
                 }
             }
-            ui::Request::Kick(peer, name) => {
+            ui::Request::Kick(peer) => {
                 if let State::Linked(link) = &mut self.state
                     && link.role == Role::Host
                 {
                     let _ = link.session.kick(peer);
                     link.accepted.retain(|p| *p != peer);
-                    notices::tell(&format!("Coop: kicked {name}"));
                 }
             }
             ui::Request::OpenBan(peer, name) => {
@@ -668,8 +693,9 @@ impl Driver {
                 if let State::Linked(link) = &mut self.state
                     && link.role == Role::Host
                 {
-                    let _ = link.session.ban(peer, ban.until(link));
+                    let _ = link.session.ban(peer, ban.until(link), &ban.reason);
                     link.accepted.retain(|p| *p != peer);
+                    link.told_gone.push(peer);
                 }
                 let how_long = match seconds {
                     0 => "for this match".to_owned(),
@@ -677,18 +703,20 @@ impl Driver {
                     _ => format!("for {} minutes", seconds.div_ceil(60)),
                 };
                 coop_log!("banned {name} ({peer}) {how_long}: \"{}\"", ban.reason);
-                notices::tell(&format!("Coop: banned {name} {how_long}"));
+                notices::say(Tone::Bad, &format!("Coop: {name} is banned {how_long}"));
                 self.bans.retain(|ban| ban.peer != peer);
                 self.bans.push(ban);
             }
-            ui::Request::Unban(peer, name) => {
+            ui::Request::Unban(peer) => {
+                if let Some(ban) = self.bans.iter().find(|ban| ban.peer == peer) {
+                    notices::say(Tone::Good, &format!("Coop: {} is unbanned", ban.name));
+                }
                 self.bans.retain(|ban| ban.peer != peer);
                 if let State::Linked(link) = &mut self.state
                     && link.role == Role::Host
                 {
                     link.session.unban(peer);
                 }
-                notices::tell(&format!("Coop: lifted {name}'s ban"));
             }
             ui::Request::Invite(peer, name) => {
                 let State::Linked(link) = &mut self.state else {
@@ -706,7 +734,6 @@ impl Driver {
                     .unwrap_or_default();
                 if link.session.invite(peer, own).is_ok() {
                     coop_log!("invited {name} ({peer})");
-                    notices::tell(&format!("Coop: invited {name}"));
                     self.invited.retain(|(p, _)| *p != peer);
                     self.invited.push((peer, Instant::now()));
                 }
@@ -805,9 +832,6 @@ impl Driver {
             State::Seeking(seek) => {
                 let look = self.look_until.is_some_and(|until| Instant::now() < until);
                 seek_tick(seek, look);
-                for news in std::mem::take(&mut seek.news) {
-                    notices::tell(&news);
-                }
             }
             State::Linked(link) => {
                 // Players of our match may ask to join, or answer.
@@ -870,7 +894,7 @@ impl Driver {
         }
         let text = match link.role {
             Role::Host => "Coop: stopped hosting: the match changed".to_owned(),
-            Role::Member => format!("Coop: left {}'s vehicle: the match changed", link.host_name),
+            Role::Member => format!("Coop: left {}'s session: the match changed", link.host_name),
         };
         stop(link, "the match changed");
         notices::alert(&text);
@@ -887,7 +911,7 @@ impl Driver {
                 self.bans.retain(|ban| !ban.over(now));
                 if link.role == Role::Host {
                     for ban in &self.bans {
-                        let _ = link.session.ban(ban.peer, ban.until(&link));
+                        let _ = link.session.ban(ban.peer, ban.until(&link), &ban.reason);
                     }
                 }
                 self.state = State::Linked(link)
@@ -1029,7 +1053,8 @@ fn look_for_hosts(editor: Object) -> Option<Box<Seek>> {
     let transport = match SteamTransport::new(true) {
         Ok(transport) => transport,
         Err(reason) => {
-            notices::alert(&format!("Coop can't use Steam: {reason}"));
+            coop_log!("can't use Steam: {reason}");
+            notices::alert("Coop needs Steam to find friends' games.");
             return None;
         }
     };
@@ -1043,7 +1068,6 @@ fn look_for_hosts(editor: Object) -> Option<Box<Seek>> {
         friends_playing: 0,
         server_players: 0,
         invites: Vec::new(),
-        news: Vec::new(),
     }))
 }
 
@@ -1116,9 +1140,10 @@ fn seek_tick(seek: &mut Seek, greet: bool) {
                 seek.invites.retain(|(p, _, _)| *p != peer);
                 seek.invites.push((peer, name.clone(), Instant::now()));
                 if new {
-                    seek.news.push(format!(
-                        "Coop: {name} invites you to build in their vehicle (coop page: Join {name})"
-                    ));
+                    notices::say(
+                        Tone::Good,
+                        &format!("Coop: {name} invites you to build (see the coop page)"),
+                    );
                 }
             }
             Event::BadMessage { peer, error } => {
@@ -1484,7 +1509,7 @@ fn start(game: &Game, editor: Object, opening: Opening) -> Option<Box<Link>> {
             Ok(tcp) => (Session::new(info()), Wire::Local(tcp), Role::Host, None),
             Err(error) => {
                 coop_log!("local test: can't listen: {error}");
-                notices::alert("Coop: another game on this PC hosts already");
+                notices::alert("Coop: another game on this PC already hosts");
                 return None;
             }
         },
@@ -1502,7 +1527,8 @@ fn start(game: &Game, editor: Object, opening: Opening) -> Option<Box<Link>> {
                 (Session::new(info()), Wire::Steam(steam), Role::Host, None)
             }
             Err(reason) => {
-                notices::alert(&format!("Coop can't use Steam: {reason}"));
+                coop_log!("can't use Steam: {reason}");
+                notices::alert("Coop needs Steam to play with friends.");
                 return None;
             }
         },
@@ -1563,17 +1589,6 @@ fn start(game: &Game, editor: Object, opening: Opening) -> Option<Box<Link>> {
                 objects.len(),
                 if local { 8 } else { max_players() }
             );
-            if !local && max_players() > TESTED_PLAYERS {
-                notices::tell(&format!(
-                    "Coop: up to {} players may join; more than {TESTED_PLAYERS} may be unstable",
-                    max_players()
-                ));
-            }
-            notices::tell(if local {
-                "Coop: hosting this vehicle for the other game on this PC"
-            } else {
-                "Coop: hosting this vehicle. Friends and players here with Editor tweaks can ask to join"
-            });
         }
         Role::Member => match joining {
             Some(host) => {
@@ -1581,7 +1596,6 @@ fn start(game: &Game, editor: Object, opening: Opening) -> Option<Box<Link>> {
                 session
                     .join(host, String::new(), name)
                     .expect("a seeking session is idle");
-                notices::tell(&format!("Coop: asking {host_name} to let you in"));
             }
             None => {
                 host_name = "the other game".into();
@@ -1589,7 +1603,6 @@ fn start(game: &Game, editor: Object, opening: Opening) -> Option<Box<Link>> {
                     .join(local::HOST, local::CODE.into(), name)
                     .expect("a new session is idle");
                 coop_log!("local test: joining the other instance");
-                notices::tell("Coop: asking the other game to let you in");
             }
         },
     }
@@ -1604,6 +1617,7 @@ fn start(game: &Game, editor: Object, opening: Opening) -> Option<Box<Link>> {
         answers: Vec::new(),
         own_slot: (role == Role::Host).then_some(::coop::ids::SUBHOST_SLOT),
         members: Vec::new(),
+        told_gone: Vec::new(),
         editor,
         component,
         loaded: false,
@@ -1665,7 +1679,6 @@ fn step(game: &Game, link: &mut Link) -> bool {
             };
             if let Ok(reordered) = target.refit(&changes::remembered()) {
                 coop_log!("found the session's vehicle in the editor after all");
-                notices::tell("Coop: the session's vehicle is back: building goes on");
                 found_again(game, link, reordered);
             }
         }
@@ -1736,8 +1749,6 @@ fn step(game: &Game, link: &mut Link) -> bool {
             link.audit_at = Instant::now() + Duration::from_secs(audit::pace::SECONDS);
             audit(game, link);
         }
-        #[cfg(feature = "coop-test")]
-        Role::Member if drift::pressed() => drift::drift(&target),
         _ => {}
     }
     if link.session.is_loaded() {
@@ -1759,7 +1770,7 @@ fn overloaded(link: &mut Link, since: Instant) -> bool {
     }
     coop_log!("left: applying what the subhost sends took most of the game's time for a while");
     notices::alert(&format!(
-        "Coop: left {}'s session: it sends more than your game can keep up with",
+        "Coop: left {}'s session: your game can't keep up with it",
         link.host_name
     ));
     link.session.leave();
@@ -1788,34 +1799,40 @@ fn network(link: &mut Link) -> bool {
     }
     pump(&mut link.session, &mut link.transport);
     let mut alive = true;
-    for peer in link.transport.take_lost() {
+    for Closed { peer, by_peer } in link.transport.take_lost() {
         match link.role {
             Role::Host => {
-                // Only for someone still in or asking: a kick or refusal ends a connection too.
-                let name = link
-                    .members
-                    .iter()
-                    .find(|m| m.peer == peer)
-                    .map(|m| m.name.clone())
-                    .or_else(|| {
-                        let asking = link.asking.iter().find(|(p, _)| *p == peer);
-                        asking.map(|(_, name)| name.clone())
-                    });
-                match name {
-                    Some(name) => notices::tell(&format!("Coop: lost the connection to {name}")),
-                    None => coop_log!("connection to {peer} ended"),
+                // Only a member still in lost its connection: a kick ends one too, and one that
+                // said goodbye (read just above, with its connection closing) or closed it on
+                // purpose left, which the next members list tells.
+                let still_in = link.session.expected_peers().contains(&peer);
+                let name = link.members.iter().find(|m| m.peer == peer);
+                match name.map(|m| m.name.clone()) {
+                    Some(name) if still_in && !by_peer => {
+                        notices::say(Tone::Plain, &format!("Coop: {name} lost connection"));
+                        link.told_gone.push(peer);
+                    }
+                    _ => coop_log!("connection to {peer} ended"),
                 }
                 let _ = link.session.lost(peer);
                 link.asking.retain(|(p, _)| *p != peer);
             }
             Role::Member => {
-                notices::alert(&format!("Coop: lost the connection to {}", link.host_name));
+                let host = &link.host_name;
+                notices::alert(&if by_peer {
+                    format!("Coop: {host} stopped hosting")
+                } else {
+                    format!("Coop: lost connection to {host}")
+                });
                 alive = false;
             }
         }
     }
     if link.role == Role::Member && !link.joined && link.started.elapsed() > ANSWER_WAIT {
-        notices::alert(&format!("Coop: {} didn't answer", link.host_name));
+        notices::alert(&format!(
+            "Coop: {} didn't answer your request",
+            link.host_name
+        ));
         alive = false;
     }
     if link.role == Role::Host {
@@ -1942,10 +1959,6 @@ fn refit(game: &Game, link: &mut Link, since: Instant) {
             }
             link.resyncing = true;
             link.here = Here::Editing;
-            notices::tell(&format!(
-                "Coop: back in {}'s vehicle (the one here is in EditorTweaks\\CoopBackups)",
-                link.host_name
-            ));
         }
         // SAFETY: the editor is live (it's ticking); game thread.
         Role::Host if link.kept.is_some() && unsafe { objects(game, link.editor) }.is_empty() => {
@@ -2047,7 +2060,6 @@ fn resume(game: &Game, link: &mut Link) {
         "the session's vehicle is back; {} things to catch up on",
         link.missed.len()
     );
-    notices::tell("Coop: back to the session's vehicle, with what the others built meanwhile");
 }
 
 /// Subhost, [`Here::Elsewhere`]: the editor's vehicle replaces the session's for everyone.
@@ -2055,7 +2067,7 @@ fn share(game: &Game, link: &mut Link) {
     // SAFETY: the editor is live (it's ticking); game thread.
     let objects = unsafe { objects(game, link.editor) };
     if objects.is_empty() {
-        notices::alert("Coop: the editor is empty: there's nothing to share");
+        notices::alert("Coop: the editor is empty: nothing to share");
         return;
     }
     match link.session.rehost(objects.len()) {
@@ -2072,11 +2084,10 @@ fn share(game: &Game, link: &mut Link) {
             link.rounds = Rounds::default();
             link.here = Here::Editing;
             coop_log!("shared the editor's vehicle ({} objects)", ids.len());
-            notices::tell("Coop: shared this vehicle: it replaces the session's for everyone");
         }
         Err(error) => {
             coop_log!("can't share the editor's vehicle: {error:?}");
-            notices::alert("Coop: this vehicle can't be shared: it has too many bricks");
+            notices::alert("Coop: this vehicle has too many bricks to share");
         }
     }
 }
@@ -2447,27 +2458,22 @@ fn handle_anywhere(link: &mut Link, event: Event) -> bool {
             coop_log!("joined as slot {slot}");
             link.joined = true;
             link.own_slot = Some(slot);
+            notices::say(
+                Tone::Plain,
+                &format!("Coop: you joined {}'s session", link.host_name),
+            );
             link.presence.joined(slot);
             link.cameras.joined(slot);
-            notices::tell(&format!("Coop: joined {}'s vehicle", link.host_name));
             for peer in link.session.expected_peers() {
                 link.transport.log_connection(peer);
             }
         }
         Event::Refused(reason) => {
-            let why = match reason {
-                RefuseReason::Refused => "said no".to_owned(),
-                RefuseReason::Full => "has no room left".into(),
-                RefuseReason::GameVersion => "plays another game version".into(),
-                RefuseReason::WrongCode => "wants a code".into(),
-                RefuseReason::NotHosting => "isn't hosting any more".into(),
-                RefuseReason::Banned { minutes: u16::MAX } => "banned you".into(),
-                RefuseReason::Banned { minutes: 1 } => "banned you for 1 more minute".into(),
-                RefuseReason::Banned { minutes } => {
-                    format!("banned you for {minutes} more minutes")
-                }
+            let tone = match reason {
+                RefuseReason::Banned { .. } => Tone::Bad,
+                _ => Tone::Plain,
             };
-            notices::alert(&format!("Coop: {} {why}", link.host_name));
+            notices::say(tone, &refusal_text(&link.host_name, &reason));
             return false;
         }
         Event::JoinAsked { peer, name } => {
@@ -2485,19 +2491,17 @@ fn handle_anywhere(link: &mut Link, event: Event) -> bool {
         }
         Event::JoinWithdrawn { peer } => {
             if let Some(at) = link.asking.iter().position(|(p, _)| *p == peer) {
-                let (_, name) = link.asking.remove(at);
-                notices::tell(&format!("Coop: {name} stopped asking"));
+                link.asking.remove(at);
                 link.asking_shown = None;
             }
         }
         Event::Members(members) => {
             let names: Vec<&str> = members.iter().map(|m| m.name.as_str()).collect();
             coop_log!("members: {}", names.join(", "));
+            tell_who_changed(link, &members);
             link.members = members.clone();
             link.cameras.members(&members);
-            for news in link.presence.members(members) {
-                notices::tell(&news);
-            }
+            link.presence.members(members);
         }
         Event::Drifted => coop_log!("drifted from the subhost: asked for a snapshot"),
         Event::UndoConflict => {
@@ -2507,10 +2511,12 @@ fn handle_anywhere(link: &mut Link, event: Event) -> bool {
             coop_log!("session ended: {reason:?}");
             let host = &link.host_name;
             match reason {
-                EndReason::Kicked => notices::alert(&format!("Coop: {host} removed you")),
+                EndReason::Kicked => {
+                    notices::alert(&format!("Coop: {host} removed you from the session"))
+                }
                 EndReason::Closed => notices::alert(&format!("Coop: {host} stopped hosting")),
                 EndReason::HostFlooded(_) => notices::alert(&format!(
-                    "Coop: left {host}'s session: it sent far more than a session needs"
+                    "Coop: left {host}'s session: it sent far too much data"
                 )),
                 EndReason::Left => {}
             }
@@ -2535,20 +2541,58 @@ fn handle_anywhere(link: &mut Link, event: Event) -> bool {
     true
 }
 
-/// Subhost: shows who asks to join, and answers them as the coop page says, or the oldest with the
-/// accept or refuse key.
-fn answer_joins(link: &mut Link) {
-    static ACCEPT: AtomicBool = AtomicBool::new(false);
-    static REFUSE: AtomicBool = AtomicBool::new(false);
-    let accept = went_down(&COOP_ACCEPT_JOIN, &ACCEPT);
-    let refuse = went_down(&COOP_REFUSE_JOIN, &REFUSE);
-    let mut answers = std::mem::take(&mut link.answers);
-    if (accept || refuse)
-        && let Some((peer, _)) = link.asking.first()
-    {
-        answers.push((*peer, accept));
+/// What the player is told when `host` refuses their request to join.
+fn refusal_text(host: &str, reason: &RefuseReason) -> String {
+    match reason {
+        RefuseReason::Refused => format!("Coop: {host} declined your request"),
+        RefuseReason::Full => format!("Coop: {host}'s session is full"),
+        RefuseReason::GameVersion => format!("Coop: {host} is on a different game version"),
+        // Players never type a code: both sides of a Steam session use none, so this takes a
+        // build that sends one.
+        RefuseReason::WrongCode => format!("Coop: couldn't join {host}'s session"),
+        RefuseReason::NotHosting => format!("Coop: {host} isn't hosting anymore"),
+        RefuseReason::Banned { minutes, reason } => {
+            let how_long = match *minutes {
+                u16::MAX => String::new(),
+                1 => " for another minute".to_owned(),
+                minutes => format!(" for another {minutes} minutes"),
+            };
+            // Typed by the host's player: one line, whatever it holds.
+            let reason = reason.replace(char::is_control, " ");
+            let why = match reason.trim() {
+                "" => String::new(),
+                reason => format!(". Reason: {reason}"),
+            };
+            format!("Coop: you are banned from {host}'s session{how_long}{why}")
+        }
     }
-    for (peer, yes) in answers {
+}
+
+/// Says in the chat who came and who left, between the session's members so far and `members`. A
+/// member arriving finds the others there: only those after it are news.
+fn tell_who_changed(link: &mut Link, members: &[Member]) {
+    let arriving = link.role == Role::Member && link.members.is_empty();
+    if !arriving {
+        for old in &link.members {
+            if Some(old.slot) != link.own_slot
+                && !members.iter().any(|m| m.slot == old.slot)
+                && !link.told_gone.contains(&old.peer)
+            {
+                notices::say(Tone::Plain, &format!("Coop: {} left", old.name));
+            }
+        }
+        for new in members {
+            if Some(new.slot) != link.own_slot && !link.members.iter().any(|m| m.slot == new.slot) {
+                notices::say(Tone::Plain, &format!("Coop: {} joined", new.name));
+            }
+        }
+    }
+    link.told_gone.clear();
+}
+
+/// Subhost: shows who asks to join, and answers them as the coop page says.
+fn answer_joins(link: &mut Link) {
+    for (peer, yes) in std::mem::take(&mut link.answers) {
         let Some(at) = link.asking.iter().position(|(p, _)| *p == peer) else {
             continue;
         };
@@ -2560,13 +2604,9 @@ fn answer_joins(link: &mut Link) {
             if !link.accepted.contains(&peer) {
                 link.accepted.push(peer);
             }
-        }
-        let text = if yes {
-            format!("Coop: letting {name} in")
         } else {
-            format!("Coop: refused {name}")
-        };
-        notices::tell(&text);
+            notices::say(Tone::Plain, &format!("Coop: you declined {name}'s request"));
+        }
     }
     let Some((_, name)) = link.asking.first().cloned() else {
         return;
@@ -2581,9 +2621,7 @@ fn answer_joins(link: &mut Link) {
             n => format!(" ({n} more waiting)"),
         };
         notices::tell(&format!(
-            "Coop: {name} asks to join. {} accepts, {} refuses (or the coop page){more}",
-            COOP_ACCEPT_JOIN.key_label(),
-            COOP_REFUSE_JOIN.key_label()
+            "Coop: {name} asks to join: answer on the coop page{more}"
         ));
     }
 }

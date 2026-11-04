@@ -25,6 +25,13 @@ const LOST_EVERY: Duration = Duration::from_secs(1);
 const CLOSED_BY_PEER: i32 = 4;
 const PROBLEM: i32 = 5;
 
+/// A session's peer whose connection ended.
+pub struct Closed {
+    pub peer: PeerId,
+    /// It ended it on purpose (its game closed, say), rather than the connection failing.
+    pub by_peer: bool,
+}
+
 /// Steam's messages as a coop transport.
 pub struct SteamTransport {
     pub steam: Steam,
@@ -116,20 +123,23 @@ impl SteamTransport {
 
     /// The session's peers whose connection Steam closed since the last call (checked every
     /// second).
-    pub fn take_lost(&mut self) -> Vec<PeerId> {
+    pub fn take_lost(&mut self) -> Vec<Closed> {
         if self.lost_at.elapsed() < LOST_EVERY {
             return Vec::new();
         }
         self.lost_at = Instant::now();
         let mut newly = Vec::new();
         for &peer in &self.expected {
-            let closed = self
-                .steam
-                .peer_connection(peer)
-                .is_some_and(|c| c.state == CLOSED_BY_PEER || c.state == PROBLEM);
+            let Some(state) = self.steam.peer_connection(peer).map(|c| c.state) else {
+                continue;
+            };
+            let closed = state == CLOSED_BY_PEER || state == PROBLEM;
             if closed && !self.lost.contains(&peer) {
                 self.lost.push(peer);
-                newly.push(peer);
+                newly.push(Closed {
+                    peer,
+                    by_peer: state == CLOSED_BY_PEER,
+                });
             }
         }
         newly

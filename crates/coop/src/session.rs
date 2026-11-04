@@ -24,8 +24,8 @@ use std::collections::{HashMap, VecDeque};
 use crate::audit::{Audit, Digest};
 use crate::framing::{self, Assembler};
 use crate::ids::{CoopId, IdAllocator, LiveSet, ORIGINAL_SLOT, SUBHOST_SLOT, Slot};
-use crate::limits::{Flood, Limits};
-use crate::message::{Member, Message, PeerId, PeerInfo, RefuseReason};
+use crate::limits::{Ban, Flood, Limits};
+use crate::message::{Member, Message, PeerId, PeerInfo, RefuseReason, caps};
 use crate::ops::{Op, Value};
 use crate::presence::View;
 use crate::undo::{Change, History, StepBack};
@@ -488,18 +488,19 @@ impl Session {
     }
 
     /// Subhost: removes a member, or refuses a joiner asking, and refuses its requests until
-    /// `until` ([`Session::tick`]'s clock), telling it how long it waits.
-    pub fn ban(&mut self, peer: PeerId, until: u64) -> Result<(), SessionError> {
+    /// `until` ([`Session::tick`]'s clock), telling it how long it waits and `reason`.
+    pub fn ban(&mut self, peer: PeerId, until: u64, reason: &str) -> Result<(), SessionError> {
         let Role::Host(host) = &self.role else {
             return Err(SessionError::NotSubhost);
         };
         let asking = host.asking.iter().any(|(p, _)| *p == peer);
-        self.limits.banned_until.insert(peer, until);
-        if asking && let Some(minutes) = self.ban_left(peer) {
-            self.out.send(
-                peer,
-                &Message::JoinRefused(RefuseReason::Banned { minutes }),
-            );
+        let ban = Ban {
+            until,
+            reason: cut_to_bytes(reason, caps::BAN_REASON).to_owned(),
+        };
+        self.limits.banned_until.insert(peer, ban);
+        if asking && let Some(refusal) = self.ban_refusal(peer) {
+            self.out.send(peer, &Message::JoinRefused(refusal));
         }
         self.remove(peer, true)
     }
@@ -509,12 +510,15 @@ impl Session {
         self.limits.banned_until.remove(&peer);
     }
 
-    /// How many more minutes (rounded up) `peer` is banned for, if it is (`u16::MAX`: at least
-    /// that many, e.g. until the subhost lifts it).
-    fn ban_left(&self, peer: PeerId) -> Option<u16> {
-        let until = *self.limits.banned_until.get(&peer)?;
-        let left = until.checked_sub(self.now).filter(|left| *left > 0)?;
-        Some(left.div_ceil(60_000).min(u16::MAX.into()) as u16)
+    /// What `peer` is told if it's banned now: the minutes left, rounded up (`u16::MAX`: at least
+    /// that many, e.g. until the subhost lifts it), and the reason.
+    fn ban_refusal(&self, peer: PeerId) -> Option<RefuseReason> {
+        let ban = self.limits.banned_until.get(&peer)?;
+        let left = ban.until.checked_sub(self.now).filter(|left| *left > 0)?;
+        Some(RefuseReason::Banned {
+            minutes: left.div_ceil(60_000).min(u16::MAX.into()) as u16,
+            reason: ban.reason.clone(),
+        })
     }
 
     /// Subhost: the connection to a member (or a joiner asking) was lost. It may join again.
@@ -956,7 +960,7 @@ impl Session {
     }
 
     fn handle_as_host(&mut self, peer: PeerId, session: u32, message: Message) {
-        let banned = self.ban_left(peer);
+        let banned = self.ban_refusal(peer);
         let Role::Host(host) = &mut self.role else {
             unreachable!()
         };
@@ -966,8 +970,8 @@ impl Session {
             game_version,
         } = message
         {
-            let refusal = if let Some(minutes) = banned {
-                Some(RefuseReason::Banned { minutes })
+            let refusal = if banned.is_some() {
+                banned
             } else if code != host.settings.code {
                 if self.limits.of(peer, self.now).wrong_code() {
                     self.limits.banned.insert(peer);
@@ -1366,6 +1370,15 @@ impl Session {
 
 /// The subhost first (`self_peer` is a placeholder: peers know the subhost's address already).
 /// Why `host` can't take another member, if it can't.
+/// `text`, or as much of it as fits `max` bytes without splitting a character.
+fn cut_to_bytes(text: &str, max: usize) -> &str {
+    let mut end = max.min(text.len());
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    &text[..end]
+}
+
 fn full(host: &Host) -> Option<RefuseReason> {
     (host.members.len() >= host.settings.max_members || host.next_slot > u16::from(Slot::MAX))
         .then_some(RefuseReason::Full)
@@ -1677,7 +1690,7 @@ mod tests {
         host.host(7, "h".into(), approving(), 3).unwrap();
         let mut guest = join_approved(&mut host, 2, "g");
         host.take_events();
-        host.ban(2, 10 * 60_000).unwrap();
+        host.ban(2, 10 * 60_000, "griefing").unwrap();
         pump(&mut host, 1, &mut guest, 2);
         assert!(!host.members().iter().any(|m| m.peer == 2));
         host.take_events();
@@ -1694,22 +1707,31 @@ mod tests {
         };
         assert_eq!(
             ask(&mut host),
-            vec![Event::Refused(RefuseReason::Banned { minutes: 10 })]
+            vec![Event::Refused(RefuseReason::Banned {
+                minutes: 10,
+                reason: "griefing".into()
+            })]
         );
         host.tick(9 * 60_000 + 1);
         assert_eq!(
             ask(&mut host),
-            vec![Event::Refused(RefuseReason::Banned { minutes: 1 })]
+            vec![Event::Refused(RefuseReason::Banned {
+                minutes: 1,
+                reason: "griefing".into()
+            })]
         );
         assert!(host.take_events().is_empty(), "the host's player was asked");
         host.tick(10 * 60_000);
         assert!(ask(&mut host).is_empty());
         host.take_events();
         // Lifted early.
-        host.ban(2, u64::MAX).unwrap();
+        host.ban(2, u64::MAX, "").unwrap();
         assert_eq!(
             ask(&mut host),
-            vec![Event::Refused(RefuseReason::Banned { minutes: u16::MAX })]
+            vec![Event::Refused(RefuseReason::Banned {
+                minutes: u16::MAX,
+                reason: String::new()
+            })]
         );
         host.unban(2);
         assert!(ask(&mut host).is_empty());
@@ -1728,15 +1750,52 @@ mod tests {
         guest.join(1, "1234".into(), "g".into()).unwrap();
         pump(&mut host, 1, &mut guest, 2);
         host.take_events();
-        host.ban(2, 60_000).unwrap();
+        host.ban(2, 60_000, "griefing").unwrap();
         pump(&mut host, 1, &mut guest, 2);
         assert_eq!(
             guest.take_events(),
-            vec![Event::Refused(RefuseReason::Banned { minutes: 1 })]
+            vec![Event::Refused(RefuseReason::Banned {
+                minutes: 1,
+                reason: "griefing".into()
+            })]
         );
         // Its request went with it.
         host.answer_join(2, true).unwrap();
         assert!(host.take_outgoing().is_empty());
+    }
+
+    /// Past the cap, the reason is cut between characters: the message must stay readable, as a
+    /// longer one would be refused when read.
+    #[test]
+    fn a_long_ban_reason_still_reaches_the_banned() {
+        let mut host = Session::new(info());
+        host.host(7, "h".into(), approving(), 3).unwrap();
+        let mut guest = Session::new(info());
+        guest.join(1, "1234".into(), "g".into()).unwrap();
+        pump(&mut host, 1, &mut guest, 2);
+        host.take_events();
+        host.ban(2, 60_000, &"é".repeat(150)).unwrap();
+        pump(&mut host, 1, &mut guest, 2);
+        assert_eq!(
+            guest.take_events(),
+            vec![Event::Refused(RefuseReason::Banned {
+                minutes: 1,
+                reason: "é".repeat(caps::BAN_REASON / 2)
+            })]
+        );
+    }
+
+    /// The mod tells "left" from "lost connection" by this: a member's goodbye may be read together
+    /// with its connection closing.
+    #[test]
+    fn a_member_that_said_goodbye_is_no_longer_expected() {
+        let mut host = Session::new(info());
+        host.host(7, "h".into(), approving(), 3).unwrap();
+        let mut guest = join_approved(&mut host, 2, "g");
+        assert!(host.expected_peers().contains(&2));
+        guest.leave();
+        pump(&mut host, 1, &mut guest, 2);
+        assert!(!host.expected_peers().contains(&2));
     }
 
     #[test]

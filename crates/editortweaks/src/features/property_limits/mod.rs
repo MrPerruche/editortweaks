@@ -1,6 +1,7 @@
-//! Our own limits on property values instead of the game's: by default none besides a sanity cap
-//! (`rules::UNLIMITED`), so values typed into sliders aren't limited to the slider's range;
-//! [`rules`] sets limits for specific properties.
+//! Our own limits on the values the vehicle editor edits, instead of the game's: by default none
+//! besides a sanity cap (`rules::UNLIMITED`), so values typed into sliders aren't limited to the
+//! slider's range; [`rules`] sets limits for specific properties. Everything else keeps the game's
+//! limits ([`scope`]).
 //!
 //! The game limits numeric values in up to three places, each handled by a submodule:
 //! - [`slider`]: the slider widget clamps typed values to its range.
@@ -15,8 +16,6 @@
 //! (until they edit that value). Arrow keys still stop at the slider's ends, and so does dragging
 //! unless `slider_drag` lifts that; a rule's `drag_min` then stops drags before typed values.
 //!
-//! The color row's sliders keep the game's range ([`is_color_slider`]).
-//!
 //! [`highlight`] colors sliders showing values outside of the game's range, and differently those
 //! outside of the rules too.
 
@@ -26,6 +25,7 @@ mod highlight;
 mod limits;
 mod property;
 mod rules;
+mod scope;
 mod slider;
 
 use crate::prelude::*;
@@ -62,6 +62,9 @@ impl Feature for PropertyLimits {
                 ),
             }
         }
+        if let Err(reason) = scope::install() {
+            log!("every value keeps the game's limits: {reason}");
+        }
         if let Err(reason) = highlight::install() {
             log!("values outside of the game's range aren't highlighted: {reason}");
         }
@@ -69,6 +72,7 @@ impl Feature for PropertyLimits {
     }
 
     fn on_engine_init(&self) {
+        scope::on_engine_init();
         slider::on_engine_init();
         brick_size::on_engine_init();
         highlight::on_engine_init();
@@ -92,11 +96,8 @@ pub(crate) fn rewrites_stored_values() -> bool {
 /// typed values past their sliders' ends as bricks' do.
 pub(crate) const UNLIMITED: f32 = rules::UNLIMITED;
 
-/// Whether `slider` is one of a brick color row's, whose range stays (a hue past 360 isn't a color).
-///
-/// # Safety
-/// `slider` must be a live `UBrickSliderWidget`. Game thread only.
-pub(crate) unsafe fn is_color_slider(slider: *const core::ffi::c_void) -> bool {
-    // SAFETY: per the contract.
-    unsafe { slider::is_color_slider(slider) }
+/// How far values of `slider` may go, if past its ends (see [`scope`]); `None` keeps them within
+/// its range. Game thread only.
+pub(crate) fn slider_limit(slider: *const core::ffi::c_void) -> Option<(f32, f32)> {
+    scope::limit_of(slider)
 }

@@ -65,6 +65,16 @@ pub trait Number: Sync {
     fn limit(&self) -> (f32, f32) {
         self.range()
     }
+    /// The smallest and largest values the value `index` can be set to: [`Self::limit`], or its own
+    /// slider's ends if the row doesn't let typed values past its ends.
+    fn component_limit(&self, index: usize) -> (f32, f32) {
+        let limit = self.limit();
+        if limit == self.range() {
+            self.component_range(index)
+        } else {
+            limit
+        }
+    }
     /// How the values are shown.
     fn unit(&self) -> Unit;
     /// How the value `index` is shown, if it differs by value (like a time next to a percentage).
@@ -990,7 +1000,12 @@ thread_local! {
 pub fn noting_number_shown(update: impl FnOnce()) -> Option<&'static dyn Number> {
     let previous = NUMBER_SHOWN.replace(Some(None));
     update();
-    NUMBER_SHOWN.replace(previous).flatten()
+    let number = NUMBER_SHOWN.replace(previous).flatten();
+    // A call around this one, for the same update, wants to know too.
+    if previous.is_some() && number.is_some() {
+        NUMBER_SHOWN.set(Some(number));
+    }
+    number
 }
 
 /// During [`noting_number_shown`]'s update, once the row read its value: our number it shows, if

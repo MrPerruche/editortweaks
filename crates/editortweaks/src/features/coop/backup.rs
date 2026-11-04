@@ -1,13 +1,20 @@
 //! What coop keeps of the vehicles it builds or replaces, as vehicle files (the game's own bytes,
 //! as in a saved vehicle's `Vehicle.brv`):
 //!
-//! - The coop autosave ([`AutoSave`]), a clone of the game's own autosave: a recent copy of the
-//!   session's vehicle in a vehicle folder of its own, `Vehicles\CoopAutoSave\Autosave.brv`,
-//!   written as soon as the session's vehicle is in the editor, then every [`EVERY`] if it
-//!   changed, and as the session ends. The game lists a vehicle folder holding only an
-//!   `Autosave.brv` as it lists its own autosave folder (`Vehicles\AutoSave`): "Auto saved file"
-//!   and the file's date (BRMK 0x333EAC, `docs/re/coop/README.md`). Each session replaces the
-//!   last one's, as the game's autosave does.
+//! - The session's two autosaves ([`AutoSave`]), so what a session did to the vehicle (griefing,
+//!   say) can be undone and what it built isn't lost:
+//!   - Starting: the vehicle as the session got it, in a vehicle folder of its own,
+//!     `Vehicles\CoopAutoSave\Autosave.brv`, written once, as soon as the session's vehicle is in
+//!     the editor. The next session replaces it. The game lists a vehicle folder holding only an
+//!     `Autosave.brv` as it lists its own autosave folder: "Auto saved file" and the file's date
+//!     (BRMK 0x333EAC, `docs/re/coop/README.md`), and treats it as an autosave
+//!     (`game::ugc_autosave`): saving it prompts Save As.
+//!   - Exiting: the vehicle as it's left, in the game's own autosave folder,
+//!     `Vehicles\AutoSave\Autosave.brv`, as the session ends or the editor goes (the game closing,
+//!     say), if the session changed it. It replaces what's there, as the game's autosave of
+//!     another unsaved vehicle does.
+//!
+//!   Crashes are left to the game's own autosave.
 //! - Backups of what coop replaces ([`now`]): the joiner's own vehicle before the session's
 //!   replaces it, the host's before another is shared. In `SavedRemastered\EditorTweaks\
 //!   CoopBackups`, named by the time (UTC) and what they are; the newest [`KEEP`] of each kind are
@@ -23,23 +30,28 @@ use super::log::coop_log;
 use super::{Game, Object, objects};
 use crate::framework::clock;
 
-/// How often the coop autosave is written again, if the vehicle changed.
-pub const EVERY: Duration = Duration::from_secs(5 * 60);
+/// How soon the session's starting autosave is tried again, if it wasn't written (an empty editor,
+/// a full disk).
+const RETRY: Duration = Duration::from_secs(10);
 /// Backups kept of each kind: older ones are deleted.
 const KEEP: usize = 20;
-/// The coop autosave's folder among the game's vehicles, and its file (named as the game names
-/// its autosaves).
-const AUTOSAVE_FOLDER: &str = "CoopAutoSave";
+/// The starting autosave's folder among the game's vehicles.
+pub const AUTOSAVE_FOLDER: &str = "CoopAutoSave";
+/// The game's own autosave folder, for the exiting autosave.
+const GAME_AUTOSAVE_FOLDER: &str = "AutoSave";
+/// The file in either folder (named as the game names its autosaves), and the game's picture of
+/// the vehicle beside it.
 const AUTOSAVE_FILE: &str = "Autosave.brv";
+const PREVIEW_FILE: &str = "Preview.png";
 
-/// The coop autosave of a session: when it's due, and what it holds.
+/// The autosaves of a session: when to try the starting one, and what was last written.
 pub struct AutoSave {
     due: Instant,
     last: Vec<u8>,
 }
 
 impl AutoSave {
-    /// For a session starting: its first tick with the vehicle writes it.
+    /// For a session starting: its first tick with the vehicle writes the starting autosave.
     pub fn new() -> Self {
         Self {
             due: Instant::now(),
@@ -47,53 +59,78 @@ impl AutoSave {
         }
     }
 
-    /// Each tick the editor holds the session's vehicle: writes it (`editor`'s, of `component`)
-    /// when due, if it changed.
+    /// Each tick the editor holds the session's vehicle: writes it (`editor`'s, of `component`) as
+    /// the starting autosave if this session hasn't yet.
     pub fn tick(&mut self, game: &Game, editor: Object, component: Object) {
-        if Instant::now() < self.due {
+        if !self.last.is_empty() || Instant::now() < self.due {
             return;
         }
-        self.due = Instant::now() + EVERY;
-        self.write(game, editor, component);
-    }
-
-    /// The session ends, `editor` holding its vehicle: writes it if it changed (not if it never
-    /// was written: the session's vehicle never came).
-    pub fn finish(&mut self, game: &Game, editor: Object, component: Object) {
-        if !self.last.is_empty() {
-            self.write(game, editor, component);
+        self.due = Instant::now() + RETRY;
+        if let Some(bytes) = self.changed(game, editor, component)
+            && write_autosave(AUTOSAVE_FOLDER, &bytes)
+        {
+            self.last = bytes;
         }
     }
 
-    fn write(&mut self, game: &Game, editor: Object, component: Object) {
-        // SAFETY: the editor is live (it's ticking); game thread.
+    /// The session is left, or `editor` is about to go, holding the session's vehicle: writes it
+    /// as the exiting autosave if it changed (unchanged, the starting autosave already holds it
+    /// and the game's autosave is left alone; never written, the session's vehicle never came).
+    pub fn finish(&mut self, game: &Game, editor: Object, component: Object) {
+        if self.last.is_empty() {
+            return;
+        }
+        if let Some(bytes) = self.changed(game, editor, component)
+            && write_autosave(GAME_AUTOSAVE_FOLDER, &bytes)
+        {
+            remove_game_preview();
+            self.last = bytes;
+        }
+    }
+
+    /// The vehicle's bytes, if there's a vehicle and they aren't what was last written.
+    fn changed(&self, game: &Game, editor: Object, component: Object) -> Option<Vec<u8>> {
+        // SAFETY: the editor is live (it's ticking, or just about to end play); game thread.
         let objects = unsafe { objects(game, editor) };
         // An empty editor isn't a vehicle to keep.
         if objects.is_empty() {
-            return;
+            return None;
         }
         // SAFETY: the editor's live objects.
         match unsafe { game.archive.save(component, &objects) } {
-            Ok(bytes) if bytes == self.last => {}
-            Ok(bytes) => {
-                if write_autosave(&bytes) {
-                    self.last = bytes;
-                }
+            Ok(bytes) => (bytes != self.last).then_some(bytes),
+            Err(reason) => {
+                coop_log!("coop autosave not written: {reason}");
+                None
             }
-            Err(reason) => coop_log!("coop autosave not written: {reason}"),
         }
     }
 }
 
-/// Writes `bytes` as the coop autosave: beside it first, then in its place, so the game's vehicle
-/// list never reads half a file. Whether it was written.
-fn write_autosave(bytes: &[u8]) -> bool {
-    let Some(local) = std::env::var_os("LOCALAPPDATA") else {
+/// The vehicles' folder entry called `name`.
+fn vehicle_folder(name: &str) -> Option<PathBuf> {
+    let local = std::env::var_os("LOCALAPPDATA")?;
+    Some(
+        PathBuf::from(local)
+            .join(r"BrickRigs\SavedRemastered\Vehicles")
+            .join(name),
+    )
+}
+
+/// Deletes the picture in the game's autosave folder: it shows the vehicle autosaved there before,
+/// and the game takes a new one with its next autosave if there's none.
+fn remove_game_preview() {
+    if let Some(folder) = vehicle_folder(GAME_AUTOSAVE_FOLDER) {
+        let _ = fs::remove_file(folder.join(PREVIEW_FILE));
+    }
+}
+
+/// Writes `bytes` as the autosave in the vehicle folder `name`: beside it first, then in its
+/// place, so the game's vehicle list never reads half a file. Whether it was written.
+fn write_autosave(name: &str, bytes: &[u8]) -> bool {
+    let Some(folder) = vehicle_folder(name) else {
         return false;
     };
-    let folder = PathBuf::from(local)
-        .join(r"BrickRigs\SavedRemastered\Vehicles")
-        .join(AUTOSAVE_FOLDER);
     let path = folder.join(AUTOSAVE_FILE);
     let part = folder.join(format!("{AUTOSAVE_FILE}.part"));
     let written = fs::create_dir_all(&folder)

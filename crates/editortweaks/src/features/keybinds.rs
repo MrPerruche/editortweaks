@@ -247,16 +247,6 @@ pub static EXPORT_MODEL: Keybind = Keybind::menu(
     "/Game/BrickRigs/UI/Textures/Icons/T_SaveFileAs.T_SaveFileAs",
 );
 
-/// Coop test builds only: makes this member's vehicle differ from the coop session's on purpose, to
-/// test that it's noticed and mended (`coop`'s `drift`).
-#[cfg(feature = "coop-test")]
-pub static COOP_DRIFT: Keybind = Keybind::new(
-    "EditorTweaks_CoopDrift",
-    "Coop test: drift on purpose",
-    "Coop test builds only. Press in the second game of the local coop test to make its vehicle differ from the first's without telling it (moves, regroups, reorders or deletes a brick, in turn): within seconds it should notice and fix it.",
-    &["Ctrl+F8"],
-);
-
 /// Opens the coop page (`coop::ui`).
 pub static COOP_MENU: Keybind = Keybind::menu(
     "EditorTweaks_Coop",
@@ -266,38 +256,8 @@ pub static COOP_MENU: Keybind = Keybind::menu(
     "/Game/BrickRigs/UI/Textures/Icons/T_Dummy.T_Dummy",
 );
 
-/// The coop subhost lets in the oldest player asking to join (`coop`).
-pub static COOP_ACCEPT_JOIN: Keybind = Keybind::new(
-    "EditorTweaks_CoopAcceptJoin",
-    "Coop: accept a join request",
-    "While hosting, lets in the player a notification says asks to join (the oldest, if several ask).",
-    &["Ctrl+F9"],
-);
-
-/// The coop subhost refuses the oldest player asking to join (`coop`).
-pub static COOP_REFUSE_JOIN: Keybind = Keybind::new(
-    "EditorTweaks_CoopRefuseJoin",
-    "Coop: refuse a join request",
-    "While hosting, refuses the player a notification says asks to join (the oldest, if several ask).",
-    &["Ctrl+F10"],
-);
-
-/// The Tools section's keybinds (with coop's; the drift key in test builds only).
-#[cfg(feature = "coop-test")]
-const TOOLS: &[&Keybind] = &[
-    &EXPORT_MODEL,
-    &COOP_MENU,
-    &COOP_ACCEPT_JOIN,
-    &COOP_REFUSE_JOIN,
-    &COOP_DRIFT,
-];
-#[cfg(not(feature = "coop-test"))]
-const TOOLS: &[&Keybind] = &[
-    &EXPORT_MODEL,
-    &COOP_MENU,
-    &COOP_ACCEPT_JOIN,
-    &COOP_REFUSE_JOIN,
-];
+/// The Tools section's keybinds (with coop's).
+const TOOLS: &[&Keybind] = &[&EXPORT_MODEL, &COOP_MENU];
 
 /// Every keybind, by section, in the order the settings list them. The sections are the
 /// changelog's headers (those having keys).

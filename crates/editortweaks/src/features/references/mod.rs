@@ -124,9 +124,11 @@ struct State {
     unreadable: bool,
     /// The references last shown, to carry them over to a Save As or a first save.
     last_seen: Option<Seen>,
-    /// The stamp of the vehicle in the autosave folder at the last poll (`None` before the first):
-    /// when it changes, the game autosaved there.
+    /// The stamp of the vehicle in the game's autosave folder at the last poll (`None` before the
+    /// first): when it changes, the game autosaved there.
     autosave: Option<Option<Stamp>>,
+    /// The same for coop's autosave folder.
+    coop_autosave: Option<Option<Stamp>>,
     scene: Scene,
     /// Model reads report here.
     loads: Option<(Sender<Loaded>, Receiver<Loaded>)>,
@@ -172,6 +174,7 @@ impl State {
             unreadable: false,
             last_seen: None,
             autosave: None,
+            coop_autosave: None,
             scene: Scene::new(),
             loads: None,
             selected: Vec::new(),
@@ -555,12 +558,27 @@ unsafe fn poll(code: &Code, editor: *mut UObjectBase, state: &mut State) -> Vec<
     let autosave = vehicle::autosave_stamp();
     let autosaved = state.autosave.is_some_and(|seen| seen != autosave);
     state.autosave = Some(autosave);
+    let coop_autosave = vehicle::coop_autosave_stamp();
+    let coop_autosaved = state
+        .coop_autosave
+        .is_some_and(|seen| seen != coop_autosave);
+    state.coop_autosave = Some(coop_autosave);
+    // Coop's copy being written says nothing about a vehicle open from anywhere else.
+    let open_autosaved = if state
+        .folder
+        .as_deref()
+        .is_some_and(vehicle::is_coop_autosave)
+    {
+        coop_autosaved
+    } else {
+        autosaved
+    };
     if state.folder != folder || (folder.is_none() && info_changed) {
         match &folder {
             Some(folder) => log!("vehicle folder: {}", folder.display()),
             None => log!("no vehicle folder (not saved yet?)"),
         }
-        if autosaved && state.folder.as_deref().is_some_and(vehicle::is_autosave) {
+        if open_autosaved && state.folder.as_deref().is_some_and(vehicle::is_autosave) {
             // The autosave folder's vehicle, autosaved as it's left.
             follow_autosave(state);
         }
@@ -570,7 +588,7 @@ unsafe fn poll(code: &Code, editor: *mut UObjectBase, state: &mut State) -> Vec<
         // Recovering the autosave from the game's browser doesn't write it.
         let first_autosave = autosaved
             && state.folder.is_none()
-            && folder.as_deref().is_some_and(vehicle::is_autosave);
+            && folder.as_deref().is_some_and(vehicle::is_game_autosave);
         if let (true, Some(to)) = (first_autosave, &folder) {
             write_autosave(&state.sidecar, to);
         } else if let (Some(to), Some(seen)) = (&folder, state.last_seen.as_ref()) {
@@ -587,7 +605,7 @@ unsafe fn poll(code: &Code, editor: *mut UObjectBase, state: &mut State) -> Vec<
             state.hidden.clear();
         }
         state.refresh_panel = true;
-    } else if autosaved {
+    } else if open_autosaved {
         follow_autosave(state);
     }
 
@@ -709,9 +727,10 @@ fn carry_over(seen: &Seen, to: &Path) {
     }
 }
 
-/// After the game autosaved into its autosave folder, the open vehicle staying the same: if that's
-/// the vehicle autosaved there, writes its references along, marked with this autosave. Another
-/// vehicle open (one saved in its own folder), the sidecar there is left: it no longer belongs.
+/// After an autosave into an autosave folder (the game's, or coop's for a vehicle open from there),
+/// the open vehicle staying the same: if that's the vehicle autosaved there, writes its references
+/// along, marked with this autosave. Another vehicle open (one saved in its own folder), the
+/// sidecar there is left: it no longer belongs.
 fn follow_autosave(state: &mut State) {
     match state.folder.clone() {
         Some(folder) if vehicle::is_autosave(&folder) => {

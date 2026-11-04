@@ -3,8 +3,7 @@
 use windows_sys::Win32::Foundation::{HWND, LPARAM};
 use windows_sys::Win32::System::Threading::GetCurrentProcessId;
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    EnumWindows, GetClassNameW, GetWindowTextLengthW, GetWindowTextW, GetWindowThreadProcessId,
-    IsWindowVisible, SetWindowTextW,
+    EnumWindows, GetClassNameW, GetWindowThreadProcessId, IsWindowVisible,
 };
 use windows_sys::core::BOOL;
 
@@ -41,23 +40,6 @@ pub fn find_game_window() -> Option<HWND> {
     // SAFETY: `visit` only dereferences `lparam` as the `Search` we pass, which outlives the call.
     unsafe { EnumWindows(Some(visit), &raw mut search as LPARAM) };
     (!search.found.is_null()).then_some(search.found)
-}
-
-/// Current title of `hwnd`.
-pub fn title(hwnd: HWND) -> String {
-    // SAFETY: `hwnd` is a window handle; an invalid one just yields 0.
-    let len = unsafe { GetWindowTextLengthW(hwnd) }.max(0) as usize;
-    let mut buf = vec![0u16; len + 1];
-    // SAFETY: `buf` holds `buf.len()` u16s, and that's the maximum we let the API write.
-    let copied = unsafe { GetWindowTextW(hwnd, buf.as_mut_ptr(), buf.len() as i32) }.max(0);
-    String::from_utf16_lossy(&buf[..copied as usize])
-}
-
-/// Sets the title of `hwnd`. Returns false if Windows rejected it.
-pub fn set_title(hwnd: HWND, title: &str) -> bool {
-    let wide: Vec<u16> = title.encode_utf16().chain(Some(0)).collect();
-    // SAFETY: `wide` is NUL-terminated and outlives the call.
-    unsafe { SetWindowTextW(hwnd, wide.as_ptr()) != 0 }
 }
 
 fn class_name(hwnd: HWND) -> String {

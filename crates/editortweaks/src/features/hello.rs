@@ -1,12 +1,9 @@
 //! Proof of life: shows that the mod loads, that engine hooks fire and that signature-resolved game
-//! functions can be called. Visible in-game as a suffix on the window title.
+//! functions can be called. Visible in the log (`brickworks.txt`).
 
-use crate::platform::window;
 use crate::prelude::*;
 
 pub struct Hello;
-
-const TITLE_SUFFIX: &str = " + editortweaks";
 
 impl Feature for Hello {
     fn id(&self) -> &'static str {
@@ -38,24 +35,6 @@ impl Feature for Hello {
             log!("game version {version}");
         } else {
             log!("game version {version}, but this build targets {expected}");
-        }
-    }
-
-    fn on_map_load(&self) {
-        let Some(hwnd) = window::find_game_window() else {
-            log!("game window not found");
-            return;
-        };
-        let title = window::title(hwnd);
-        if title.ends_with(TITLE_SUFFIX) {
-            return;
-        }
-        let title = title.trim_end(); // the game's title has trailing spaces
-        let new_title = format!("{title}{TITLE_SUFFIX}");
-        if window::set_title(hwnd, &new_title) {
-            log!("window title set to '{new_title}'");
-        } else {
-            log!("failed to set window title");
         }
     }
 }

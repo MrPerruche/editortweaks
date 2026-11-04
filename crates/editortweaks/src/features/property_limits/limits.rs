@@ -49,8 +49,8 @@ pub enum Bound {
 /// the result is clamped to the range again.
 pub type Adjust = fn(&Edit, &mut [f32; 3]);
 
-/// Most bytes a property may have for rules to depend on it (see [`Rule::depends_on`]).
-pub const MAX_DEPENDENCY_SIZE: usize = 8;
+/// Most bytes a property may have for rules to depend on it (see [`Rule::depends_on`]): a vector's.
+pub const MAX_DEPENDENCY_SIZE: usize = 12;
 
 /// Limits for one property. Start from [`rule`] and narrow them with the methods.
 #[derive(Clone, Copy)]

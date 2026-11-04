@@ -271,8 +271,17 @@ pub(crate) struct Limits {
     /// Member: our subhost's allowance (made when it first sends something).
     host: Option<Allowance>,
     pub banned: HashSet<PeerId>,
-    /// Who the subhost's player banned, until when ([`crate::Session::tick`]'s clock).
-    pub banned_until: HashMap<PeerId, u64>,
+    /// Who the subhost's player banned.
+    pub banned_until: HashMap<PeerId, Ban>,
+}
+
+/// A ban by the subhost's player.
+#[derive(Debug)]
+pub(crate) struct Ban {
+    /// [`crate::Session::tick`]'s clock.
+    pub until: u64,
+    /// What the player gave as the reason, told to the banned player.
+    pub reason: String,
 }
 
 impl Limits {

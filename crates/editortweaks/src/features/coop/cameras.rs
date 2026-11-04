@@ -49,7 +49,7 @@ const LABEL_GAP: f64 = 10.0;
 pub static THROUGH_BRICKS: Toggle = Toggle::new(
     "CoopCamerasThroughBricks",
     "Others' cameras through bricks",
-    "Other players' camera markers show through bricks. Off: bricks in front hide them.",
+    "Other players' camera markers show through bricks. Off: bricks hide them.",
     false,
 );
 

@@ -95,28 +95,12 @@ impl Shown {
         self.boxes_at = None;
     }
 
-    /// The session's members now; returns what to tell the player: who left, and newcomers'
-    /// colors.
-    pub fn members(&mut self, members: Vec<Member>) -> Vec<String> {
+    /// The session's members now (who left or came is shown on the coop page, not announced).
+    pub fn members(&mut self, members: Vec<Member>) {
         let slots: Vec<Slot> = members.iter().map(|m| m.slot).collect();
-        let left = self
-            .members
-            .iter()
-            .filter(|old| Some(old.slot) != self.own && !slots.contains(&old.slot))
-            .map(|old| format!("Coop: {} left", old.name));
-        let came = members
-            .iter()
-            .filter(|m| Some(m.slot) != self.own)
-            .filter(|m| !self.members.iter().any(|old| old.slot == m.slot))
-            .map(|m| {
-                let (color, _) = presence::color_of(&slots, m.slot);
-                format!("Coop: {} shows in {color}", m.name)
-            });
-        let news = left.chain(came).collect();
         self.selections.retain(|slot, _| slots.contains(slot));
         self.members = members;
         self.boxes_at = None;
-        news
     }
 
     /// `slot` selected `ids`.

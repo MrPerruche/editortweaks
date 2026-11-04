@@ -1,12 +1,11 @@
 //! Slider widgets clamp typed values to their range in `SetValueInternal` (`game::slider`). For a
 //! value outside the range, the range is widened for that one call so the game's own clamp keeps
 //! it (its snapping still applies), then restored, so the slider keeps showing its normal range.
-//! Values only get the widest limit here (±`SAFE_MAX`): the property they're stored into applies
-//! the rules (`property`). Dragging and arrow keys clamp to the range themselves before calling it
-//! (`slider_drag` can remove that from dragging).
+//! Values only get the slider's widest limit here ([`scope`](super::scope)): the property they're
+//! stored into applies the rules (`property`). Dragging and arrow keys clamp to the range themselves
+//! before calling it (`slider_drag` can remove that from dragging).
 //!
-//! The color picker's sliders (`game::color_picker`) keep the game's range: values outside of it
-//! aren't colors.
+//! Sliders that aren't lifted keep the game's range ([`scope`](super::scope)).
 //!
 //! While a drag (or an arrow key) sets a slider's value, [`dragged_value`] tells the property what
 //! that value is, for rules stopping drags earlier than typed values (`Rule::drag_min`).
@@ -15,9 +14,8 @@ use core::ffi::c_void;
 use std::cell::Cell;
 use std::sync::OnceLock;
 
-use super::limits::SAFE_MAX;
+use super::scope;
 use crate::framework::{hook, timings};
-use crate::game::color_picker::{self, ColorPickers};
 use crate::game::slider::{self, RangeFields, SetValueInternalFn, ValueFields};
 use crate::prelude::*;
 
@@ -26,9 +24,6 @@ static ORIGINAL: OnceLock<SetValueInternalFn> = OnceLock::new();
 static RANGE: OnceLock<RangeFields> = OnceLock::new();
 /// Set once reflection is available; until then (or if it fails) drags go as far as typed values.
 static VALUE: OnceLock<ValueFields> = OnceLock::new();
-
-/// Set once reflection is available; until then (or if it fails) color sliders are unclamped too.
-static COLOR_PICKERS: OnceLock<ColorPickers> = OnceLock::new();
 
 thread_local! {
     /// The slider whose value a drag or an arrow key is setting on this thread, if any.
@@ -71,23 +66,6 @@ pub(super) fn on_engine_init() {
         }
         Err(reason) => log!("drags go as far as typed values: {reason}"),
     }
-    match color_picker::color_pickers() {
-        Ok(pickers) => {
-            let _ = COLOR_PICKERS.set(pickers);
-        }
-        Err(reason) => log!("color sliders aren't kept to their range: {reason}"),
-    }
-}
-
-/// Whether `slider` is one of a brick color row's, which stay within their range.
-///
-/// # Safety
-/// `slider` must be a live `UBrickSliderWidget`. Game thread only.
-pub(super) unsafe fn is_color_slider(slider: *const c_void) -> bool {
-    // SAFETY: per the contract.
-    COLOR_PICKERS
-        .get()
-        .is_some_and(|pickers| unsafe { pickers.is_color_slider(slider.cast()) })
 }
 
 /// Whether slider values are being unclamped (the other parts only matter if they are).
@@ -154,8 +132,12 @@ unsafe fn set_value(
     if clamp_and_snap & 0xFF == 0 || value.is_nan() {
         return call(value);
     }
+    // Not lifted: the game clamps it to the range.
+    let Some((limit_min, limit_max)) = scope::limit_of(this) else {
+        return call(value);
+    };
     // Infinity comes from typed values too large once converted from the shown unit.
-    let value = value.clamp(-SAFE_MAX, SAFE_MAX);
+    let value = value.clamp(limit_min, limit_max);
 
     // SAFETY: SetValueInternal is a UBrickSliderWidget member, so `this` is one; the offsets come
     // from that class's reflection data. UI code only runs on the game thread.
@@ -166,13 +148,6 @@ unsafe fn set_value(
         if (min..=max).contains(&value) {
             return call(value);
         }
-        // The game clamps it to the range.
-        if is_color_slider(this) {
-            static SEEN: std::sync::Once = std::sync::Once::new();
-            SEEN.call_once(|| log!("color slider kept to its range {min:?}..{max:?} ({value:?})"));
-            return call(value);
-        }
-
         let (wide_min, wide_max) = (min.min(value), max.max(value));
         *min_field = wide_min;
         *max_field = wide_max;

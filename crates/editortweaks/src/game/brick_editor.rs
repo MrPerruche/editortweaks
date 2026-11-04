@@ -80,6 +80,61 @@ unsafe extern "C" fn tick_detour(editor: *mut UObjectBase, delta: f32) {
     }
 }
 
+/// `void ABrickEditor::EndPlay(EEndPlayReason::Type)` (BRMK 0x9D8C0, game RVA 0xCD8F70, vtable slot
+/// 104): the editor is going, with its vehicle still there. The player left it (it's destroyed), the
+/// map changed or the game is closing (`UGameEngine::PreExit`). See `docs/re/editor-operations.md`.
+pub const END_PLAY: FunctionSig = FunctionSig {
+    name: "ABrickEditor::EndPlay",
+    // `AActor::EndPlay`, the user settings, then saving the zoom ratio to them (setter inlined).
+    pattern: "48 89 5c 24 10 57 48 81 ec ?? ?? 00 00 0f 29 74 24 ?? 48 8b f9 e8 ?? ?? ?? ?? e8 ?? ?? ?? ?? f3 0f 10 b7 ?? ?? 00 00 48 8d 15 ?? ?? ?? ?? 41 b8 01 00 00 00 48 8d 8c 24 ?? ?? 00 00 48 8b d8 e8 ?? ?? ?? ?? 0f 2e b3 ?? ?? 00 00 74",
+};
+
+type EndPlayFn = unsafe extern "C" fn(editor: *mut UObjectBase, reason: u8);
+
+/// What runs as an editor goes (see [`before_end_play`]). Called on the game thread.
+pub type BeforeEndPlay = fn(editor: *mut UObjectBase);
+
+static ORIGINAL_END_PLAY: OnceLock<EndPlayFn> = OnceLock::new();
+static BEFORE_END_PLAY: Mutex<Vec<BeforeEndPlay>> = Mutex::new(Vec::new());
+
+/// Runs `callback` as an editor goes, before any of it is taken down: the last moment its vehicle
+/// can be read. A crash or a killed process never gets here. The first call installs the hook.
+pub fn before_end_play(callback: BeforeEndPlay) -> Result<(), String> {
+    if ORIGINAL_END_PLAY.get().is_none() {
+        let end_play = END_PLAY.resolve()?;
+        // SAFETY: `end_play` is the start of ABrickEditor::EndPlay, and the detour has its
+        // signature.
+        unsafe {
+            hook::install_typed(
+                END_PLAY.name,
+                end_play,
+                end_play_detour as EndPlayFn,
+                &ORIGINAL_END_PLAY,
+            )?
+        };
+    }
+    BEFORE_END_PLAY
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .push(callback);
+    Ok(())
+}
+
+unsafe extern "C" fn end_play_detour(editor: *mut UObjectBase, reason: u8) {
+    let _span = timings::span("game::brick_editor::end_play_detour");
+    // Copied out, so that a callback may ask for more without a deadlock.
+    let callbacks = BEFORE_END_PLAY
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .clone();
+    for callback in callbacks {
+        callback(editor);
+    }
+    let original = *ORIGINAL_END_PLAY.get().expect("hook recorded before use");
+    // SAFETY: the original function with its own arguments.
+    timings::game(END_PLAY.name, || unsafe { original(editor, reason) });
+}
+
 /// The start of an operation, inlined in a `UBrickEditorMode` action (game RVA 0xD0EAF0; it takes
 /// the editor from the mode, opens an operation, changes the selection and finishes it):
 ///

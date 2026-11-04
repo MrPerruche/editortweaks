@@ -12,9 +12,11 @@
 
 use core::ffi::c_void;
 
+use brickrust::ue::fname::FName;
 use brickrust::ue::fproperty::FProperty;
 
 use crate::framework::sig::FunctionSig;
+use crate::game::reflection;
 
 /// Offset of the edited `FProperty*` in a numeric property. The typed setters (e.g. RVA 0xD081B0)
 /// store the value at `Container::target() + FProperty::Offset_Internal`, reading it from here.
@@ -30,6 +32,24 @@ pub unsafe fn reflected_field(property: *const c_void) -> *const FProperty {
         *property
             .byte_add(REFLECTED_FIELD)
             .cast::<*const FProperty>()
+    }
+}
+
+/// Offset of a numeric property's name (`FName`): the reflected property's for a row editing one,
+/// the row's own type for one that doesn't. Game 0xD68446 stores it after building the thrust force
+/// row, and BRMK's base constructor (0x1171A0) starts it out as `None`.
+const NAME: usize = 0x10;
+
+/// Whether `property` is the row of type `name`, one editing no reflected property
+/// (e.g. `FThrusterForceBrickProperty`, which has its own getter, setter and range).
+///
+/// # Safety
+/// `property` must be a live numeric property (e.g. `ClampValue`'s `this`).
+pub unsafe fn is_row_type(property: *const c_void, name: &str) -> bool {
+    // SAFETY: per the contract and the layout above.
+    unsafe {
+        reflected_field(property).is_null()
+            && reflection::name_is(&*property.byte_add(NAME).cast::<FName>(), name)
     }
 }
 

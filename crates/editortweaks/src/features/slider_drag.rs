@@ -6,17 +6,18 @@
 //!   takes as long as 100 to 1000), see [`ALT_DRAG_SPEED`]. Shift and Control slow it down, as they
 //!   do normal drags (the game's own keys for that, which stay). Releasing Alt carries on as a
 //!   normal drag from there.
-//! - With [`LIFT_SLIDER_LIMITS`] (a setting), no drag stops at the slider's ends (plain, Shift,
-//!   Ctrl or Alt): values only stop at the property's own limits (`property_limits` and its rules, some of which
-//!   stop drags before typed values: `drag_min`). In absolute mode (the value under the cursor),
-//!   dragging past an end carries on proportionally. Arrow keys still stop at the ends. The color
-//!   picker's sliders still stop there (`property_limits::is_color_slider`). So an absolute drag
-//!   doesn't stop where the (hidden) cursor meets the screen's edge, the cursor is moved back from
-//!   the edges, and the drag sees it where it would be without that ([`CursorShift`]).
+//! - With [`LIFT_SLIDER_LIMITS`] (a setting), no drag of a slider of the vehicle editor's values
+//!   stops at the slider's ends (plain, Shift, Ctrl or Alt): values only stop at the property's own
+//!   limits (`property_limits` and its rules, some of which stop drags before typed values:
+//!   `drag_min`). In absolute mode (the value under the cursor), dragging past an end carries on
+//!   proportionally. Arrow keys still stop at the ends. All other sliders stop there too
+//!   (`property_limits::slider_limit`). So an absolute drag doesn't stop where the (hidden) cursor
+//!   meets the screen's edge, the cursor is moved back from the edges, and the drag sees it where it
+//!   would be without that ([`CursorShift`]).
 //!
 //! How: the slider's mouse move handler (`game::slider_drag`) is hooked. Its clamp to the slider's
-//! range is removed from its code (or put back, as the setting says when a drag moves);
-//! `property_limits` then keeps the out-of-range value when it's set. During an Alt-drag the game sees a Shift-drag that didn't move, which keeps the value,
+//! range is removed from its code or put back, as the setting and the dragged slider say when a
+//! drag moves; `property_limits` then keeps the out-of-range value when it's set. During an Alt-drag the game sees a Shift-drag that didn't move, which keeps the value,
 //! while a timer (`platform::timer`, about once per frame) moves it. When a property stops a
 //! dragged value at its limit, the drag carries on from there ([`stored`]): moving back takes
 //! effect right away instead of first undoing the movement past the limit. The row's other sliders
@@ -44,12 +45,13 @@ use crate::platform::keyboard;
 use crate::platform::timer::ThreadTimer;
 use crate::prelude::*;
 
-/// Lift the slider's own limits from every kind of drag, so only the property's limits apply.
+/// Lift the slider's own limits from every kind of drag in the vehicle editor, so only the
+/// property's limits apply.
 pub static LIFT_SLIDER_LIMITS: Toggle = Toggle::new(
     "LiftSliderLimits",
     "Drag past slider ends",
-    "Dragging a slider carries on past its ends, up to the property's own limits. Arrow keys still \
-     stop at the ends.",
+    "In the vehicle editor, dragging a brick's slider carries on past its ends, up to the \
+     property's own limits. Arrow keys still stop at the ends.",
     true,
 );
 
@@ -220,14 +222,16 @@ fn can_lift() -> bool {
     keeps
 }
 
-/// Lifts the drag's clamp to the slider's range, or puts it back, as [`LIFT_SLIDER_LIMITS`] says
-/// now. Whether drags carry on past the slider's ends.
+/// Lifts the drag's clamp to the slider's range, or puts it back, as [`LIFT_SLIDER_LIMITS`] and
+/// the dragged `slider` say now. Whether drags carry on past the slider's ends.
 ///
 /// # Safety
 /// Game thread only, outside of `NativeOnMouseMove` (whose code holds the clamp).
-unsafe fn sync_limits(sliders: &Sliders) -> bool {
+unsafe fn sync_limits(sliders: &Sliders, slider: *const c_void) -> bool {
     let lifted = sliders.lifted.load(Ordering::Relaxed);
-    let wanted = sliders.can_lift && LIFT_SLIDER_LIMITS.get();
+    let wanted = sliders.can_lift
+        && LIFT_SLIDER_LIMITS.get()
+        && property_limits::slider_limit(slider).is_some();
     if wanted == lifted || sliders.stuck.load(Ordering::Relaxed) {
         return lifted;
     }
@@ -277,7 +281,7 @@ unsafe extern "C" fn on_mouse_move(
         return call();
     }
     // SAFETY: on the game thread, before NativeOnMouseMove runs.
-    let lifted = unsafe { sync_limits(sliders) };
+    let lifted = unsafe { sync_limits(sliders, slider) };
     // SAFETY: the caller's event and geometry, valid during the call.
     let (moved, width, modifier_keys) = unsafe {
         (
@@ -295,9 +299,9 @@ unsafe extern "C" fn on_mouse_move(
         // Without lifted limits, an absolute drag stops at the slider's end, on screen.
         if lifted {
             keep_cursor_off_edges(modifier_keys);
+            // SAFETY: a live slider being dragged, on the game thread.
+            unsafe { keep_drag_within_limit(sliders, slider) };
         }
-        // SAFETY: a live slider being dragged, on the game thread.
-        unsafe { keep_color_drag_in_range(sliders, slider) };
         return reply;
     }
 
@@ -309,19 +313,27 @@ unsafe extern "C" fn on_mouse_move(
     unsafe { as_still_shift_drag(event.cast_mut(), call) }
 }
 
-/// Keeps the drag of a color picker's slider within its range: its clamp is lifted from the game's
-/// code, so without this the drag would run past the end unseen and moving back would take effect
-/// late.
+/// How far a drag of `slider` may go now.
 ///
 /// # Safety
 /// `slider` must be a live slider. Game thread only.
-unsafe fn keep_color_drag_in_range(sliders: &Sliders, slider: *mut c_void) {
+unsafe fn drag_bounds(sliders: &Sliders, slider: *const c_void) -> (f32, f32) {
+    match property_limits::slider_limit(slider) {
+        Some(limit) if sliders.lifted.load(Ordering::Relaxed) => limit,
+        // SAFETY: per the contract.
+        _ => unsafe { sliders.range.get(slider) },
+    }
+}
+
+/// Keeps a drag within how far its slider's values go, with the clamp lifted from the game's code:
+/// without this the drag would run past the end unseen and moving back would take effect late.
+///
+/// # Safety
+/// `slider` must be a live slider. Game thread only.
+unsafe fn keep_drag_within_limit(sliders: &Sliders, slider: *mut c_void) {
     // SAFETY: per the contract.
     unsafe {
-        if !property_limits::is_color_slider(slider) {
-            return;
-        }
-        let (min, max) = sliders.range.get(slider);
+        let (min, max) = drag_bounds(sliders, slider);
         let dragged = sliders.drag.drag_value(slider);
         if dragged < min || dragged > max {
             sliders.drag.set_drag_value(slider, dragged.clamp(min, max));
@@ -589,13 +601,11 @@ unsafe fn alt_drag_step(sliders: &Sliders, slider: *mut c_void, distance: f32, s
     } else {
         1.0
     };
-    let mut target = alt_drag_target(current, span, distance * distance.abs() * seconds);
     // SAFETY: per the contract.
-    if !sliders.lifted.load(Ordering::Relaxed)
-        || unsafe { property_limits::is_color_slider(slider) }
-    {
-        target = target.max(min).min(max);
-    }
+    let (low, high) = unsafe { drag_bounds(sliders, slider) };
+    let target = alt_drag_target(current, span, distance * distance.abs() * seconds)
+        .max(low)
+        .min(high);
     if !target.is_finite() || target == current {
         return;
     }

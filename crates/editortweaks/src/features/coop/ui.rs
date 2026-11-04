@@ -24,7 +24,7 @@ pub static COOP: Page = Page {
     path: "Coop",
     category: "Properties.Settings.EditorTweaksCoop",
     sections: &super::SETTINGS,
-    body: &["Asking to join", "Players", "Invites"],
+    body: &["Join requests", "Players", "Invites"],
     make: || local_test_marked(coop_page()),
 };
 
@@ -32,7 +32,7 @@ static JOIN: Page = Page {
     path: "Coop/CoopJoin",
     category: "Properties.Settings.EditorTweaksCoopJoin",
     sections: &[],
-    body: &["Friends", "This server"],
+    body: &["Friends", "This match"],
     make: join_page,
 };
 
@@ -40,7 +40,7 @@ static BANS: Page = Page {
     path: "Coop/CoopBans",
     category: "Properties.Settings.EditorTweaksCoopBans",
     sections: &[],
-    body: &["Banned from your sessions in this match"],
+    body: &["Banned in this match"],
     make: bans_page,
 };
 
@@ -48,7 +48,7 @@ static INVITE: Page = Page {
     path: "Coop/CoopInvite",
     category: "Properties.Settings.EditorTweaksCoopInvite",
     sections: &[],
-    body: &["Steam friends playing Brick Rigs"],
+    body: &["Friends playing Brick Rigs"],
     make: invite_page,
 };
 
@@ -177,8 +177,8 @@ pub enum Request {
     Answer(PeerId, bool),
     /// Look for friends hosting for a while.
     Look,
-    /// Remove this member, called this; they may ask again.
-    Kick(PeerId, String),
+    /// Remove this member; they may ask again.
+    Kick(PeerId),
     /// Open the ban dialog for this member, called this.
     OpenBan(PeerId, String),
     /// The ban dialog was confirmed: ban them for this long (0: until the match ends).
@@ -189,7 +189,7 @@ pub enum Request {
         seconds: u64,
     },
     /// Lift this player's ban.
-    Unban(PeerId, String),
+    Unban(PeerId),
     /// Invite this friend to our session.
     Invite(PeerId, String),
     /// Hosting, the editor holding another vehicle: it replaces the session's.
@@ -300,15 +300,13 @@ fn ask(text: &str, icon: &'static str, question: String, request: Request) {
     settings_menu::show(&CONFIRM);
 }
 
-const SHARE_QUESTION: &str = "This editor doesn't hold the coop session's vehicle. Share this one \
-     instead? It replaces the session's vehicle for everyone (theirs is backed up to \
-     EditorTweaks\\CoopBackups first). Cancel: the session waits until you share one or stop \
-     hosting (coop page).";
+const SHARE_QUESTION: &str = "This editor has another vehicle. Share it? It replaces the \
+     session's vehicle for everyone, which is backed up first. Cancel: the others wait until you \
+     share or stop hosting.";
 
-const RESUME_QUESTION: &str = "This editor doesn't hold the coop session's vehicle. Continue the \
-     session's, with what the others built meanwhile? This one is backed up to \
-     EditorTweaks\\CoopBackups first. Cancel: choose on the coop page, where you can also share \
-     this one with everyone instead.";
+const RESUME_QUESTION: &str = "This editor has another vehicle. Restore the session's vehicle, \
+     with what the others built meanwhile? Yours is backed up first. Cancel: choose on the coop \
+     page.";
 
 /// Asks the subhost's player what to do with the editor's vehicle (it came back to the editor with
 /// another than the session's): continue the session's if a copy was `kept`, else share this one.
@@ -316,7 +314,7 @@ const RESUME_QUESTION: &str = "This editor doesn't hold the coop session's vehic
 pub fn ask_back(kept: bool) {
     if kept {
         ask(
-            "Continue the session's vehicle",
+            "Restore session's vehicle",
             HOST_ICON,
             RESUME_QUESTION.into(),
             Request::Resume,
@@ -423,7 +421,7 @@ fn player_rows(status: &Status) -> Vec<BodyRow> {
                         "Kick",
                         NO_ICON,
                         format!("Kick {name}? They can ask to join again."),
-                        Request::Kick(peer, name.clone()),
+                        Request::Kick(peer),
                     ),
                     act("Ban...", Request::OpenBan(peer, name)),
                 ],
@@ -439,10 +437,7 @@ fn join_row(text: String, host: Option<PeerId>, name: &str) -> BodyRow {
         vec![act_asking(
             "Join",
             PLAYER_ICON,
-            format!(
-                "Join {name}? Your vehicle is saved to EditorTweaks\\CoopBackups, then replaced \
-                 by theirs."
-            ),
+            format!("Join {name}? Your vehicle is backed up, then replaced by theirs."),
             Request::Join(host, name.to_owned()),
         )],
     )
@@ -511,7 +506,7 @@ fn coop_page() -> Shown {
                 )
             };
             let title = if status.elsewhere {
-                "Coop: hosting, but this isn't the session's vehicle".into()
+                "Coop: hosting, but not the session's vehicle".into()
             } else if others.is_empty() {
                 "Coop: hosting, nobody joined yet".into()
             } else {
@@ -519,7 +514,7 @@ fn coop_page() -> Shown {
             };
             let resume = (status.elsewhere && status.kept).then(|| {
                 button(
-                    "Continue the session's vehicle".into(),
+                    "Restore session's vehicle".into(),
                     HOST_ICON,
                     || request(Request::Resume),
                     Then::Close,
@@ -527,7 +522,7 @@ fn coop_page() -> Shown {
             });
             let share = status.elsewhere.then(|| {
                 asking(
-                    "Share this vehicle instead",
+                    "Share this vehicle",
                     HOST_ICON,
                     SHARE_QUESTION.into(),
                     Request::Share,
@@ -560,7 +555,7 @@ fn coop_page() -> Shown {
         Doing::Asking(host) => Shown {
             title: format!("Coop: asking {host} to let you in"),
             buttons: vec![button(
-                "Cancel join request".into(),
+                "Cancel request".into(),
                 NO_ICON,
                 || request(Request::Leave),
                 Then::Stay,
@@ -580,7 +575,7 @@ fn coop_page() -> Shown {
             Shown {
                 title,
                 buttons: vec![asking(
-                    "Leave current session",
+                    "Leave session",
                     EXIT_ICON,
                     format!("Leave {host}'s vehicle? You keep it as it is now, to build alone."),
                     Request::Leave,
@@ -604,9 +599,9 @@ fn join_page() -> Shown {
     let title = if !status.hosts.is_empty() {
         "Join a vehicle"
     } else if status.looking {
-        "Looking for players hosting..."
+        "Looking for hosts..."
     } else {
-        "Nobody hosting found"
+        "No hosts found"
     };
     let buttons = if status.looking {
         Vec::new()
@@ -625,7 +620,7 @@ fn join_page() -> Shown {
             .iter()
             .filter(|host| host.friend == friends)
             .map(|host| match &host.unfit {
-                Some(_) => note(format!("{}: another version", host.name)),
+                Some(_) => note(format!("{}: different version", host.name)),
                 None => join_row(host.name.clone(), host.peer, &host.name),
             })
             .collect()
@@ -641,7 +636,7 @@ fn join_page() -> Shown {
     let mut server = rows(false);
     if server.is_empty() {
         server.push(note(match status.server_players {
-            0 => "Nobody else here".to_owned(),
+            0 => "No one else here".to_owned(),
             1 => "Nobody hosting (1 other player)".to_owned(),
             n => format!("Nobody hosting ({n} other players)"),
         }));
@@ -675,7 +670,7 @@ fn bans_page() -> Shown {
                     "Lift",
                     BAN_ICON,
                     format!("Lift {}'s ban? They can ask to join again.", ban.name),
-                    Request::Unban(ban.peer, ban.name.clone()),
+                    Request::Unban(ban.peer),
                 )],
             )
         })
@@ -683,7 +678,7 @@ fn bans_page() -> Shown {
     let title = if status.bans.is_empty() {
         "Coop: nobody is banned"
     } else {
-        "Coop: bans"
+        "Coop: banned players"
     };
     Shown {
         title: title.into(),
@@ -721,7 +716,7 @@ fn invite_page() -> Shown {
         })
         .collect();
     let title = if rows.is_empty() {
-        "Coop: no other Steam friend is playing Brick Rigs"
+        "Coop: no friends playing Brick Rigs"
     } else {
         "Coop: invite friends (they need Editor tweaks)"
     };

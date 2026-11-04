@@ -106,6 +106,31 @@ impl Thrusters {
     }
 }
 
+/// How hard a thruster of type `info_class` and size `size` pushes at an `InputScale` of 1 (kg cm/s²,
+/// always positive), as `GetDefaultThrustForce` (BRMK 0x1452E0) but in doubles, as sizes that large
+/// lose too much in floats. `None` if `info_class` isn't a thruster's.
+///
+/// # Safety
+/// `info_class` must be null or a live class. Game thread only.
+pub unsafe fn force_per_input_scale(info_class: *const UClass, size: Vector) -> Option<f64> {
+    let info = reflection::find_class("ThrusterBrickStaticInfo")?;
+    let offset = reflection::field_offset(info, "Thrust", "FloatProperty", 4).ok()?;
+    // SAFETY: per the contract; `Thrust`'s offset comes from reflection, and the class is checked to
+    // be one holding it first.
+    let thrust = unsafe {
+        if !reflection::with_parents(info_class.cast()).any(|class| class == info.cast()) {
+            return None;
+        }
+        reflection::default_object(info_class)?
+            .cast::<u8>()
+            .add(offset)
+            .cast::<f32>()
+            .read_unaligned()
+    };
+    let nozzle = f64::from(size[0]) * f64::from(size[1]) / f64::from(NOZZLE_UNIT);
+    Some((f64::from(thrust) * nozzle).abs())
+}
+
 /// `EFluAxisLock UScalableBrick::GetBrickSizeAxisLock() const` (virtual; BRMK 1.11.6 export
 /// 0x143820, vtable +0x5A8): `None` (0). `UThrusterBrick` overrides it (BRMK 0x143830) with `XY`
 /// (1): its nozzle stays square.

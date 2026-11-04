@@ -1,11 +1,14 @@
 //! What the resize tool shows, as lines: boxes, the part the mouse is on, what it snaps to (marked
 //! by its kind, see [`Mark`]). Drawn in the vehicle, shown in the world. Line widths are given in
-//! pixels and turned into centimeters at each line's distance. What's drawn on top has a dark halo
-//! so it stands out on light and dark bricks alike, and the snap point's mark pops up and pulses.
+//! pixels and turned into centimeters at the distance of each line's middle, so a line looks wider
+//! where it's nearer; on a line long enough to go too far (the edge of a giant brick next to the
+//! camera), the stretches past [`WIDTHS`]'s limits get a width of their own. What's drawn on top has
+//! a dark halo so it stands out on light and dark bricks alike, and the snap point's mark pops up and
+//! pulses.
 
 use core::f64::consts::TAU;
 
-use super::geometry::{self, Bounds, Frame, Vec3};
+use super::geometry::{self, Bounds, Frame, Vec3, WidthRule};
 use super::model::{BrickModel, Element};
 use super::parts::Part;
 use crate::game::line_batcher::Line;
@@ -170,6 +173,16 @@ const PULSE_WHITE: f64 = 0.65;
 const DASH_PIXELS: f32 = 6.0;
 const GAP_PIXELS: f32 = 4.0;
 const MAX_DASHES: f64 = 200.0;
+/// How much wider or thinner than its pen a line may look along it, and so where it's cut when it
+/// would go past that: into stretches between which the distance to the camera changes by 1.25
+/// times (so about how much wider one is than the next), counting 1 cm as the nearest (a line right
+/// through the camera gets no endless tiny stretches).
+const WIDTHS: WidthRule = WidthRule {
+    ratio: 1.25,
+    nearest: 1.0,
+    thinnest: 0.5,
+    widest: 3.0,
+};
 
 /// The shape marking a snap point, facing the screen.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -261,21 +274,41 @@ impl Drawing {
         lines
     }
 
+    /// A line from `start` to `end`: one, unless it's long enough to go past [`WIDTHS`]'s limits.
+    /// The thinnest pen has no width to limit.
     pub fn segment(&mut self, start: Vec3, end: Vec3, pen: Pen) {
-        if pen.halo {
-            self.halo(start, end, pen);
+        if pen.pixels <= 0.0 {
+            self.stroke(start, end, pen, 0.0);
+            return;
         }
-        let line = self.line(start, end, pen);
+        let camera = self.pixels.camera;
+        let stretches = geometry::stretches(start, end, camera, &WIDTHS);
+        let at = |share| geometry::lerp([start, end], share);
+        for stretch in geometry::merged(stretches) {
+            self.stroke(
+                at(stretch.from),
+                at(stretch.to),
+                pen,
+                stretch.width_distance,
+            );
+        }
+    }
+
+    /// One line and its halo, as wide as `pen` says at `width_distance` from the camera.
+    fn stroke(&mut self, start: Vec3, end: Vec3, pen: Pen, width_distance: f64) {
+        if pen.halo {
+            self.halo(start, end, pen, width_distance);
+        }
+        let line = self.line(start, end, pen, width_distance);
         self.lines.push(line);
     }
 
-    fn line(&self, start: Vec3, end: Vec3, pen: Pen) -> Line {
-        let middle = geometry::scale(geometry::add(start, end), 0.5);
+    fn line(&self, start: Vec3, end: Vec3, pen: Pen, width_distance: f64) -> Line {
         Line {
             start: math::narrow(self.vehicle.point(start)),
             end: math::narrow(self.vehicle.point(end)),
             color: pen.color,
-            thickness: self.pixels.of(pen.pixels, middle) as f32,
+            thickness: (f64::from(pen.pixels) * width_distance * self.pixels.per_distance) as f32,
             on_top: pen.on_top,
         }
     }
@@ -283,7 +316,7 @@ impl Drawing {
     /// A dark line under the segment from `start` to `end`: wider, a bit longer at both ends, and a
     /// bit further from the camera (where it looks the same), so the segment shows in front of it
     /// whether or not the engine tests the depth of lines on top.
-    fn halo(&mut self, start: Vec3, end: Vec3, pen: Pen) {
+    fn halo(&mut self, start: Vec3, end: Vec3, pen: Pen, width_distance: f64) {
         let pixels = self.pixels;
         let along = geometry::normalized(geometry::sub(end, start)).unwrap_or_default();
         let moved = |point: Vec3, outward: f64| {
@@ -299,14 +332,13 @@ impl Drawing {
             pixels: pen.pixels + 2.0 * HALO_PIXELS,
             ..pen
         };
-        let line = self.line(moved(start, -1.0), moved(end, 1.0), halo);
+        let line = self.line(moved(start, -1.0), moved(end, 1.0), halo, width_distance);
         self.halos.push(line);
     }
 
-    /// The twelve edges of a box (just outside it, so it doesn't hide them).
+    /// The twelve edges of a box, a pixel outside it all along (so it doesn't hide them, and on a
+    /// giant brick they don't float away from it next to the camera).
     pub fn outline(&mut self, frame: &Frame, bounds: &Bounds, pen: Pen) {
-        let center = frame.point(bounds.point([0; 3]));
-        let bounds = bounds.grown(self.pixels.at(center));
         for along in 0..3 {
             let (a, b) = ((along + 1) % 3, (along + 2) % 3);
             for (side_a, side_b) in [(-1, -1), (-1, 1), (1, -1), (1, 1)] {
@@ -314,10 +346,30 @@ impl Drawing {
                 sides[a] = side_a;
                 sides[b] = side_b;
                 sides[along] = -1;
-                let start = frame.point(bounds.point(sides));
+                let start = bounds.point(sides);
                 sides[along] = 1;
-                let end = frame.point(bounds.point(sides));
-                self.segment(start, end, pen);
+                let end = bounds.point(sides);
+                let pixels = self.pixels;
+                // A point along the edge at `share` of it, moved out by a pixel there; past the
+                // edge's ends too, to meet the other edges at the corners.
+                let out = |share: f64| {
+                    let mut point = geometry::lerp([start, end], share);
+                    let pixel = pixels.at(frame.point(point));
+                    point[a] += f64::from(side_a) * pixel;
+                    point[b] += f64::from(side_b) * pixel;
+                    if share == 0.0 {
+                        point[along] -= pixel;
+                    } else if share == 1.0 {
+                        point[along] += pixel;
+                    }
+                    frame.point(point)
+                };
+                let ends = (frame.point(start), frame.point(end));
+                // Not merged: where it's moved out follows the distance, whatever its width does.
+                for stretch in geometry::stretches(ends.0, ends.1, pixels.camera, &WIDTHS) {
+                    let (from, to) = (out(stretch.from), out(stretch.to));
+                    self.stroke(from, to, pen, stretch.width_distance);
+                }
             }
         }
     }

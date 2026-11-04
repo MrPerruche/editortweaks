@@ -188,7 +188,7 @@ COOP BUILDING ({kind})
 Both players need this same build, and to be Steam friends.
 - Open the vehicle editor. In its top bar, "Editor tweaks" > "Coop..." opens the coop page.
 - To host: "Host this vehicle". When a friend asks to join, the coop page opens: "Let in".
-- To join: "Join a friend", wait for the host to show in the list, then "Join". Your own vehicle
+- To join: "Join someone", wait for the host to show in the list, then "Join". Your own vehicle
   is backed up first, then replaced by the host's.
 - Everything you place, move, paint or change shows for the other player. Undo (Ctrl+Z) only
   undoes your own changes.
@@ -540,14 +540,14 @@ def main() -> None:
 
     p = sub.add_parser("build", help="build the mod DLL")
     p.add_argument("--debug", action="store_true", help="debug profile instead of release")
-    p.add_argument("--coop-test", action="store_true", help="with coop's test-only tools (drift key, local test, probe)")
+    p.add_argument("--coop-test", action="store_true", help="with coop's test-only tools (local test, probe)")
     p.add_argument("--expires", type=parse_expiry, metavar="WHEN", help=expires_help)
     p.set_defaults(func=cmd_build)
 
     p = sub.add_parser("install", help="build and copy the DLL into <game>/brickworks/")
     p.add_argument("--debug", action="store_true", help="install the debug build")
     p.add_argument("--no-build", action="store_true", help="install the existing build as-is")
-    p.add_argument("--coop-test", action="store_true", help="with coop's test-only tools (drift key, local test, probe)")
+    p.add_argument("--coop-test", action="store_true", help="with coop's test-only tools (local test, probe)")
     p.add_argument("--expires", type=parse_expiry, metavar="WHEN", help=expires_help)
     p.set_defaults(func=cmd_install)
 

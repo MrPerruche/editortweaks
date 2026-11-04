@@ -32,7 +32,7 @@ time the mod doesn't start (it logs why in `brickworks.txt`). It goes by the PC'
 
 Coop building (several players editing one vehicle) is in beta and part of every build.
 `--coop-test` (on `build`, `install` and `package`) adds the test-only tools
-(a local test with two game instances on one PC, a drift key, a Steam self-send probe) and makes
+(a local test with two game instances on one PC, a Steam self-send probe) and makes
 `package` a test zip with the friend test steps. Notes: `docs/re/coop/`, UI: `docs/coop-ui.md`.
 
 `python tools/et.py --help` lists everything. To disable the mod without uninstalling, rename
