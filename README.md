@@ -13,7 +13,13 @@ A mod for Brick Rigs that extends the vehicle editor.
 - 6 new view modes
 - Editor limits increased to 200km x 200km
 - Highly configurable, fully remappable and removable keybinds
-- [And so much more](https://cryptpad.fr/code/#/2/code/view/dc0tXSDCH7+wuSdAmFhmBYtYYZhiCyR8UC7MbWmUlk8/)
+- [And so much more](FEATURES.md)
+
+## Tutorials
+
+- **[Installing and updating Editor Tweaks](https://youtu.be/inEQjcMLDH4)**
+- **[See & try out all Editor Tweaks features](https://steamcommunity.com/sharedfiles/filedetails/?id=3834892373)**
+- **[Walkthrough of all Editor Tweaks 0.1 features](https://youtu.be/VDeWaRK5V1w)**
 
 ## Install
 
@@ -22,7 +28,7 @@ Editor Tweaks is a BrickRust mod, so it needs the brickworks loader.
 1. Install [brickworks](https://github.com/KoT3isGood/brickrust/releases/tag/v0.1.0) **0.1.0**
    (ignore the repo being named brickrust instead of brickworks).
 2. Download the [latest Editor Tweaks release](https://github.com/MrPerruche/editortweaks/releases/latest).
-3. Follow the [installation tutorial](https://TODO).
+3. Follow the [installation tutorial](https://youtu.be/inEQjcMLDH4).
 
 ## License
 
