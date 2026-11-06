@@ -6,7 +6,10 @@ use crate::wire::{DecodeError, Reader, Result, Writer};
 
 /// Caps on what a peer may send (first guesses, `protocol.md`).
 pub mod caps {
-    pub const OPS_PER_BATCH: usize = 10_000;
+    /// A member's whole allowance of changes at once (`limits::rates::CHANGES`). 10,000 was too few:
+    /// one edit on a vehicle of 1,760 bricks came to 14,353 ops, and a proposal the subhost can't
+    /// read is an edit lost.
+    pub const OPS_PER_BATCH: usize = 300_000;
     /// The editor's archive counts bricks in a `u16`.
     pub const IDS_PER_OP: usize = 65_535;
     pub const ARCHIVE_BYTES: usize = 16 << 20;

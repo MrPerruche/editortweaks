@@ -53,6 +53,7 @@ mod notices;
 mod presence;
 #[cfg(feature = "coop-test")]
 mod probe;
+mod share;
 mod status_box;
 mod steam_link;
 mod ui;
@@ -89,7 +90,7 @@ use crate::framework::timings;
 use crate::game::brick_editor::{self, BrickEditor};
 use crate::game::brick_groups::{self, BrickGroups};
 use crate::game::chat::{self, Chat, Tone};
-use crate::game::editor_mode::{self, EditorModes};
+use crate::game::editor_mode::{self, EditorModes, Selector};
 use crate::game::editor_object::SpawnTransforms;
 use crate::game::editor_view::{self, Bricks};
 use crate::game::input_sources::{self, InputSources};
@@ -117,15 +118,15 @@ pub static LOCAL_TEST: Toggle = Toggle::new(
 pub static REQUEST_OPENS_PAGE: Toggle = Toggle::new(
     "CoopRequestOpensPage",
     "Open page on join requests",
-    "Someone asking to join opens the coop page. Off: only the message shows.",
+    "When someone asks to join your vehicle, the coop page automatically opens to approve / decline the request.",
     true,
 );
 
 /// Most players in a session we host, us included (`questions.md` Q8). Its index + 2.
 pub static MAX_PLAYERS: Count = Count::new(
     "CoopMaxPlayers",
-    "Most players",
-    "How many can build in your vehicle, you included. Above 4 may be unstable.",
+    "Member slots",
+    "How many members can build in your vehicle, you included. Above 4 may be unstable.",
     2,
     32,
     4,
@@ -138,6 +139,7 @@ pub static SETTINGS: [Section; 1] = [Section {
         Setting::Count(&MAX_PLAYERS),
         Setting::Toggle(&REQUEST_OPENS_PAGE),
         Setting::Toggle(&cameras::THROUGH_BRICKS),
+        Setting::Choice(&share::QUALITY),
         #[cfg(feature = "coop-test")]
         Setting::Toggle(&LOCAL_TEST),
     ],
@@ -167,9 +169,11 @@ const ANSWER_WAIT: Duration = Duration::from_secs(180);
 const ASKING_EVERY: Duration = Duration::from_secs(4);
 /// No editor ticked for this long (or it's gone): the player left the editor.
 const AWAY_AFTER: Duration = Duration::from_secs(2);
-/// Back in an editor, how long the session's vehicle is looked for in it (an editor may load it a
-/// little after it opens) before it's taken for another.
-const REFIT_WAIT: Duration = Duration::from_secs(3);
+/// Back in an editor, how long the session's vehicle is looked for in it before it's taken for
+/// another. The game loads an editor's vehicle before its first tick (`EnterEditor` calls `LoadItem`
+/// and `LoadFromFile`, which return their result), and was seen to in the logs; a few frames more
+/// only in case some way in doesn't.
+const REFIT_WAIT: Duration = Duration::from_millis(150);
 /// How often a subhost's editor holding another vehicle is looked at again for the session's.
 const LOOK_AGAIN: Duration = Duration::from_secs(1);
 /// How often the thread timer ticks the link while no editor does.
@@ -180,6 +184,8 @@ pub struct Game {
     editor: BrickEditor,
     bricks: Bricks,
     modes: EditorModes,
+    /// Selecting bricks as a click does (or why not: then a resync loses the selection).
+    selector: Result<Selector, String>,
     archive: VehicleArchive,
     spawn: SpawnTransforms,
     values: BrickValues,
@@ -220,6 +226,9 @@ fn game() -> Option<&'static Game> {
             editor: brick_editor::find()?,
             bricks: editor_view::bricks()?,
             modes: editor_mode::find()?,
+            selector: editor_mode::selector().inspect_err(|reason| {
+                coop_log!("a resync will lose the selection: {reason}");
+            }),
             archive,
             spawn: SpawnTransforms::find()?,
             values: property_values::find()?,
@@ -313,7 +322,10 @@ impl Wire {
                     by_peer: false,
                 })
                 .collect(),
-            Wire::Steam(steam) => steam.take_lost(),
+            Wire::Steam(steam) => steam.take_lost(|| {
+                let players = dialogs::match_players().into_iter().map(|(id, _)| id);
+                Some((dialogs::current_match()?, players.collect()))
+            }),
         }
     }
 
@@ -321,6 +333,13 @@ impl Wire {
     fn log_connection(&self, peer: PeerId) {
         if let Wire::Steam(steam) = self {
             steam.log_connection(peer);
+        }
+    }
+
+    /// Logs what is queued toward `peer` on Steam, to see bulk data waiting.
+    fn log_queue(&self, peer: PeerId) {
+        if let Wire::Steam(steam) = self {
+            steam.log_queue(peer);
         }
     }
 
@@ -352,6 +371,13 @@ impl Transport for Wire {
         match self {
             Wire::Local(tcp) => tcp.receive(),
             Wire::Steam(steam) => steam.receive(),
+        }
+    }
+
+    fn backlog(&mut self, to: PeerId) -> Option<usize> {
+        match self {
+            Wire::Local(tcp) => tcp.backlog(to),
+            Wire::Steam(steam) => steam.backlog(to),
         }
     }
 }
@@ -396,6 +422,8 @@ struct Link {
     autosave: backup::AutoSave,
     /// Member: how much of the game's time goes to what the subhost sends (see [`overloaded`]).
     workload: ::coop::limits::Workload,
+    /// Subhost: an edit made other bricks here than the session counts ([`settle`]).
+    drifted_here: bool,
     /// Others' selections, and sending ours.
     presence: presence::Shown,
     /// Others' cameras, and sending ours.
@@ -416,6 +444,8 @@ struct Link {
     /// Subhost: the session's vehicle as the editor last closed on it ([`editor_closing`]), to
     /// bring back if the player returns to another vehicle or none ([`resume`]).
     kept: Option<Kept>,
+    /// The subhost's references, shared with members.
+    share: share::Share,
 }
 
 /// A copy of the session's vehicle: its bricks' coop ids, in object order, and the vehicle (a
@@ -1629,6 +1659,7 @@ fn start(game: &Game, editor: Object, opening: Opening) -> Option<Box<Link>> {
         started: Instant::now(),
         autosave: backup::AutoSave::new(),
         workload: ::coop::limits::Workload::default(),
+        drifted_here: false,
         presence: presence::Shown::new((role == Role::Host).then_some(::coop::ids::SUBHOST_SLOT)),
         cameras: cameras::Cameras::new((role == Role::Host).then_some(::coop::ids::SUBHOST_SLOT)),
         here: Here::Editing,
@@ -1639,6 +1670,10 @@ fn start(game: &Game, editor: Object, opening: Opening) -> Option<Box<Link>> {
         accepted: Vec::new(),
         resyncing: false,
         kept: None,
+        share: match role {
+            Role::Host => share::Share::host(),
+            Role::Member => share::Share::member(),
+        },
     }))
 }
 
@@ -1738,6 +1773,9 @@ fn step(game: &Game, link: &mut Link) -> bool {
     if alive && link.role == Role::Member && overloaded(link, busy_since) {
         return false;
     }
+    if std::mem::take(&mut link.drifted_here) {
+        settle(game, link);
+    }
     if !requests.snapshots.is_empty() {
         answer(game, link, requests.snapshots);
     }
@@ -1753,9 +1791,22 @@ fn step(game: &Game, link: &mut Link) -> bool {
     }
     if link.session.is_loaded() {
         link.autosave.tick(game, link.editor, link.component);
+        if link.share.settled() {
+            link.autosave.references_settled();
+        }
     }
     send(link);
     alive
+}
+
+/// Subhost: an edit made other bricks in this editor than the session counts. The session takes the
+/// editor's word for it, and what it can't have goes for everyone (`Session::settle`).
+fn settle(game: &Game, link: &mut Link) {
+    let ids = ids_in_order(game, link.editor);
+    match link.session.settle(&ids) {
+        0 => coop_log!("  the session counts the editor's bricks again"),
+        gone => coop_log!("  {gone} bricks this editor doesn't have were deleted for everyone"),
+    }
 }
 
 /// Member: counts the time this tick spent reading and applying what the subhost sent, and leaves
@@ -1798,6 +1849,13 @@ fn network(link: &mut Link) -> bool {
         steam.expect(link.session.expected_peers());
     }
     pump(&mut link.session, &mut link.transport);
+    let now = session_time(link, Instant::now());
+    link.share.tick(
+        &mut link.session,
+        &mut link.transport,
+        now,
+        link.here == Here::Editing,
+    );
     let mut alive = true;
     for Closed { peer, by_peer } in link.transport.take_lost() {
         match link.role {
@@ -2054,6 +2112,7 @@ fn resume(game: &Game, link: &mut Link) {
     };
     if target.load(&kept.ids, &kept.vehicle, false).drifted {
         coop_log!("  the session's vehicle came back differently: audits will show where");
+        link.drifted_here = true;
     }
     link.here = Here::Editing;
     coop_log!(
@@ -2149,11 +2208,17 @@ fn audited(link: &mut Link, target: &Target, audit: &Audit) {
     // SAFETY: the editor is live (it's ticking); game thread.
     let objects = unsafe { objects(game, link.editor) };
     let ids: Vec<CoopId> = objects.iter().filter_map(|&o| changes::id_of(o)).collect();
-    let differences = audit.compare(objects.len() as u32, audit::order_hash(ids), |id| {
-        let object = changes::object(id)?;
-        // SAFETY: objects with coop ids are live; game thread.
-        unsafe { digest_of(game, object) }
-    });
+    let absent = changes::absent();
+    let differences = audit.compare_without(
+        objects.len() as u32,
+        audit::order_hash(ids),
+        &absent,
+        |id| {
+            let object = changes::object(id)?;
+            // SAFETY: objects with coop ids are live; game thread.
+            unsafe { digest_of(game, object) }
+        },
+    );
     if differences.is_empty() {
         if link.audits_failed > 0 {
             coop_log!("audit: the vehicle matches the subhost's again");
@@ -2353,11 +2418,26 @@ fn step_back(link: &mut Link, target: &Target, redo: bool) {
     if outcome.refused > 0 {
         coop_log!("  {} ops refused as impossible here", outcome.refused);
     }
-    if outcome.drifted {
-        match link.role {
-            Role::Member => link.session.request_resync(),
-            Role::Host => coop_log!("  the subhost's editor drifted from the session"),
+    follow_outcome(link, outcome);
+}
+
+/// What it takes when an edit came out otherwise in this editor. A brick this game can't make goes
+/// for everyone if it's the subhost's (its editor is the session's vehicle), and only here if it's
+/// a member's, which needs no snapshot: another wouldn't make the brick either. Anything else gets
+/// a member the vehicle.
+fn follow_outcome(link: &mut Link, outcome: apply::Outcome) {
+    match link.role {
+        Role::Member => {
+            changes::mark_absent(outcome.skipped);
+            if outcome.drifted {
+                link.session.request_resync();
+            }
         }
+        Role::Host if outcome.drifted || !outcome.skipped.is_empty() => {
+            coop_log!("  the subhost's editor drifted from the session");
+            link.drifted_here = true;
+        }
+        Role::Host => {}
     }
 }
 
@@ -2402,7 +2482,14 @@ fn handle(link: &mut Link, target: Option<&Target>, event: Event, requests: &mut
                     "session's vehicle before the host shared another",
                 );
             }
+            // The bricks come back as new objects: the selection follows their ids.
+            let selected = match &target.game.presence {
+                Ok(kit) => presence::selected(kit),
+                Err(_) => Vec::new(),
+            };
             let outcome = target.load(&ids, &vehicle, !link.loaded);
+            target.select(&selected);
+            changes::mark_absent(outcome.skipped);
             link.loaded = true;
             link.resyncing = false;
             if outcome.drifted {
@@ -2425,12 +2512,7 @@ fn handle(link: &mut Link, target: Option<&Target>, event: Event, requests: &mut
             if outcome.refused > 0 {
                 coop_log!("  {} ops refused as impossible here", outcome.refused);
             }
-            if outcome.drifted {
-                match link.role {
-                    Role::Member => link.session.request_resync(),
-                    Role::Host => coop_log!("  the subhost's editor drifted from the session"),
-                }
-            }
+            follow_outcome(link, outcome);
         }
         Event::SnapshotWanted(request) => requests.snapshots.push(request),
         Event::OrderWanted(peer) => requests.orders.push(peer),
@@ -2464,6 +2546,8 @@ fn handle_anywhere(link: &mut Link, event: Event) -> bool {
             );
             link.presence.joined(slot);
             link.cameras.joined(slot);
+            let now = session_time(link, Instant::now());
+            link.share.joined(&mut link.session, now);
             for peer in link.session.expected_peers() {
                 link.transport.log_connection(peer);
             }
@@ -2528,6 +2612,20 @@ fn handle_anywhere(link: &mut Link, event: Event) -> bool {
         }
         Event::Selection { slot, ids } => link.presence.selected(slot, ids),
         Event::Camera { slot, view } => link.cameras.seen(slot, view),
+        Event::ReferenceLevelAsked { peer, level } => {
+            let now = session_time(link, Instant::now());
+            link.share.level_asked(peer, level, now);
+        }
+        Event::ReferenceWanted { peer, content } => link.share.wanted(peer, content),
+        Event::ReferenceList(entries) => link.share.list(entries),
+        Event::ReferenceData {
+            content,
+            offset,
+            data,
+        } => {
+            let now = session_time(link, Instant::now());
+            link.share.data(content, offset, &data, now);
+        }
         // Already in a session: invites don't matter.
         Event::Hello { .. } | Event::Invited { .. } => {}
         // Made in the editor (`handle`).

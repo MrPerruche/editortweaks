@@ -412,7 +412,8 @@ fn after_tick(editor: *mut UObjectBase, _delta: f32) {
     };
     report_written();
     let held = keybinds::EXPORT_MODEL.is_held();
-    let pressed = held && !KEY_HELD.swap(held, Ordering::Relaxed);
+    let was_held = KEY_HELD.swap(held, Ordering::Relaxed);
+    let pressed = held && !was_held;
     if REQUESTED.swap(false, Ordering::Relaxed) || pressed {
         settings_menu::open(&DIALOG);
     }

@@ -2,7 +2,8 @@
 //! mouse, telling about what's under it, in the view modes that have something to tell
 //! ([`super::describe`]): "Strength", "Connections", "Reference fit", and the game's "Physics" (its
 //! centers, [`super::physics`]). Shown over the 3D view
-//! (`game::view_canvas`), worked out again only when the mouse, the camera or the editor changed.
+//! (`game::view_canvas`), worked out again only when the mouse, the camera or the editor changed,
+//! and hidden while the camera moves.
 //! Off with the setting [`TOOLTIPS`] (shared with the shot preview's tooltips).
 //!
 //! What's under the mouse is traced like the editor's clicks (`game::line_trace`), hidden bricks
@@ -14,6 +15,7 @@
 
 use std::collections::HashSet;
 use std::sync::{Mutex, OnceLock, PoisonError};
+use std::time::{Duration, Instant};
 
 use brickrust::ue::coreuobject::UObjectBase;
 
@@ -27,6 +29,7 @@ use crate::game::line_trace::{self, ComponentTrace, LineTrace};
 use crate::game::view_tooltip::{self, ViewTooltip, ViewTooltipCode};
 use crate::game::viewport::Ray;
 use crate::math;
+use crate::platform::keyboard;
 use crate::prelude::*;
 
 /// Whether the shot preview and our view modes show their tooltips, a setting.
@@ -74,6 +77,9 @@ const STEP: f32 = 0.01;
 const BEYOND: f32 = 1.0e5;
 /// How much bigger than a brick's box the line must meet, in cm: the box is the engine's, rounded.
 const BOX_MARGIN: f32 = 1.0;
+/// How long after the camera last moved the tooltip stays away, so that it doesn't flash back
+/// between two movements (slow ones can leave a frame or two with the camera still).
+const AFTER_CAMERA: Duration = Duration::from_millis(150);
 /// What the tooltip needs from the game (after engine init).
 struct Code {
     editor: BrickEditor,
@@ -90,6 +96,10 @@ struct State {
     /// What it was worked out for, and what it said then (no lines: hidden).
     key: Option<Key>,
     shown: Description,
+    /// The ray through the middle of the view (the mouse's moves with the mouse), and when it last
+    /// changed: the camera moving.
+    view: Option<[Vector; 2]>,
+    camera_moved: Option<Instant>,
 }
 
 /// What the tooltip's text depends on.
@@ -124,6 +134,8 @@ static STATE: Mutex<State> = Mutex::new(State {
         title: String::new(),
         lines: Vec::new(),
     },
+    view: None,
+    camera_moved: None,
 });
 static BOXES: Mutex<Option<Boxes>> = Mutex::new(None);
 
@@ -375,6 +387,9 @@ impl State {
             if controller.is_null() {
                 return None;
             }
+            if self.camera_moving(code, controller)? {
+                return None;
+            }
             let mouse = code.ui.viewport.mouse(controller)?;
             let ray = code.ui.viewport.ray(controller, mouse)?;
             let key = Key {
@@ -402,6 +417,29 @@ impl State {
             }
             self.tooltip.show(&code.ui, controller, mouse).ok()
         }
+    }
+
+    /// Whether the camera is moving, or about to (a button that turns it is down: the mouse stays
+    /// where it was meanwhile, so nothing else tells). The tooltip is about what's under the mouse,
+    /// which doesn't hold still then.
+    ///
+    /// # Safety
+    /// `controller` must be the live editor's. Game thread only.
+    unsafe fn camera_moving(&mut self, code: &Code, controller: *mut UObjectBase) -> Option<bool> {
+        // SAFETY: per the contract.
+        let view = unsafe {
+            let [width, height] = code.ui.viewport.size(controller)?;
+            let middle = [width as f32 * 0.5, height as f32 * 0.5];
+            code.ui.viewport.ray(controller, middle)?
+        };
+        let view = [view.origin, view.direction];
+        if self.view.replace(view).is_some_and(|last| last != view) {
+            self.camera_moved = Some(Instant::now());
+        }
+        let moved_lately = self
+            .camera_moved
+            .is_some_and(|at| at.elapsed() < AFTER_CAMERA);
+        Some(moved_lately || keyboard::is_mouse_button_down() || keyboard::is_middle_button_down())
     }
 
     /// Hides the tooltip.

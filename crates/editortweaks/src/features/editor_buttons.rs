@@ -7,7 +7,8 @@
 //! `Action_MoveCamera` (`game::editor_input::ButtonAction`), called on press and on release; Shift
 //! + the left button is `AddToSelection` instead of `Select`, the middle button `PivotCamera`. The
 //! keys are `Action_DeleteSelection` (Delete), `Action_DuplicateSelection` (Ctrl + C),
-//! `Action_HideSelection` (H) and `Action_UnhideAll` (Alt + H), handlers of the same kind. Their
+//! `Action_HideSelection` (H), `Action_UnhideAll` (Alt + H) and `Action_EditorCancel`, handlers of
+//! the same kind. Their
 //! exec thunks are hooked here on the first [`listen`] (`AddToSelection`, `PivotCamera` and the
 //! keys only if found: the left and right buttons work without them); each press or release goes
 //! to the listeners in the order they listened, until one takes it: then the game's handler doesn't
@@ -44,6 +45,8 @@ pub enum Button {
     Hide,
     /// `UnhideAll`: Alt + H.
     UnhideAll,
+    /// `EditorCancel`.
+    Cancel,
 }
 
 impl Button {
@@ -51,7 +54,7 @@ impl Button {
     pub fn is_key(self) -> bool {
         matches!(
             self,
-            Button::Delete | Button::Duplicate | Button::Hide | Button::UnhideAll
+            Button::Delete | Button::Duplicate | Button::Hide | Button::UnhideAll | Button::Cancel
         )
     }
 }
@@ -79,6 +82,7 @@ struct Actions {
     duplicate: Option<ButtonAction>,
     hide: Option<ButtonAction>,
     unhide_all: Option<ButtonAction>,
+    cancel: Option<ButtonAction>,
 }
 
 static ACTIONS: OnceLock<Actions> = OnceLock::new();
@@ -90,6 +94,7 @@ static ORIGINAL_DELETE: OnceLock<NativeThunk> = OnceLock::new();
 static ORIGINAL_DUPLICATE: OnceLock<NativeThunk> = OnceLock::new();
 static ORIGINAL_HIDE: OnceLock<NativeThunk> = OnceLock::new();
 static ORIGINAL_UNHIDE_ALL: OnceLock<NativeThunk> = OnceLock::new();
+static ORIGINAL_CANCEL: OnceLock<NativeThunk> = OnceLock::new();
 /// Whether the hooks are in place, or why not.
 static HOOKED: OnceLock<Result<(), String>> = OnceLock::new();
 static LISTENERS: Mutex<Vec<Listener>> = Mutex::new(Vec::new());
@@ -120,6 +125,7 @@ fn hook_handlers() -> Result<(), String> {
         duplicate: optional(editor_input::DUPLICATE_SELECTION),
         hide: optional(editor_input::HIDE_SELECTION),
         unhide_all: optional(editor_input::UNHIDE_ALL),
+        cancel: optional(editor_input::EDITOR_CANCEL),
     };
     let (select, move_camera) = (actions.select.thunk, actions.move_camera.thunk);
     let add_to_selection = actions.add_to_selection.as_ref().map(|action| action.thunk);
@@ -128,6 +134,7 @@ fn hook_handlers() -> Result<(), String> {
     let duplicate = actions.duplicate.as_ref().map(|action| action.thunk);
     let hide = actions.hide.as_ref().map(|action| action.thunk);
     let unhide_all = actions.unhide_all.as_ref().map(|action| action.thunk);
+    let cancel = actions.cancel.as_ref().map(|action| action.thunk);
     let _ = ACTIONS.set(actions);
     // SAFETY: every target is an exec thunk, and the detours are NativeThunks.
     unsafe {
@@ -202,6 +209,16 @@ fn hook_handlers() -> Result<(), String> {
             )
         {
             log!("Unhide all not taken over: {reason}");
+        }
+        if let Some(cancel) = cancel
+            && let Err(reason) = hook::install_typed(
+                "execAction_EditorCancel",
+                cancel,
+                cancel_detour as NativeThunk,
+                &ORIGINAL_CANCEL,
+            )
+        {
+            log!("Cancel not taken over: {reason}");
         }
     }
     Ok(())
@@ -361,6 +378,22 @@ unsafe extern "C" fn unhide_all_detour(
     }
 }
 
+unsafe extern "C" fn cancel_detour(context: *mut c_void, stack: *mut c_void, result: *mut c_void) {
+    let _span = timings::span("editor_buttons::cancel_detour");
+    let original = *ORIGINAL_CANCEL.get().expect("hook recorded before use");
+    // SAFETY: the thunk's own arguments, passed on.
+    unsafe {
+        handle(
+            Button::Cancel,
+            "execAction_EditorCancel",
+            context,
+            stack,
+            result,
+            original,
+        )
+    }
+}
+
 /// Runs `original` (the game's `game_name`), the thunk of `button`'s action called with `context`, `stack` and `result`,
 /// unless a listener takes the call.
 ///
@@ -387,6 +420,7 @@ unsafe fn handle(
                 Button::Duplicate => actions.duplicate.as_ref(),
                 Button::Hide => actions.hide.as_ref(),
                 Button::UnhideAll => actions.unhide_all.as_ref(),
+                Button::Cancel => actions.cancel.as_ref(),
             };
             if let Some(action) = action
                 && action.is_editor_input(context)

@@ -13,10 +13,14 @@
 //!
 //! With references selected (clicked, see [`select`]), the panel shows them instead of the
 //! editor's settings, as it shows selected bricks (`settings_list::replace`): their color and
-//! opacity (the game's color picker, alpha being the opacity), link or copy, position, rotation, width (images) or scale (models); for models their pivot, and
+//! opacity (the game's color picker, alpha being the opacity), link or copy, position, rotation,
+//! width (images) or scale and size (models, the size setting the scale); for models their pivot, and
 //! for OBJ and STL files (glTF fixes them) the file's up and front axes and units. The first
 //! selected reference's values show; a change goes to every selected reference the row fits:
 //! positions move them together, the other values are set on each.
+//!
+//! In a coop session a member's references are the host's ([`super::received`]): the rows show their
+//! values but don't change them, nothing is added, and a row says how far they arrived.
 //!
 //! Rows run on the game thread while the panel lists or changes them (never inside a tick of the
 //! feature), so they use the feature's state directly; each change shows at the next tick and is
@@ -51,8 +55,11 @@ const VIEW_GAP: f64 = 20.0;
 const POSITION_RANGE: (f32, f32) = (-10_000.0, 10_000.0);
 /// The ends of an image's width, in cm.
 const WIDTH_RANGE: (f32, f32) = (1.0, 100_000.0);
-/// The ends of a model's scale (1 is its size in the file).
-const SCALE_RANGE: (f32, f32) = (0.001, 100.0);
+/// The ends of a model's scale (1 is its size in the file): down to a millionth, for models made in
+/// mm or bigger than real (a 1 km model is then 1 mm).
+const SCALE_RANGE: (f32, f32) = (0.000_001, 100.0);
+/// The ends of the size sliders, in cm: typed sizes go as far as the scale lets them.
+const SIZE_RANGE: (f32, f32) = (1.0, 10_000.0);
 
 /// A row: its key, name, tooltip, value, and when it's listed.
 type RowSpec = (
@@ -67,7 +74,7 @@ type RowSpec = (
 pub static ADD_AS: Choice = Choice::new(
     "ReferencesAddAs",
     "New references",
-    "Whether an added reference links to its file, or copies it into the vehicle's folder so moving the original doesn't lose it (copies stay on this PC). A reference's File row changes it later.",
+    "Whether an added reference links to its file, or copies it in a safe place so moving the original doesn't lose it (copies stay on this PC). A reference's File row changes it later.",
     &[
         Alternative {
             key: "Link",
@@ -82,13 +89,20 @@ pub static ADD_AS: Choice = Choice::new(
 );
 
 /// The rows with nothing selected, after the map's.
-const GENERAL: [RowSpec; 3] = [
+const GENERAL: [RowSpec; 4] = [
     (
         "ReferencesAdd",
         "Add reference",
         ADD_DESCRIPTION,
         Value::List(&ADD),
-        always,
+        not_received,
+    ),
+    (
+        "ReferencesReceived",
+        "Host's references",
+        RECEIVED_DESCRIPTION,
+        Value::List(&RECEIVED),
+        received_row,
     ),
     (
         "ReferencesVisibility",
@@ -153,6 +167,13 @@ const SELECTED: [(&str, &[RowSpec]); 2] = [
                 Value::Number(&SCALE),
                 has_model,
             ),
+            (
+                "ReferenceSize",
+                "Size",
+                SIZE_DESCRIPTION,
+                Value::Number(&SIZE),
+                has_model,
+            ),
         ],
     ),
     (
@@ -163,7 +184,7 @@ const SELECTED: [(&str, &[RowSpec]); 2] = [
                 "Pivot",
                 PIVOT_DESCRIPTION,
                 Value::List(&PIVOT),
-                has_model,
+                has_own_model,
             ),
             (
                 "ReferenceUp",
@@ -255,7 +276,36 @@ fn always() -> bool {
     true
 }
 
+/// Whether the references shown are the player's own, not the coop session's.
+fn not_received() -> bool {
+    state().is_none_or(|state| state.received.is_none())
+}
+
+fn received_row() -> bool {
+    !not_received()
+}
+
+/// The row saying how far the session's references arrived.
+struct Received;
+
+static RECEIVED: Received = Received;
+
+impl List for Received {
+    fn items(&self) -> Vec<String> {
+        vec![state().map_or_else(String::new, |state| state.received_status.clone())]
+    }
+
+    fn chosen(&self) -> usize {
+        0
+    }
+
+    fn choose(&self, _index: usize) -> bool {
+        true
+    }
+}
+
 const ADD_DESCRIPTION: &str = "Import an image or model as reference. This reference will only be visible in the editor! You cannot spawn it in the world. You can go in settings to set whether the game keeps a link to the file (meaning the imported file must not be moved or destroyed) or keeps a copy safe it in its game file..";
+const RECEIVED_DESCRIPTION: &str = "These references are the host's, sent over at the quality set in Editor Tweaks' coop settings. Saving the vehicle keeps a copy of them. You can hide them, only for you.";
 const HIDDEN_DESCRIPTION: &str = "Some references are invisible (opacity 0), so they can't be clicked. Click to make them visible again.";
 const SHOWN_DESCRIPTION: &str = "Hide references with \"Hidden\", make so you can't select them with \"Not selectable\", or use \"Visible\" to see them.";
 const OPACITY_DESCRIPTION: &str = "How opaque the reference is. How opacity is handled can be configured in Editor Tweaks' settings. If set to 0, it is invisible and can't be clicked but can be reverted in the side bar.";
@@ -264,7 +314,8 @@ const TINT_DESCRIPTION: &str = "The color multiplies the reference's colors (its
 const POSITION_DESCRIPTION: &str = "Where the reference is. The sliders span the editor, typed values can go further, as for bricks.";
 const ROTATION_DESCRIPTION: &str = "Rotate a reference.";
 const WIDTH_DESCRIPTION: &str = "How wide the picture is (its height follows).";
-const SCALE_DESCRIPTION: &str = "Scale of the reference.";
+const SCALE_DESCRIPTION: &str = "Scale of the reference: 100% is its size in the file.";
+const SIZE_DESCRIPTION: &str = "Length, width and height of the model (its box, along its own axes). Setting one scales the model to it, the others follow.";
 const FILE_DESCRIPTION: &str = "Link: loads what is found at this file path. The file must not be moved or deleted, else the reference will be lost. Copy: keep a copy of the file save in game files, avoiding accidental edits and deletions.";
 const PIVOT_DESCRIPTION: &str = "Which point of the model is at the reference's position.";
 const UP_DESCRIPTION: &str =
@@ -304,6 +355,10 @@ fn edit_selected(mut change: impl FnMut(&mut Reference, &Context) -> Result<(), 
         return false;
     };
     let state = &mut *state;
+    // The session's references are the host's.
+    if state.received.is_some() {
+        return false;
+    }
     let folder = state.folder.clone();
     let context = Context {
         folder: folder.as_deref(),
@@ -393,6 +448,17 @@ fn is_model(reference: &Reference) -> bool {
     reference.kind == Kind::Model
 }
 
+/// A model read from its own file, not one a coop host sent (already in the editor's space, around
+/// its pivot).
+fn is_own_model(reference: &Reference) -> bool {
+    let file = reference
+        .source
+        .copy
+        .as_deref()
+        .unwrap_or(&reference.source.path);
+    is_model(reference) && Format::of(Path::new(file)) != Some(Format::Shared)
+}
+
 /// A model whose format leaves its axes and units to the user.
 fn leaves_axes(reference: &Reference) -> bool {
     is_model(reference)
@@ -406,6 +472,10 @@ fn has_image() -> bool {
 
 fn has_model() -> bool {
     any_selected(is_model)
+}
+
+fn has_own_model() -> bool {
+    any_selected(is_own_model)
 }
 
 fn has_axes() -> bool {
@@ -455,7 +525,7 @@ fn browse(kind: Kind) {
     let Some(mut state) = state() else {
         return;
     };
-    if state.browsing.is_some() {
+    if state.browsing.is_some() || state.received.is_some() {
         return;
     }
     let mode = if ADD_AS.get() == 1 {
@@ -475,6 +545,9 @@ static SHOW_HIDDEN: Buttons = Buttons {
         let Some(mut state) = state() else {
             return;
         };
+        if state.received.is_some() {
+            return;
+        }
         for reference in state.sidecar.references.iter_mut().filter(|r| is_hidden(r)) {
             reference.visible = true;
             if reference.opacity <= 0.0 {
@@ -751,25 +824,122 @@ static WIDTH: Numbers = Numbers {
     unit: Unit::Distance,
 };
 
-/// One scale for all three axes; scales differing per axis (edited by hand) keep their ratios.
+/// Sets a model's scale (the first axis' one, as the Scale row shows it) to `scale`, within
+/// [`SCALE_RANGE`]. Scales differing per axis (edited by hand) keep their ratios.
+fn set_scale(reference: &mut Reference, scale: f64) {
+    if scale.is_nan() || scale <= 0.0 {
+        return;
+    }
+    let scale = scale.clamp(f64::from(SCALE_RANGE.0), f64::from(SCALE_RANGE.1));
+    let old = reference.scale[0];
+    reference.scale = if old > 0.0 {
+        reference.scale.map(|axis| axis * scale / old)
+    } else {
+        [scale; 3]
+    };
+}
+
+/// One scale for all three axes.
 static SCALE: Numbers = Numbers {
     get: |reference| is_model(reference).then(|| vec![reference.scale[0]]),
-    set: |reference, _, scale| {
-        let old = reference.scale[0];
-        if scale <= 0.0 {
-            return;
-        }
-        reference.scale = if old > 0.0 {
-            reference.scale.map(|axis| axis * scale / old)
-        } else {
-            [scale; 3]
-        };
-    },
+    set: |reference, _, scale| set_scale(reference, scale),
     together: Together::Same,
     range: Ends::Fixed(SCALE_RANGE.0, SCALE_RANGE.1),
     limit: SCALE_RANGE,
     unit: Unit::Percent,
 };
+
+/// The Size row: a model's length, width and height in cm, shown in the player's units. Another way
+/// to set its scale (as a thruster's force is to its input scale), so it's known only once the
+/// model is built.
+struct Size;
+
+static SIZE: Size = Size;
+
+/// A model's size along its own axes at its scale, in cm, once it's built.
+fn size_of(state: &State, reference: &Reference) -> Option<[f64; 3]> {
+    if !is_model(reference) {
+        return None;
+    }
+    let unscaled = state.scene.local_size(&reference.id)?;
+    Some(core::array::from_fn(|axis| {
+        unscaled[axis] * reference.scale[axis].abs()
+    }))
+}
+
+/// The selected models' sizes ([`size_of`]), by id, the first selected one first.
+fn selected_sizes() -> Vec<(String, [f64; 3])> {
+    let Some(state) = state() else {
+        return Vec::new();
+    };
+    state
+        .selected
+        .iter()
+        .filter_map(|id| {
+            let reference = state
+                .sidecar
+                .references
+                .iter()
+                .find(|reference| reference.id == *id)?;
+            Some((id.clone(), size_of(&state, reference)?))
+        })
+        .collect()
+}
+
+impl Number for Size {
+    fn values(&self) -> Vec<f32> {
+        selected_sizes()
+            .first()
+            .map(|(_, size)| size.map(|value| value as f32).to_vec())
+            .unwrap_or_default()
+    }
+
+    /// The first value the panel changed sets every selected model's size along that axis (each
+    /// keeps its proportions): only one can be set, the others follow.
+    fn set_values(&self, values: &[f32]) {
+        let sizes = selected_sizes();
+        let Some((_, first)) = sizes.first() else {
+            return;
+        };
+        let Some((axis, new)) = first
+            .iter()
+            .zip(values)
+            .enumerate()
+            .find(|&(_, (&old, &new))| old as f32 != new)
+            .map(|(axis, (_, &new))| (axis, widen(new)))
+        else {
+            return;
+        };
+        edit_selected(|reference, _| {
+            let Some((_, size)) = sizes.iter().find(|(id, _)| *id == reference.id) else {
+                return Ok(());
+            };
+            // A flat model has no size to scale from along its flat axis.
+            if size[axis] > 0.0 {
+                set_scale(reference, reference.scale[0] * new / size[axis]);
+            }
+            Ok(())
+        });
+    }
+
+    fn range(&self) -> (f32, f32) {
+        SIZE_RANGE
+    }
+
+    /// Typed sizes go past the sliders: [`set_scale`] keeps the scale within its limits.
+    fn limit(&self) -> (f32, f32) {
+        (0.0, property_limits::UNLIMITED)
+    }
+
+    fn unit(&self) -> Unit {
+        Unit::Distance
+    }
+
+    /// The values follow each other: neither the game's lock nor the value order button fit.
+    fn alike(&self) -> bool {
+        false
+    }
+}
 
 /// A list showing and changing something of the selected references.
 struct Options {

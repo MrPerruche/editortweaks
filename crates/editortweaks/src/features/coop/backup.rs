@@ -28,6 +28,7 @@ use std::time::{Duration, Instant};
 
 use super::log::coop_log;
 use super::{Game, Object, objects};
+use crate::features::references::received;
 use crate::framework::clock;
 
 /// How soon the session's starting autosave is tried again, if it wasn't written (an empty editor,
@@ -88,6 +89,16 @@ impl AutoSave {
         }
     }
 
+    /// A member's references settled after the starting autosave was written (they arrive after
+    /// the vehicle): writes them along with it.
+    pub fn references_settled(&self) {
+        if !self.last.is_empty()
+            && let Some(folder) = vehicle_folder(AUTOSAVE_FOLDER)
+        {
+            received::write_along(&folder);
+        }
+    }
+
     /// The vehicle's bytes, if there's a vehicle and they aren't what was last written.
     fn changed(&self, game: &Game, editor: Object, component: Object) -> Option<Vec<u8>> {
         // SAFETY: the editor is live (it's ticking, or just about to end play); game thread.
@@ -139,6 +150,7 @@ fn write_autosave(name: &str, bytes: &[u8]) -> bool {
     match written {
         Ok(()) => {
             coop_log!("coop autosave: {}", path.display());
+            received::write_along(&folder);
             true
         }
         Err(error) => {

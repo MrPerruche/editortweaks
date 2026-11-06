@@ -113,9 +113,235 @@ pub fn land(garage: &Garage, place: &GaragePlace, pinned: bool, vehicle: &Vehicl
     }
 }
 
+/// How the game turns a vehicle spawned at the player's location: `FRotationMatrix::MakeFromZX(
+/// normal, forward).Rotator()`, its up along the ground's `normal`, facing `forward` as far as that
+/// allows.
+pub fn on_surface(normal: Vec3, forward: Vec3) -> Quat {
+    let z = math::normalized(normal).unwrap_or([0.0, 0.0, 1.0]);
+    let mut x = math::normalized(forward).unwrap_or([1.0, 0.0, 0.0]);
+    // Facing along the normal leaves no way to tell forward: the engine picks an axis.
+    if math::dot(z, x).abs() > 1.0 - 1e-8 {
+        x = if z[2].abs() < 1.0 - 1e-8 {
+            [0.0, 0.0, 1.0]
+        } else {
+            [1.0, 0.0, 0.0]
+        };
+    }
+    let y = math::normalized(math::cross(z, x)).unwrap_or([0.0, 1.0, 0.0]);
+    let x = math::cross(y, z);
+    // `FMatrix::Rotator`.
+    let pitch = x[2].atan2((x[0] * x[0] + x[1] * x[1]).sqrt());
+    let yaw = x[1].atan2(x[0]);
+    let unrolled_y = [-yaw.sin(), yaw.cos(), 0.0];
+    let roll = math::dot(z, unrolled_y).atan2(math::dot(y, unrolled_y));
+    Quat::from_rotator([pitch.to_degrees(), yaw.to_degrees(), roll.to_degrees()])
+}
+
+/// How much smaller than the vehicle's box the box that's tested for room is, on each side.
+const FIT_TOLERANCE: f64 = 5.0;
+
+/// What a sweep of the vehicle's box hit: where its centre was, and whether it started inside.
+#[derive(Clone, Copy, Debug)]
+pub struct BoxHit {
+    pub location: Vec3,
+    pub started_inside: bool,
+}
+
+/// Where the game puts a vehicle spawned on the ground at `ground`, turned by `rotation`
+/// (`ABrickVehicle::GetVehicleSpawnOffset` without a spawn point, for an unpinned vehicle): the
+/// bottom of its box on the ground. If `blocked` says its box (centred where given, with the half
+/// size given) has no room there, `sweep` (from, to, half size) brings it back from each side in
+/// turn: right, left, forward, back, up. The first hit that didn't start inside anything places
+/// it, moved back from what it hit. With none, it stays where it has no room.
+pub fn fit_on_ground(
+    ground: Vec3,
+    rotation: Quat,
+    vehicle: &VehicleBox,
+    blocked: impl FnOnce(Vec3, Vec3) -> bool,
+    mut sweep: impl FnMut(Vec3, Vec3, Vec3) -> Option<BoxHit>,
+) -> Landing {
+    let (half, middle) = (vehicle.half(), vehicle.center());
+    let tested = [0, 1, 2].map(|axis| half[axis] - FIT_TOLERANCE);
+    let mut center = math::add(ground, rotation.rotate([0.0, 0.0, half[2]]));
+    if blocked(center, tested) {
+        let size = math::scale(half, 2.0);
+        let widest = 2.0 * half[0].max(half[1]).max(half[2]);
+        let tries = [
+            ([0.0, 1.0, 0.0], size[1] + half[1]),
+            ([0.0, -1.0, 0.0], size[1] - half[1]),
+            ([1.0, 0.0, 0.0], size[0] + half[0]),
+            ([-1.0, 0.0, 0.0], size[0] - half[0]),
+            ([0.0, 0.0, 1.0], widest + half[2]),
+        ];
+        for (direction, distance) in tries {
+            if distance < 1e-4 {
+                continue;
+            }
+            let along = rotation.rotate(direction);
+            let from = math::add(center, math::scale(along, distance));
+            let Some(hit) = sweep(from, center, tested).filter(|hit| !hit.started_inside) else {
+                continue;
+            };
+            // 55 cm back along a side, 5 cm up.
+            let back = 5.0 + (1.0 - f64::abs(direction[2])) * 50.0;
+            center = math::add(hit.location, math::scale(along, back));
+            break;
+        }
+    }
+    Landing {
+        vehicle: Pose {
+            location: math::sub(center, rotation.rotate(middle)),
+            rotation,
+        },
+        spawn_point: [middle[0], middle[1], middle[2] - half[2]],
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const VEHICLE: VehicleBox = VehicleBox {
+        min: [-100.0, 10.0, 20.0],
+        max: [300.0, 50.0, 80.0],
+    };
+
+    fn in_world(landing: &Landing, point: Vec3) -> Vec3 {
+        math::add(
+            landing.vehicle.location,
+            landing.vehicle.rotation.rotate(point),
+        )
+    }
+
+    fn near(a: Vec3, b: Vec3) -> bool {
+        a.iter().zip(b).all(|(a, b)| (a - b).abs() < 1e-6)
+    }
+
+    #[test]
+    fn with_room_the_box_stands_on_the_ground() {
+        let rotation = Quat::from_rotator([0.0, 90.0, 0.0]);
+        let landing = fit_on_ground(
+            [1000.0, 2000.0, 500.0],
+            rotation,
+            &VEHICLE,
+            |_, tested| {
+                assert!(near(tested, [195.0, 15.0, 25.0]), "{tested:?}");
+                false
+            },
+            |_, _, _| panic!("no sweep with room"),
+        );
+        assert!(near(
+            in_world(&landing, landing.spawn_point),
+            [1000.0, 2000.0, 500.0]
+        ));
+        assert_eq!(landing.spawn_point, [100.0, 30.0, 20.0]);
+    }
+
+    #[test]
+    fn without_room_it_comes_back_from_the_right_first() {
+        let ground = [0.0, 0.0, 0.0];
+        let mut sweeps = Vec::new();
+        let landing = fit_on_ground(
+            ground,
+            Quat::from_rotator([0.0; 3]),
+            &VEHICLE,
+            |_, _| true,
+            |from, to, _| {
+                sweeps.push((from, to));
+                Some(BoxHit {
+                    location: [0.0, 40.0, 30.0],
+                    started_inside: false,
+                })
+            },
+        );
+        // From 1.5 times its width to the right (half 20: 60 cm), down to where it should stand.
+        assert_eq!(sweeps, [([0.0, 60.0, 30.0], [0.0, 0.0, 30.0])]);
+        // Moved 55 cm further right than the hit, so its box's middle is at 95 cm.
+        let middle = in_world(&landing, VEHICLE.center());
+        assert!(near(middle, [0.0, 95.0, 30.0]), "{middle:?}");
+    }
+
+    #[test]
+    fn sweeps_starting_inside_something_are_skipped_in_the_games_order() {
+        let mut froms = Vec::new();
+        let landing = fit_on_ground(
+            [0.0; 3],
+            Quat::from_rotator([0.0; 3]),
+            &VEHICLE,
+            |_, _| true,
+            |from, _, _| {
+                froms.push(from);
+                match froms.len() {
+                    5 => Some(BoxHit {
+                        location: [0.0, 0.0, 100.0],
+                        started_inside: false,
+                    }),
+                    2 => None,
+                    _ => Some(BoxHit {
+                        location: [0.0; 3],
+                        started_inside: true,
+                    }),
+                }
+            },
+        );
+        assert_eq!(
+            froms,
+            [
+                [0.0, 60.0, 30.0],   // right: 40 + 20
+                [0.0, -20.0, 30.0],  // left: 40 - 20
+                [600.0, 0.0, 30.0],  // forward: 400 + 200
+                [-200.0, 0.0, 30.0], // back: 400 - 200
+                [0.0, 0.0, 460.0],   // up: 2 * 200 + 30
+            ]
+        );
+        // Up only moves 5 cm back.
+        assert!(near(
+            in_world(&landing, VEHICLE.center()),
+            [0.0, 0.0, 105.0]
+        ));
+    }
+
+    #[test]
+    fn nothing_found_leaves_it_where_it_has_no_room() {
+        let landing = fit_on_ground(
+            [7.0, 8.0, 9.0],
+            Quat::from_rotator([0.0; 3]),
+            &VEHICLE,
+            |_, _| true,
+            |_, _, _| None,
+        );
+        assert!(near(
+            in_world(&landing, landing.spawn_point),
+            [7.0, 8.0, 9.0]
+        ));
+    }
+
+    #[test]
+    fn on_a_slope_it_tilts_and_keeps_facing_the_players_way() {
+        // A slope going up towards +X by 30 degrees; the player faces +X.
+        let (sine, cosine) = 30f64.to_radians().sin_cos();
+        let rotation = on_surface([-sine, 0.0, cosine], [1.0, 0.0, 0.0]);
+        assert!(near(rotation.rotate([0.0, 0.0, 1.0]), [-sine, 0.0, cosine]));
+        assert!(near(rotation.rotate([1.0, 0.0, 0.0]), [cosine, 0.0, sine]));
+        assert!(near(rotation.rotate([0.0, 1.0, 0.0]), [0.0, 1.0, 0.0]));
+    }
+
+    #[test]
+    fn on_flat_ground_it_only_turns_about_the_vertical() {
+        for yaw in [0.0, 37.0, 90.0, -140.0] {
+            let forward = Quat::from_rotator([0.0, yaw, 0.0]).rotate([1.0, 0.0, 0.0]);
+            let rotation = on_surface([0.0, 0.0, 1.0], forward);
+            assert!(near(rotation.rotate([1.0, 0.0, 0.0]), forward), "{yaw}");
+            assert!(near(rotation.rotate([0.0, 0.0, 1.0]), [0.0, 0.0, 1.0]));
+        }
+    }
+
+    #[test]
+    fn a_rolled_surface_keeps_its_normal() {
+        let normal = math::normalized([0.3, -0.5, 0.8]).unwrap();
+        let rotation = on_surface(normal, [0.2, 1.0, 0.1]);
+        assert!(near(rotation.rotate([0.0, 0.0, 1.0]), normal));
+    }
 
     /// City2's central garage (`BP_Editor_Medium_2`, garage 12 of 14 in game 1.11.7), the only
     /// one of the map with a pinned spawn point: its fields from the mod kit's level (the offset is

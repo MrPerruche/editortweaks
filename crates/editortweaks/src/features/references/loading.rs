@@ -6,6 +6,7 @@ use std::path::PathBuf;
 use std::sync::mpsc::Sender;
 use std::time::{Duration, Instant};
 
+use model_io::readers::Format;
 use model_io::space::ImportSettings;
 use model_io::{Part, readers};
 
@@ -61,7 +62,13 @@ pub fn start(
 
 fn read(path: &std::path::Path, settings: &ImportSettings) -> Result<LoadedModel, String> {
     let started = Instant::now();
-    let model = model_io::space::to_unreal(readers::read(path)?, settings)?;
+    let read = readers::read(path)?;
+    // What a coop host sent is in the editor's space already.
+    let model = if Format::of(path) == Some(Format::Shared) {
+        read
+    } else {
+        model_io::space::to_unreal(read, settings)?
+    };
     let triangles = model.triangle_count();
     let pieces = model
         .parts

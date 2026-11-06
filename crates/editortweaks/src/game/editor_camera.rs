@@ -296,6 +296,16 @@ impl EditorCamera {
         (!input.is_null()).then_some(input)
     }
 
+    /// Puts the editor's camera at `location`, relative to the editor, as near as the game lets it
+    /// (it keeps the camera inside the editor's bounds).
+    ///
+    /// # Safety
+    /// As for [`Self::static_info`].
+    pub unsafe fn place_camera(&self, editor: *mut UObjectBase, location: Vector) {
+        // SAFETY: per the contract; the function comes from the game's own code.
+        unsafe { (self.code.set_camera_location)(editor, &location) };
+    }
+
     /// Moves the editor's camera by `offset` cm, as far as the game lets it (it keeps the camera
     /// inside the editor's bounds): returns how far it moved.
     ///

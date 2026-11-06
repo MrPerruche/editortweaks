@@ -7,6 +7,7 @@ use crate::audit::{Audit, Digest};
 use crate::ids::{Check, CoopId, Slot};
 use crate::ops::{Op, read_ids, read_ops, write_ids, write_ops};
 use crate::presence::View;
+use crate::references::{CHUNK, Entry, Level, read_entries, write_entries};
 use crate::wire::{DecodeError, Reader, Result, Writer};
 
 /// A peer's address on the transport: a SteamID64 over Steam, any made-up number elsewhere.
@@ -14,7 +15,7 @@ pub type PeerId = u64;
 
 pub const MAGIC: [u8; 2] = *b"ET";
 /// Bumped whenever a message changes.
-pub const PROTOCOL: u16 = 7;
+pub const PROTOCOL: u16 = 8;
 /// magic + protocol + kind + session.
 pub const HEADER_LEN: usize = 2 + 2 + 1 + 4;
 
@@ -141,6 +142,24 @@ pub enum Message {
         count: u32,
         data: Vec<u8>,
     },
+    /// Member to subhost: how much of the subhost's references it takes (`Level::to_wire`).
+    ReferenceLevel {
+        level: u8,
+    },
+    /// Subhost to member: all the references, fitted to the member's level.
+    ReferenceList {
+        entries: Vec<Entry>,
+    },
+    /// Member to subhost: "send me this reference's data from its start."
+    ReferenceWant {
+        content: u64,
+    },
+    /// Subhost to member: a piece of a reference's data, at most [`CHUNK`] bytes.
+    ReferenceData {
+        content: u64,
+        offset: u32,
+        data: Vec<u8>,
+    },
 }
 
 impl Message {
@@ -167,6 +186,10 @@ impl Message {
             Self::Order { .. } => 18,
             Self::Camera { .. } => 19,
             Self::Invite { .. } => 20,
+            Self::ReferenceLevel { .. } => 21,
+            Self::ReferenceList { .. } => 22,
+            Self::ReferenceWant { .. } => 23,
+            Self::ReferenceData { .. } => 24,
         }
     }
 
@@ -293,6 +316,18 @@ impl Message {
                 w.raw(data);
             }
             Self::Invite { name } => w.str(name),
+            Self::ReferenceLevel { level } => w.u8(*level),
+            Self::ReferenceList { entries } => write_entries(&mut w, entries),
+            Self::ReferenceWant { content } => w.u64(*content),
+            Self::ReferenceData {
+                content,
+                offset,
+                data,
+            } => {
+                w.u64(*content);
+                w.u32(*offset);
+                w.bytes(data);
+            }
         }
         w.finish()
     }
@@ -471,6 +506,22 @@ impl Message {
                 };
                 Self::Camera { slot, view }
             }
+            21 => {
+                let level = r.u8()?;
+                if Level::from_wire(level).is_none() {
+                    return Err(DecodeError::BadValue("reference level"));
+                }
+                Self::ReferenceLevel { level }
+            }
+            22 => Self::ReferenceList {
+                entries: read_entries(&mut r)?,
+            },
+            23 => Self::ReferenceWant { content: r.u64()? },
+            24 => Self::ReferenceData {
+                content: r.u64()?,
+                offset: r.u32()?,
+                data: r.bytes("reference data", CHUNK)?.to_vec(),
+            },
             tag => {
                 return Err(DecodeError::BadTag {
                     what: "message",
@@ -487,6 +538,7 @@ impl Message {
 mod tests {
     use super::*;
     use crate::ops::{Transform, Value};
+    use crate::references::{ImageLook, Kind};
 
     fn id(slot: Slot, n: u32) -> CoopId {
         CoopId::new(slot, n).unwrap()
@@ -599,6 +651,61 @@ mod tests {
                 commit: 12,
                 ids: vec![id(0, 1), id(2, 7)],
             },
+            Message::ReferenceLevel { level: 2 },
+            Message::ReferenceList {
+                entries: vec![
+                    Entry {
+                        id: "a_1".into(),
+                        name: "Reference".into(),
+                        kind: Kind::Model,
+                        content: 0xFEED,
+                        bytes: 5000,
+                        triangles: 120,
+                        pixels: 64,
+                        simplified: true,
+                        position: [1.0, 2.0, -3.0],
+                        rotation: [0.0, 90.0, 0.0],
+                        scale: [1.0; 3],
+                        mirror: [false, true, false],
+                        opacity: 0.5,
+                        color: [1.0, 1.0, 0.0],
+                        image: None,
+                    },
+                    Entry {
+                        id: "b-2".into(),
+                        name: "Photo".into(),
+                        kind: Kind::Image,
+                        content: 7,
+                        bytes: 90,
+                        triangles: 0,
+                        pixels: 4096,
+                        simplified: false,
+                        position: [0.0; 3],
+                        rotation: [0.0; 3],
+                        scale: [1.0; 3],
+                        mirror: [false; 3],
+                        opacity: 1.0,
+                        color: [1.0; 3],
+                        image: Some(ImageLook {
+                            width: 200.0,
+                            flip_x: false,
+                            flip_y: true,
+                            double_sided: true,
+                            pixelated: false,
+                            pivot: 4,
+                        }),
+                    },
+                ],
+            },
+            Message::ReferenceList {
+                entries: Vec::new(),
+            },
+            Message::ReferenceWant { content: 0xFEED },
+            Message::ReferenceData {
+                content: 0xFEED,
+                offset: 16384,
+                data: vec![9; 100],
+            },
         ]
     }
 
@@ -625,6 +732,33 @@ mod tests {
                 let _ = Message::decode(&flipped);
             }
         }
+    }
+
+    #[test]
+    fn reference_messages_refuse_what_no_honest_peer_sends() {
+        let level = |level| Message::ReferenceLevel { level }.encode(1);
+        assert!(Message::decode(&level(0)).is_ok());
+        assert!(Message::decode(&level(3)).is_ok());
+        assert_eq!(
+            Message::decode(&level(4)),
+            Err(DecodeError::BadValue("reference level"))
+        );
+
+        let data = |len| {
+            Message::ReferenceData {
+                content: 1,
+                offset: 0,
+                data: vec![0; len],
+            }
+            .encode(1)
+        };
+        assert!(Message::decode(&data(CHUNK)).is_ok());
+        assert!(matches!(
+            Message::decode(&data(CHUNK + 1)),
+            Err(DecodeError::TooLong { .. })
+        ));
+        assert!(Message::ReferenceWant { content: 1 }.reliable());
+        assert!(data(1).len() > HEADER_LEN);
     }
 
     #[test]

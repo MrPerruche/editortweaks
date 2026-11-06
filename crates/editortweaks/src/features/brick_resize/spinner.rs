@@ -412,6 +412,18 @@ impl SpinnerBrick {
     }
 }
 
+/// How many segments the arc of `radians` is drawn or followed in: at least 8, and at most a whole
+/// turn's. A vehicle may hold any angle (a crash report had one of -1.8e17 degrees, which asked for
+/// 4.8e16 points), and past a turn the arc only goes over itself.
+// Not `clamp`, which would keep a NaN angle's NaN, so 0 segments.
+#[allow(clippy::manual_clamp)]
+fn arc_segments(radians: f64) -> usize {
+    (radians.abs() / core::f64::consts::TAU * ARC_SEGMENTS)
+        .ceil()
+        .max(8.0)
+        .min(ARC_SEGMENTS) as usize
+}
+
 /// A line along a spinner's arc through a point of its cross-section (a rim, a crest), as
 /// snapping sees it: points evenly apart along the arc's angle, and the arc itself between them
 /// (not the straight lines from one to the next).
@@ -426,13 +438,10 @@ pub struct ArcLine {
 
 impl ArcLine {
     fn new(spinner: &Spinner, section: [f64; 2]) -> Self {
-        let steps = (spinner.radians().abs() / core::f64::consts::TAU * ARC_SEGMENTS)
-            .ceil()
-            .max(8.0) as usize;
         Self {
             spinner: *spinner,
             section,
-            steps,
+            steps: arc_segments(spinner.radians()),
         }
     }
 
@@ -1392,9 +1401,7 @@ fn draw_arc(
     dashed: bool,
 ) {
     let arc = spinner.radians();
-    let segments = (arc.abs() / core::f64::consts::TAU * ARC_SEGMENTS)
-        .ceil()
-        .max(8.0) as usize;
+    let segments = arc_segments(arc);
     let inside = [0.0; 2];
     let lift = |t: f64| {
         let on = frame.point(spinner.section_point(t, point));

@@ -13,13 +13,14 @@
 //! plain version of their material is a new instance of the plain brick type's base material
 //! (`ScalableBrickStaticInfo`'s defaults) with the same parameters.
 
-use std::sync::Mutex;
+use std::sync::{Mutex, Once};
 
 use brickrust::ue::coreuobject::UObjectBase;
 use brickrust::ue::uclass::{UClass, UStruct};
 
 use crate::game::reflection::{self, Function, Parameters, put, take};
 use crate::game::weak_object::WeakObject;
+use crate::prelude::log;
 
 /// `EMIDCreationFlags::Transient`: the new instance goes in the transient package, like the
 /// game's own brick instances.
@@ -43,6 +44,156 @@ struct Copy {
     function: Function,
     source: usize,
     quick: usize,
+}
+
+/// Sets a material instance's own parameter values on another, each under its exact
+/// `FMaterialParameterInfo`, as the game fills a brick's instance (BRMK 0x479960:
+/// `SetScalarParameterValueByInfo` and `SetTextureParameterValueByInfo` with the layer parameter 0).
+/// `K2_CopyMaterialInstanceParameters` only keeps parameters of the source's base material as it was
+/// compiled, which may leave out the brick material's.
+struct OwnValues {
+    scalars: ValueList,
+    textures: ValueList,
+}
+
+/// One kind of a material instance's values.
+struct ValueList {
+    /// Offset of the `TArray` in `UMaterialInstance`, and an element's size.
+    array: usize,
+    stride: usize,
+    /// Offsets of `ParameterInfo` and `ParameterValue` in an element.
+    info: usize,
+    value: usize,
+    /// `Set...ParameterValueByInfo(const FMaterialParameterInfo&, Value)`.
+    set: Function,
+    set_info: usize,
+    set_value: usize,
+    /// The size of `FMaterialParameterInfo`.
+    info_size: usize,
+}
+
+impl ValueList {
+    fn find(
+        instance: *const UClass,
+        dynamic: *const UClass,
+        array: &'static str,
+        element: &'static str,
+        value_kind: &'static str,
+        value_size: i32,
+        set: &'static str,
+    ) -> Result<Self, String> {
+        let element: *const UStruct = reflection::find_object(element, "ScriptStruct")
+            .ok_or(format!("struct {element} not found"))?
+            .cast_const()
+            .cast();
+        let set = Function::find(dynamic, set)?;
+        // SAFETY: a live struct and a live class property record: the struct `ParameterInfo` is.
+        let (stride, info, info_size) = unsafe {
+            let info = reflection::find_property(element, "ParameterInfo");
+            if info.is_null() || !reflection::is_kind(info, "StructProperty") {
+                return Err("a parameter value has no ParameterInfo".into());
+            }
+            (
+                reflection::struct_size(element),
+                (*info).offset_internal as usize,
+                reflection::struct_size(reflection::struct_type(info)),
+            )
+        };
+        Ok(Self {
+            array: reflection::field_offset(instance, array, "ArrayProperty", 16)?,
+            stride,
+            info,
+            value: reflection::struct_field_offset(
+                element,
+                "ParameterValue",
+                value_kind,
+                value_size,
+            )?,
+            set_info: set.parameter(
+                "ParameterInfo",
+                "StructProperty",
+                i32::try_from(info_size).map_err(|_| "ParameterInfo is too big")?,
+            )?,
+            set_value: set.parameter("Value", value_kind, value_size)?,
+            set,
+            info_size,
+        })
+    }
+
+    /// Sets every value of `source` on `target`, how many there were. `T` is the value's type.
+    ///
+    /// # Safety
+    /// `source` must be a live material instance and `target` a live dynamic one, `T` the value's
+    /// type. Game thread only.
+    unsafe fn set_from<T: core::marker::Copy>(
+        &self,
+        source: *mut UObjectBase,
+        target: *mut UObjectBase,
+    ) -> usize {
+        // SAFETY: per the contract; the array's fields are a `TArray`'s, its elements laid out as
+        // their reflected struct, and the function reads its parameters at their reflected offsets.
+        unsafe {
+            let array = source.cast::<u8>().add(self.array).cast_const();
+            let data = array.cast::<*const u8>().read();
+            let count = usize::try_from(array.add(8).cast::<i32>().read()).unwrap_or(0);
+            for index in 0..count {
+                let element = data.add(index * self.stride);
+                let mut parameters = Parameters::new();
+                core::ptr::copy_nonoverlapping(
+                    element.add(self.info),
+                    parameters.as_mut_ptr().add(self.set_info),
+                    self.info_size,
+                );
+                let value = element.add(self.value).cast::<T>().read_unaligned();
+                put(&mut parameters, self.set_value, value);
+                self.set.call(target, &mut parameters);
+            }
+            count
+        }
+    }
+}
+
+impl OwnValues {
+    fn find(instance: *const UClass, dynamic: *const UClass) -> Result<Self, String> {
+        Ok(Self {
+            scalars: ValueList::find(
+                instance,
+                dynamic,
+                "ScalarParameterValues",
+                "ScalarParameterValue",
+                "FloatProperty",
+                4,
+                "SetScalarParameterValueByInfo",
+            )?,
+            textures: ValueList::find(
+                instance,
+                dynamic,
+                "TextureParameterValues",
+                "TextureParameterValue",
+                "ObjectProperty",
+                8,
+                "SetTextureParameterValueByInfo",
+            )?,
+        })
+    }
+
+    /// Sets `source`'s own values on `target`, and logs how many the first time.
+    ///
+    /// # Safety
+    /// `source` must be a live material instance and `target` a live dynamic one. Game thread only.
+    unsafe fn set_from(&self, source: *mut UObjectBase, target: *mut UObjectBase) {
+        static LOG_FIRST: Once = Once::new();
+        // SAFETY: per the contract; a scalar is a float, a texture an object pointer.
+        let (scalars, textures) = unsafe {
+            (
+                self.scalars.set_from::<f32>(source, target),
+                self.textures.set_from::<*mut UObjectBase>(source, target),
+            )
+        };
+        LOG_FIRST.call_once(|| {
+            log!("a plain material took {scalars} scalars and {textures} textures from its brick's")
+        });
+    }
 }
 
 /// A brick type's materials (`UBrickStaticInfo`).
@@ -70,6 +221,8 @@ pub struct BrickMaterials {
     library: *mut UObjectBase,
     create: Create,
     copy: Copy,
+    /// Without it, a plain version only has what `copy` gives it.
+    values: Option<OwnValues>,
     /// The plain versions made, each with the material it was made from. Weak pointers: the
     /// engine frees an instance once no component shows it.
     made: Mutex<Vec<(WeakObject, WeakObject)>>,
@@ -138,6 +291,11 @@ impl BrickMaterials {
             library: default_object(library)?,
             create,
             copy,
+            values: OwnValues::find(instance, class("MaterialInstanceDynamic")?)
+                .inspect_err(|reason| {
+                    log!("plain materials may not show their brick's textures: {reason}")
+                })
+                .ok(),
             made: Mutex::new(Vec::new()),
         })
     }
@@ -229,6 +387,9 @@ impl BrickMaterials {
             put(&mut parameters, call.source, source);
             put(&mut parameters, call.quick, false);
             call.function.call(made, &mut parameters);
+            if let Some(values) = &self.values {
+                values.set_from(source, made);
+            }
             made
         }
     }

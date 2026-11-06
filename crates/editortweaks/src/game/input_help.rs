@@ -28,7 +28,10 @@ use brickrust::ue::tarray::TArray;
 use brickrust::ue::uclass::{UClass, UFunction, UStruct};
 
 use crate::framework::sig::{self, CodeShape, FunctionSig};
+use crate::game::kismet;
+use crate::game::menu::SoftPointer;
 use crate::game::reflection::{self, BoolField, Function, Parameters, SingleCall};
+use crate::game::text::Text;
 
 /// `FBrActionResult UBaseInputComponent::ExecuteAction(const FName& Name, const FBrActionParams&
 /// Params)` (BRMK 0x234620, game RVA 0xDDB5F0): finds the action's binding in the component and
@@ -65,6 +68,8 @@ const POPULATE_CALL: usize = 0x11;
 
 /// The editor's top bar's Blueprint class.
 const TOP_BAR_CLASS: &str = "WBP_BrickEditor_TopDashboard_C";
+/// The editor's bottom bar's (view mode, mirror mode; more with the input help open).
+const BOTTOM_BAR_CLASS: &str = "WBP_BrickEditor_BottomDashboard_C";
 
 /// The top bar, the input help and the editor's actions (after engine init).
 pub struct InputHelp {
@@ -89,6 +94,24 @@ pub struct InputHelp {
     state: usize,
     /// How widgets sit in a dashboard's grid, or why that wasn't found.
     grid: Result<Grid, String>,
+    /// `UDashboardWidget::UpdateDashboard()`: lists its widgets again.
+    update_dashboard: *const UFunction,
+    /// What adding an action to a dashboard needs, or why that wasn't found.
+    bar_action: Result<BarAction, String>,
+}
+
+/// What adding an action of ours to a dashboard needs ([`InputHelp::add_bar_action`]).
+struct BarAction {
+    /// `UInputActionWidget::SetAction(FName, bool bIsSecondaryAction, UBaseInputComponent*, bool)`,
+    /// and its parameters' offsets (the action's name, the component, the last flag).
+    set_action: *const UFunction,
+    set_name: usize,
+    set_component: usize,
+    set_update: usize,
+    /// No text, for the action's `DisplayInfoOverride`: its row's shows.
+    no_text: Text,
+    /// A soft pointer to nothing, for the same.
+    no_icon: FName,
 }
 
 /// A widget's place in a `UGridPanel`.
@@ -224,6 +247,11 @@ impl InputHelp {
             enabled: byte("EBrActionState", "EBrActionState::Enabled")?,
             state: reflection::struct_field_offset(result, "State", "EnumProperty", 1)?,
             grid: Grid::find(),
+            update_dashboard: reflection::find_function(
+                class("DashboardWidget")?,
+                "UpdateDashboard",
+            )?,
+            bar_action: BarAction::find(),
         })
     }
 
@@ -233,11 +261,95 @@ impl InputHelp {
     /// `dashboard` must be a live object. Game thread only.
     pub unsafe fn is_top_bar(&self, dashboard: *mut UObjectBase) -> bool {
         // SAFETY: per the contract.
-        unsafe { reflection::with_parents(reflection::class_of(dashboard.cast())) }
-            // SAFETY: classes of a live object.
-            .any(|class| unsafe {
-                reflection::name_is(reflection::struct_name(class), TOP_BAR_CLASS)
-            })
+        unsafe { is_of_class(dashboard, TOP_BAR_CLASS) }
+    }
+
+    /// Whether `dashboard` is the editor's bottom bar.
+    ///
+    /// # Safety
+    /// As for [`Self::is_top_bar`].
+    pub unsafe fn is_bottom_bar(&self, dashboard: *mut UObjectBase) -> bool {
+        // SAFETY: per the contract.
+        unsafe { is_of_class(dashboard, BOTTOM_BAR_CLASS) }
+    }
+
+    /// Has `dashboard` list its widgets again, as the game does when the editor's mode changes.
+    ///
+    /// # Safety
+    /// `dashboard` must be a live dashboard widget, not populating. Game thread only.
+    pub unsafe fn update_dashboard(&self, dashboard: *mut UObjectBase) {
+        let mut parameters = Parameters::new();
+        // SAFETY: per the contract; the function has no parameters (`find` found its native code
+        // by that shape).
+        unsafe { reflection::call(dashboard, self.update_dashboard, parameters.as_mut_ptr()) };
+    }
+
+    /// Adds the action `name` to `dashboard` as a row of its own, run through `component`.
+    /// `WBP_Dashboard.AddAction` as a dashboard's Blueprint calls it, with a column span of 0 (the
+    /// row's width, on a row of its own), its text and no key shown, then `SetAction` again: without
+    /// a component the widget looks for one binding the action, and none binds ours.
+    ///
+    /// # Safety
+    /// `dashboard` must be a live dashboard widget, populating; `component` a live input component
+    /// and `name` an input table's row. Game thread only.
+    pub unsafe fn add_bar_action(
+        &self,
+        dashboard: *mut UObjectBase,
+        component: *mut UObjectBase,
+        name: FName,
+    ) -> Result<(), String> {
+        let bar = self.bar_action.as_ref().map_err(Clone::clone)?;
+        // SAFETY: per the contract; each parameter goes to its reflected offset, checked by kind and
+        // size. The display info is only read (shallow copies of our text and path, which live for
+        // the whole game): `ProcessEvent` doesn't destroy a caller's parameters.
+        unsafe {
+            let class = reflection::class_of(dashboard.cast()).cast::<UClass>();
+            let add = Function::find(class, "AddAction")?;
+            let mut parameters = Parameters::new();
+            reflection::put(
+                &mut parameters,
+                add.parameter("ActionName", "NameProperty", 8)?,
+                name,
+            );
+            reflection::put(
+                &mut parameters,
+                add.parameter("bShowText", "BoolProperty", 1)?,
+                true,
+            );
+            let info = reflection::find_property(
+                reflection::find_function(class, "AddAction")?.cast(),
+                "DisplayInfoOverride",
+            );
+            if info.is_null() || !reflection::is_kind(info, "StructProperty") {
+                return Err("AddAction: no DisplayInfoOverride".into());
+            }
+            let info_offset = (*info).offset_internal as usize;
+            let info_type = reflection::struct_type(info);
+            let text = reflection::struct_field_offset(info_type, "Name", "TextProperty", 0x18)?;
+            let icon = reflection::struct_field_offset(
+                info_type,
+                "IconTexture",
+                "SoftObjectProperty",
+                0x28,
+            )?;
+            let base = parameters.as_mut_ptr().add(info_offset);
+            core::ptr::copy_nonoverlapping(&raw const bar.no_text, base.add(text).cast(), 1);
+            base.add(icon)
+                .cast::<SoftPointer>()
+                .write_unaligned(SoftPointer::new(bar.no_icon));
+            let result = add.parameter("ReturnValue", "ObjectProperty", 8)?;
+            add.call(dashboard, &mut parameters);
+            let widget: *mut UObjectBase = reflection::take(&parameters, result);
+            if widget.is_null() {
+                return Err("AddAction: no widget".into());
+            }
+            let mut parameters = Parameters::new();
+            reflection::put(&mut parameters, bar.set_name, name);
+            reflection::put(&mut parameters, bar.set_component, component);
+            reflection::put(&mut parameters, bar.set_update, true);
+            reflection::call(widget, bar.set_action, parameters.as_mut_ptr());
+        }
+        Ok(())
     }
 
     /// The editor's input component, if it has one.
@@ -474,6 +586,53 @@ impl InputHelp {
         // SAFETY: per the contract; the state is a byte enum at its reflected offset.
         unsafe { result.add(self.state).write(self.enabled) };
     }
+}
+
+impl BarAction {
+    fn find() -> Result<Self, String> {
+        let widget = reflection::find_class("InputActionWidget")
+            .ok_or("class InputActionWidget not found")?;
+        let set_action = reflection::find_function(widget, "SetAction")?;
+        // SAFETY: a live function record; its parameters in order, whatever they're called.
+        let (set_name, set_component, set_update) = unsafe {
+            let parameters: Vec<_> = reflection::properties(set_action.cast()).collect();
+            match parameters[..] {
+                [name, secondary, component, update]
+                    if reflection::is_kind(name, "NameProperty")
+                        && reflection::is_kind(secondary, "BoolProperty")
+                        && reflection::is_kind(component, "ObjectProperty")
+                        && reflection::is_kind(update, "BoolProperty")
+                        && Parameters::fit(set_action) =>
+                {
+                    (
+                        (*name).offset_internal as usize,
+                        (*component).offset_internal as usize,
+                        (*update).offset_internal as usize,
+                    )
+                }
+                _ => return Err("SetAction: unexpected parameters".into()),
+            }
+        };
+        Ok(Self {
+            set_action,
+            set_name,
+            set_component,
+            set_update,
+            no_text: kismet::string_to_text("")?,
+            no_icon: kismet::string_to_name("None")?,
+        })
+    }
+}
+
+/// Whether `object`'s class or one of its parents is called `name`.
+///
+/// # Safety
+/// `object` must be a live object. Game thread only.
+unsafe fn is_of_class(object: *mut UObjectBase, name: &'static str) -> bool {
+    // SAFETY: per the contract.
+    unsafe { reflection::with_parents(reflection::class_of(object.cast())) }
+        // SAFETY: classes of a live object.
+        .any(|class| unsafe { reflection::name_is(reflection::struct_name(class), name) })
 }
 
 /// The `int32` variable `name` of `object`, whose class is `class`.

@@ -9,6 +9,7 @@ use brickrust::ue::coreuobject::UObjectBase;
 
 use crate::framework::sig::FunctionSig;
 use crate::game::reflection;
+use crate::game::zoom_range::ZoomRange;
 
 /// `float IViewTargetInterface::GetCameraSpeed() const` (our name; BRMK 0x323F40, game RVA
 /// 0xE6AD60): the camera's speed in cm/s, from its speed ratio (0 to 1, changed in steps by
@@ -44,6 +45,13 @@ const GET_ZOOM_CACHE_SLOT: usize = 21;
 /// Offset of the current zoom ratio in `FViewTargetZoomCache` (not reflected: +0x0 the held zoom
 /// input, +0x4 the ratio the zoom steps set, +0x8 the current one, gliding there).
 const ZOOM_CACHE_RATIO: usize = 8;
+const ZOOM_CACHE_TARGET: usize = 4;
+
+/// Slot of `GetCameraViewPoint(FVector&, FRotator&)` (`ABrickEditor`'s is
+/// `editor_camera::GET_CAMERA_VIEW_POINT`; `CalcCamera` calls it at +0x58).
+const GET_VIEW_POINT_SLOT: usize = 11;
+/// Slot of `GetZoomParams`: the view target's `FViewTargetZoomParams`, or null.
+const GET_ZOOM_PARAMS_SLOT: usize = 20;
 
 pub struct CameraSpeed {
     /// [`CAMERA_SPEED`]'s start.
@@ -122,6 +130,91 @@ pub unsafe fn zoom_ratio(interface: *mut c_void) -> Option<f32> {
         }
         let ratio = cache.add(ZOOM_CACHE_RATIO).cast::<f32>().read_unaligned();
         (0.0..=1.0).contains(&ratio).then_some(ratio)
+    }
+}
+
+/// Starts the view target's zoom gliding to `ratio`, as a zoom step does: the game then tells the
+/// zoom notification and stores the ratio as it glides. Whether it zooms.
+///
+/// # Safety
+/// As for [`zoom_ratio`].
+pub unsafe fn glide_zoom_to(interface: *mut c_void, ratio: f32) -> bool {
+    // SAFETY: per the contract; as in `zoom_ratio`, and the cache holds the target ratio as a float.
+    unsafe {
+        let get: unsafe extern "C" fn(*mut c_void) -> *mut u8 =
+            virtual_at(interface, GET_ZOOM_CACHE_SLOT * size_of::<usize>());
+        let cache = get(interface);
+        if cache.is_null() {
+            return false;
+        }
+        cache
+            .add(ZOOM_CACHE_TARGET)
+            .cast::<f32>()
+            .write_unaligned(ratio);
+        true
+    }
+}
+
+/// Where the camera is and how it looks, as the game asks a view target for it.
+///
+/// # Safety
+/// As for [`zoom_ratio`].
+pub unsafe fn view_point(interface: *mut c_void) -> ([f32; 3], [f32; 3]) {
+    let (mut location, mut rotation) = ([0.0; 3], [0.0; 3]);
+    // SAFETY: per the contract; the slot is `GetCameraViewPoint`, which fills both.
+    unsafe {
+        let get: unsafe extern "C" fn(*mut c_void, *mut [f32; 3], *mut [f32; 3]) =
+            virtual_at(interface, GET_VIEW_POINT_SLOT * size_of::<usize>());
+        get(interface, &raw mut location, &raw mut rotation);
+    }
+    (location, rotation)
+}
+
+/// Where the fields of `FViewTargetZoomParams` are (reflected).
+pub struct ZoomFields {
+    exponent: usize,
+    range: usize,
+}
+
+/// Finds [`ZoomFields`], through the editor's. After engine init.
+pub fn zoom_fields() -> Result<ZoomFields, String> {
+    let info = reflection::find_class("BrickEditorStaticInfo")
+        .ok_or("class BrickEditorStaticInfo not found")?;
+    let params = reflection::field(info, "ZoomParams", "StructProperty", 0x18)?;
+    // SAFETY: a live StructProperty record, so its struct is live and linked.
+    let params = unsafe { reflection::struct_type(params) };
+    let field = |name, kind, size| {
+        reflection::struct_field_offset(params, name, kind, size)
+            .map_err(|reason| format!("ZoomParams: {reason}"))
+    };
+    Ok(ZoomFields {
+        exponent: field("Exponent", "FloatProperty", 4)?,
+        range: field("ZoomRange", "StructProperty", 8)?,
+    })
+}
+
+impl ZoomFields {
+    /// The view target's zoom, if it zooms.
+    ///
+    /// # Safety
+    /// As for [`zoom_ratio`].
+    pub unsafe fn of(&self, interface: *mut c_void) -> Option<ZoomRange> {
+        // SAFETY: per the contract; the slot is `GetZoomParams`, which returns null or the view
+        // target's own, whose fields are at their reflected offsets.
+        unsafe {
+            let get: unsafe extern "C" fn(*mut c_void) -> *const u8 =
+                virtual_at(interface, GET_ZOOM_PARAMS_SLOT * size_of::<usize>());
+            let params = get(interface);
+            if params.is_null() {
+                return None;
+            }
+            let [min, max] = params.add(self.range).cast::<[f32; 2]>().read_unaligned();
+            Some(ZoomRange {
+                min,
+                max,
+                exponent: params.add(self.exponent).cast::<f32>().read_unaligned(),
+            })
+        }
     }
 }
 

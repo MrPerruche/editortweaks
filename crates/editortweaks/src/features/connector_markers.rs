@@ -43,8 +43,7 @@ pub struct ConnectorMarkers;
 pub static AXIS_COLORS: Toggle = Toggle::new(
     "ConnectorAxisColors",
     "Connector colors by axis",
-    "A selected scalable brick's connector markers are colored by the axis they face: red X, \
-     green Y, blue Z. Off: the game's gray and yellow.",
+    "Connectors are colored red for the X size, green for the Y size and blue for the Z side.",
     true,
 );
 

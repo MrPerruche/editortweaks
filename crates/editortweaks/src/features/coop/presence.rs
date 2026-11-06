@@ -58,6 +58,18 @@ pub fn find() -> Result<Kit, String> {
     })
 }
 
+/// The bricks selected here, sorted. Their objects are live: `changes` forgets them as they go.
+pub fn selected(kit: &Kit) -> Vec<CoopId> {
+    let mut ids: Vec<CoopId> = changes::known()
+        .into_iter()
+        // SAFETY: objects with coop ids are live editor objects; the editor ticks on the game thread.
+        .filter(|&(object, _)| unsafe { kit.selection.is_selected(object) })
+        .map(|(_, id)| id)
+        .collect();
+    ids.sort_unstable();
+    ids
+}
+
 /// What the others selected, and what of it shows.
 pub struct Shown {
     own: Option<Slot>,
@@ -129,13 +141,7 @@ impl Shown {
         now: u64,
         showing: bool,
     ) {
-        let mut ids: Vec<CoopId> = changes::known()
-            .into_iter()
-            // SAFETY: per the contract.
-            .filter(|&(object, _)| unsafe { kit.selection.is_selected(object) })
-            .map(|(_, id)| id)
-            .collect();
-        ids.sort_unstable();
+        let ids = selected(kit);
         if self.pace.due(now, &ids) {
             session.select(ids);
         }

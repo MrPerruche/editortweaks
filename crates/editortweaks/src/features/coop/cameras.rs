@@ -11,6 +11,10 @@
 //! Each marker also has its player's name above it, a text render component of ours (`game::text_actor`)
 //! on the editor's actor, the only one whose components the editor shows, in their color, turned to face the local camera, spawned with the marker and destroyed with it.
 //! If the game doesn't offer what those need (logged at start), the markers show without names.
+//!
+//! Both have a dark outline, so they read on any brick or sky: a marker's lines are thick ones over
+//! thicker dark ones, about as wide on screen from any distance; a name stands over dark copies of
+//! itself, a little off in each direction. (A text render component has no outline of its own.)
 
 use std::collections::BTreeMap;
 use std::collections::btree_map::Entry;
@@ -42,9 +46,27 @@ const LAYER: &str = "coop cameras";
 const DEPTH: f64 = 60.0;
 const HALF_WIDTH: f64 = 40.0;
 const HALF_HEIGHT: f64 = 25.0;
+/// How many lines a marker has.
+const MARKER_EDGES: usize = 10;
 /// A name's letters' height, and the gap between the top of its marker and the name (cm).
 const LABEL_SIZE: f32 = 14.0;
 const LABEL_GAP: f64 = 10.0;
+/// How wide a marker's lines and their outline are on screen (pixels, about: see
+/// [`CM_PER_PIXEL`]).
+const LINE_PIXELS: f64 = 2.0;
+const LINE_OUTLINE_PIXELS: f64 = 5.0;
+/// How wide a pixel is at one centimeter's distance (cm), at the usual field of view on a screen
+/// 1920 pixels wide. Near enough for an outline.
+const CM_PER_PIXEL: f64 = 1.0 / 960.0;
+/// How wide lines may be (cm), whatever the distance: the orthographic view stands far back.
+const MAX_LINE_WIDTH: f64 = 8.0;
+/// The outline's color.
+const OUTLINE: [f32; 3] = [0.0, 0.0, 0.0];
+/// How far a name's dark copies are off it, across and up (cm), and behind it.
+const LABEL_OUTLINE: f64 = 0.8;
+const LABEL_OUTLINE_BEHIND: f64 = 0.5;
+/// Which ways a name's dark copies are off it.
+const LABEL_OUTLINE_WAYS: [[f64; 2]; 4] = [[-1.0, -1.0], [1.0, -1.0], [-1.0, 1.0], [1.0, 1.0]];
 
 pub static THROUGH_BRICKS: Toggle = Toggle::new(
     "CoopCamerasThroughBricks",
@@ -211,11 +233,29 @@ pub struct Cameras {
 /// A name showing, and what it was last given.
 struct Label {
     handle: TextLabel,
+    /// Its dark copies, one per [`LABEL_OUTLINE_WAYS`] (fewer if some couldn't be made).
+    outline: Vec<TextLabel>,
     name: String,
     /// Linear red, green, blue.
     color: [f32; 3],
     /// Where it was last put (location, rotation).
     placed: Option<(Vector, Vector)>,
+}
+
+impl Label {
+    /// Removes the name and its outline.
+    ///
+    /// # Safety
+    /// Game thread only.
+    unsafe fn destroy(&self, text: &TextActors) {
+        // SAFETY: per the contract.
+        unsafe {
+            text.destroy(&self.handle);
+            for dark in &self.outline {
+                text.destroy(dark);
+            }
+        }
+    }
 }
 
 impl Cameras {
@@ -302,6 +342,8 @@ impl Cameras {
         }
         // SAFETY: per the contract.
         let (origin, turn) = unsafe { kit.frame(editor) };
+        // SAFETY: per the contract.
+        let viewer = unsafe { kit.viewer(editor) }.map(math::widen);
         let mut lines = Vec::new();
         // Where each name goes, in the editor's space.
         let mut anchors = Vec::new();
@@ -309,13 +351,13 @@ impl Cameras {
             let color = presence::color_of(&self.slots, slot).1.map(linear);
             let edges = marker(*shown);
             anchors.push((slot, label_anchor(&edges)));
-            lines.extend(edges.into_iter().map(|[start, end]| Line {
-                start: math::narrow(math::add(origin, turn.rotate(start))),
-                end: math::narrow(math::add(origin, turn.rotate(end))),
-                color,
-                thickness: 0.0,
-                on_top: THROUGH_BRICKS.get(),
-            }));
+            let in_world = edges.map(|[start, end]| {
+                [
+                    math::add(origin, turn.rotate(start)),
+                    math::add(origin, turn.rotate(end)),
+                ]
+            });
+            lines.extend(outlined_lines(&in_world, viewer, color));
         }
         // SAFETY: the current world's batcher.
         unsafe { kit.lines.replace(batcher, LAYER, &lines) };
@@ -342,7 +384,7 @@ impl Cameras {
             let keep = label.handle.is_alive() && anchors.iter().any(|(shown, _)| shown == slot);
             if !keep {
                 // SAFETY: per the contract.
-                unsafe { labels.text.destroy(&label.handle) };
+                unsafe { label.destroy(&labels.text) };
             }
             keep
         });
@@ -365,8 +407,17 @@ impl Cameras {
                                 coop_log!("camera name label made for {name}");
                                 self.label_logged = true;
                             }
+                            // Without its outline a name still shows.
+                            // SAFETY: as above.
+                            let outline = LABEL_OUTLINE_WAYS
+                                .iter()
+                                .filter_map(|_| unsafe {
+                                    labels.text.spawn(editor, &name, OUTLINE, LABEL_SIZE).ok()
+                                })
+                                .collect();
                             vacant.insert(Label {
                                 handle,
+                                outline,
                                 name: name.clone(),
                                 color,
                                 placed: None,
@@ -384,6 +435,9 @@ impl Cameras {
             unsafe {
                 if label.name != name {
                     labels.text.set_text(&label.handle, &name);
+                    for dark in &label.outline {
+                        labels.text.set_text(dark, &name);
+                    }
                     label.name = name;
                 }
                 if label.color != color {
@@ -397,6 +451,11 @@ impl Cameras {
                     .unwrap_or_default();
                 if label.placed != Some((at, rotation)) {
                     labels.text.place(&label.handle, at, rotation);
+                    for (dark, way) in label.outline.iter().zip(LABEL_OUTLINE_WAYS) {
+                        labels
+                            .text
+                            .place(dark, outline_place(at, rotation, way), rotation);
+                    }
                     label.placed = Some((at, rotation));
                 }
             }
@@ -411,7 +470,7 @@ impl Cameras {
         if let Some(labels) = &kit.labels {
             for label in self.labels.values() {
                 // SAFETY: per the contract.
-                unsafe { labels.text.destroy(&label.handle) };
+                unsafe { label.destroy(&labels.text) };
             }
         }
         self.labels.clear();
@@ -436,8 +495,57 @@ impl Cameras {
     }
 }
 
+/// Where a name's dark copy goes (`way`: across and up) for a name at `at` turned to `rotation`
+/// (its X axis toward the viewer, Y across, Z up): a little behind it, seen from the viewer.
+fn outline_place(at: Vector, rotation: Vector, way: [f64; 2]) -> Vector {
+    let turn = Quat::from_rotator(math::widen(rotation));
+    let off = [
+        -LABEL_OUTLINE_BEHIND,
+        way[0] * LABEL_OUTLINE,
+        way[1] * LABEL_OUTLINE,
+    ];
+    math::narrow(math::add(math::widen(at), turn.rotate(off)))
+}
+
+/// A marker's lines, each of `edges` given in the world: over dark ones if the local camera is known
+/// (`viewer`), about as wide on screen from any distance; without it, one pixel wide. The dark ones
+/// come first and stand a little further from the viewer, so they stay behind.
+fn outlined_lines(edges: &[[Vec3; 2]], viewer: Option<Vec3>, color: [f32; 3]) -> Vec<Line> {
+    let on_top = THROUGH_BRICKS.get();
+    let line = |[start, end]: [Vec3; 2], color, thickness: f64| Line {
+        start: math::narrow(start),
+        end: math::narrow(end),
+        color,
+        thickness: thickness as f32,
+        on_top,
+    };
+    let Some(viewer) = viewer else {
+        return edges.iter().map(|&edge| line(edge, color, 0.0)).collect();
+    };
+    let width_at = |point: Vec3, pixels: f64| {
+        let distance = math::length(math::sub(point, viewer));
+        (distance * CM_PER_PIXEL * pixels).min(MAX_LINE_WIDTH)
+    };
+    let mut lines = Vec::with_capacity(edges.len() * 2);
+    let mut front = Vec::with_capacity(edges.len());
+    for &edge in edges {
+        let middle = math::scale(math::add(edge[0], edge[1]), 0.5);
+        let dark = width_at(middle, LINE_OUTLINE_PIXELS);
+        let away = math::normalized(math::sub(middle, viewer)).unwrap_or([0.0; 3]);
+        let behind = math::scale(away, dark);
+        lines.push(line(
+            [math::add(edge[0], behind), math::add(edge[1], behind)],
+            OUTLINE,
+            dark,
+        ));
+        front.push(line(edge, color, width_at(middle, LINE_PIXELS)));
+    }
+    lines.append(&mut front);
+    lines
+}
+
 /// Where a marker's name goes in the editor's space: above the marker, over its middle.
-fn label_anchor(edges: &[[Vec3; 2]]) -> Vec3 {
+fn label_anchor(edges: &[[Vec3; 2]; MARKER_EDGES]) -> Vec3 {
     let points = edges.iter().flatten();
     let count = (edges.len() * 2).max(1) as f64;
     let (x, y) = points
@@ -449,7 +557,7 @@ fn label_anchor(edges: &[[Vec3; 2]]) -> Vec3 {
 
 /// A camera's marker in the editor's space: a pyramid from the camera along where it looks, and a
 /// little roof on its base's top edge, so which way is up shows.
-fn marker(view: View) -> Vec<[Vec3; 2]> {
+fn marker(view: View) -> [[Vec3; 2]; MARKER_EDGES] {
     let apex = math::widen(view.location);
     let forward = math::normalized(math::widen(view.forward)).unwrap_or([1.0, 0.0, 0.0]);
     // Unreal's axes: X forward, Y right, Z up. Looking straight up or down, right is the editor's.
@@ -466,13 +574,17 @@ fn marker(view: View) -> Vec<[Vec3; 2]> {
         )
     };
     let corners = [at(-1.0, -1.0), at(1.0, -1.0), at(1.0, 1.0), at(-1.0, 1.0)];
-    let mut lines = Vec::with_capacity(10);
-    for (i, &corner) in corners.iter().enumerate() {
-        lines.push([apex, corner]);
-        lines.push([corner, corners[(i + 1) % 4]]);
-    }
     let roof = at(0.0, 1.8);
-    lines.push([at(-0.5, 1.0), roof]);
-    lines.push([at(0.5, 1.0), roof]);
-    lines
+    [
+        [apex, corners[0]],
+        [corners[0], corners[1]],
+        [apex, corners[1]],
+        [corners[1], corners[2]],
+        [apex, corners[2]],
+        [corners[2], corners[3]],
+        [apex, corners[3]],
+        [corners[3], corners[0]],
+        [at(-0.5, 1.0), roof],
+        [at(0.5, 1.0), roof],
+    ]
 }

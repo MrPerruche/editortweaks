@@ -27,6 +27,7 @@
 //! one more `u16` per object (the object's old index + 1), so it can't be read without its counts.
 //! Coop sends whole archives (`SaveToArchive`), which do start with the header.
 
+use std::collections::HashSet;
 use std::fmt;
 use std::ops::Range;
 
@@ -78,6 +79,36 @@ impl ArchiveHeader {
         let index = *self.class_indices.get(object)?;
         self.class_names.get(usize::from(index)).map(String::as_str)
     }
+
+    /// Which of the objects the game's loader made, given the classes of what it made, in order.
+    /// It skips objects of classes this game doesn't have (a mod's brick), and only those: `None`
+    /// if `made` can't come of that, so what's missing can't be told.
+    pub fn made_objects<S: AsRef<str>>(&self, made: &[S]) -> Option<Vec<usize>> {
+        let mut objects = 0..self.object_count();
+        let found: Vec<usize> = made
+            .iter()
+            .map(|class| {
+                let class = bare_class(class.as_ref());
+                objects.find(|&object| self.class_of(object).map(bare_class) == Some(class))
+            })
+            .collect::<Option<_>>()?;
+        // A class is there or it isn't: an object of a class that was made wasn't skipped for it.
+        let classes: HashSet<&str> = made.iter().map(|c| bare_class(c.as_ref())).collect();
+        let of_those = (0..self.object_count())
+            .filter(|&object| {
+                self.class_of(object)
+                    .is_some_and(|c| classes.contains(bare_class(c)))
+            })
+            .count();
+        (of_those == found.len()).then_some(found)
+    }
+}
+
+/// A class's name as archives and the game's objects share it: `BP_Brick_C` and `BP_Brick` are
+/// `Brick`.
+fn bare_class(name: &str) -> &str {
+    let name = name.strip_prefix("BP_").unwrap_or(name);
+    name.strip_suffix("_C").unwrap_or(name)
 }
 
 /// Why an archive was refused.
@@ -379,6 +410,19 @@ mod tests {
         assert_eq!(header.object_count(), 3);
         assert_eq!(header.class_of(1), Some("Light_1sx1sx1s"));
         assert_eq!(header.class_of(3), None);
+        // What the loader made of it: all, or without a class this game lacks.
+        let (brick, light) = ("BP_ScalableBrick_C", "BP_Light_1sx1sx1s_C");
+        assert_eq!(
+            header.made_objects(&[brick, light, brick]),
+            Some(vec![0, 1, 2])
+        );
+        assert_eq!(header.made_objects(&[brick, brick]), Some(vec![0, 2]));
+        assert_eq!(header.made_objects(&[light]), Some(vec![1]));
+        assert_eq!(header.made_objects::<&str>(&[]), Some(vec![]));
+        // Not what skipping classes makes: another order, one of a class's objects, another class.
+        assert_eq!(header.made_objects(&[light, brick]), None);
+        assert_eq!(header.made_objects(&[brick]), None);
+        assert_eq!(header.made_objects(&["BP_Other_C"]), None);
         // The bodies are where the objects' data really is, and the tail is what follows.
         assert_eq!(bytes[header.bodies[0].clone()], [1; 33]);
         assert_eq!(bytes[header.bodies[1].clone()], [2; 5]);

@@ -110,27 +110,27 @@ pub enum Flood {
 
 /// A bucket: full, it holds `burst`; it refills by `per_second`. Times are milliseconds.
 #[derive(Debug, Clone)]
-struct Bucket {
-    level: f64,
+pub(crate) struct Bucket {
+    pub(crate) level: f64,
     at: u64,
 }
 
 impl Bucket {
-    fn full(rate: Rate, now: u64) -> Self {
+    pub(crate) fn full(rate: Rate, now: u64) -> Self {
         Self {
             level: rate.burst,
             at: now,
         }
     }
 
-    fn refill(&mut self, rate: Rate, now: u64) {
+    pub(crate) fn refill(&mut self, rate: Rate, now: u64) {
         let seconds = now.saturating_sub(self.at) as f64 / 1000.0;
         self.level = (self.level + seconds * rate.per_second).min(rate.burst);
         self.at = self.at.max(now);
     }
 
     /// Takes `amount` if the bucket holds that much.
-    fn take(&mut self, rate: Rate, now: u64, amount: f64) -> bool {
+    pub(crate) fn take(&mut self, rate: Rate, now: u64, amount: f64) -> bool {
         self.refill(rate, now);
         if self.level >= amount {
             self.level -= amount;

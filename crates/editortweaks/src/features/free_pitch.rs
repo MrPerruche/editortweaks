@@ -31,8 +31,8 @@ use crate::prelude::*;
 pub static UPSIDE_DOWN: Choice = Choice::new(
     "CameraUpsideDown",
     "Camera upside down",
-    "In the vehicle editor, the camera can turn past straight up and down, all the way round. Yaw \
-     inverted: the mouse's left and right also swap while the view is upside down.",
+    "Unlocks the camera, and you can make yaw inverted so moving the camera while it is \
+    upside down is more intuitive.",
     &[
         Alternative {
             key: "Off",

@@ -27,6 +27,7 @@ use std::time::{Duration, Instant};
 
 use coop::framing::Assembler;
 use coop::message::{HEADER_LEN, MAGIC, PROTOCOL, caps};
+use coop::references::{Entry, ImageLook, Kind};
 use coop::vehicle::Vehicle;
 use coop::wire::Reader;
 use coop::{
@@ -190,13 +191,17 @@ impl Rng {
 
     /// A number that is likely to sit on an edge: zero, small, at a cap or just over it, huge.
     fn interesting(&mut self) -> u32 {
-        const EDGES: [u32; 26] = [
+        const EDGES: [u32; 32] = [
             0,
             1,
             2,
             3,
             4,
             5,
+            32,
+            33,
+            128,
+            129,
             255,
             256,
             257,
@@ -204,6 +209,8 @@ impl Rng {
             4097,
             10_000,
             10_001,
+            16_384,
+            16_385,
             65_535,
             65_536,
             0x00FF_FFFF,
@@ -420,7 +427,58 @@ fn sample_messages() -> Vec<Message> {
             commit: 12,
             ids: vec![id(0, 3), id(0, 2), id(0, 1)],
         },
+        Message::ReferenceLevel { level: 2 },
+        Message::ReferenceList {
+            entries: sample_references(),
+        },
+        Message::ReferenceWant { content: 0xFEED },
+        Message::ReferenceData {
+            content: 0xFEED,
+            offset: 16384,
+            data: (0..300u32).map(|n| (n * 13) as u8).collect(),
+        },
     ]
+}
+
+/// A model and an image, with every field set to something.
+fn sample_references() -> Vec<Entry> {
+    let model = Entry {
+        id: "model_1".into(),
+        name: "A reference".into(),
+        kind: Kind::Model,
+        content: 0xFEED_FACE,
+        bytes: 123_456,
+        triangles: 4000,
+        pixels: 1024,
+        simplified: true,
+        position: [10.5, -20.0, 300.0],
+        rotation: [0.0, 45.0, 90.0],
+        scale: [1.0, 2.0, 0.5],
+        mirror: [true, false, true],
+        opacity: 0.5,
+        color: [1.0, 0.5, 0.25],
+        image: None,
+    };
+    let image = Entry {
+        id: "image-2".into(),
+        name: "A photo".into(),
+        kind: Kind::Image,
+        content: 77,
+        bytes: 9000,
+        triangles: 0,
+        pixels: 640 * 480,
+        simplified: false,
+        image: Some(ImageLook {
+            width: 300.0,
+            flip_x: false,
+            flip_y: true,
+            double_sided: true,
+            pixelated: false,
+            pivot: 5,
+        }),
+        ..model.clone()
+    };
+    vec![model, image]
 }
 
 /// The header bytes every message starts with.
@@ -440,7 +498,7 @@ fn random_frame(rng: &mut Rng, session: u32) -> Vec<u8> {
         0 => rng.bytes_below(2000),
         1 => rng.bytes_below(HEADER_LEN + 3),
         2 => {
-            let mut bytes = header(PROTOCOL, rng.byte() % 22, session);
+            let mut bytes = header(PROTOCOL, rng.byte() % 26, session);
             bytes.extend(rng.bytes_below(1500));
             bytes
         }
@@ -450,7 +508,11 @@ fn random_frame(rng: &mut Rng, session: u32) -> Vec<u8> {
         }
         4 => {
             // A kind that has counts first, and a count that promises far more than follows.
-            let mut bytes = header(PROTOCOL, *rng.pick(&[5, 6, 7, 8, 10, 16, 18]), session);
+            let mut bytes = header(
+                PROTOCOL,
+                *rng.pick(&[5, 6, 7, 8, 10, 16, 18, 22, 24]),
+                session,
+            );
             for _ in 0..rng.below(3) {
                 bytes.extend(rng.interesting().to_le_bytes());
             }
@@ -475,7 +537,7 @@ fn random_frame(rng: &mut Rng, session: u32) -> Vec<u8> {
 
 /// A valid header, then `items` numbers and bytes, many of them at a cap or well over it.
 fn structured_frame(rng: &mut Rng, session: u32, items: usize) -> Vec<u8> {
-    let mut bytes = header(PROTOCOL, rng.byte() % 20, session);
+    let mut bytes = header(PROTOCOL, rng.byte() % 26, session);
     bytes.extend(structured_tail(rng, items));
     bytes
 }
@@ -722,7 +784,7 @@ fn samples_cover_every_message_kind() {
         .map(|m| m.encode(1)[HEADER_LEN - 5])
         .collect();
     kinds.sort_unstable();
-    assert_eq!(kinds, (0..=19).collect::<Vec<u8>>());
+    assert_eq!(kinds, (0..=19).chain(21..=24).collect::<Vec<u8>>());
     for message in sample_messages() {
         assert_eq!(
             Message::decode(&message.encode(7)),
@@ -805,6 +867,56 @@ fn decoder_survives_every_cut_and_flip() {
             check_decoding("insertions", at as u64, &added);
         }
     }
+}
+
+/// Reference lists that survive the mutations are what the receiver's checks promise: ids that
+/// are names, numbers within bounds, an image look for exactly the images, no repeated ids.
+#[test]
+fn reference_lists_that_decode_are_within_their_bounds() {
+    start_watchdog();
+    let whole = Message::ReferenceList {
+        entries: sample_references(),
+    }
+    .encode(5);
+    let (mut total, mut decoded) = (0usize, 0usize);
+    for seed in seeds(400) {
+        let mut rng = Rng::new(seed);
+        for _ in 0..200 {
+            let frame = mutate(&mut rng, &whole);
+            check_decoding("reference lists", seed, &frame);
+            total += 1;
+            let Ok((_, Message::ReferenceList { entries })) = Message::decode(&frame) else {
+                continue;
+            };
+            decoded += 1;
+            assert!(entries.len() <= 256);
+            let mut ids: Vec<&str> = entries.iter().map(|e| e.id.as_str()).collect();
+            ids.sort_unstable();
+            ids.dedup();
+            assert_eq!(ids.len(), entries.len(), "seed {seed}: repeated ids");
+            for e in &entries {
+                let ok_id = (1..=32).contains(&e.id.len())
+                    && e.id
+                        .bytes()
+                        .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-');
+                assert!(ok_id, "seed {seed}: id {:?}", e.id);
+                assert!(e.name.len() <= 128 && !e.name.chars().any(char::is_control));
+                let within =
+                    |v: &[f64; 3], max: f64| v.iter().all(|x| x.is_finite() && x.abs() <= max);
+                assert!(within(&e.position, 1e7), "seed {seed}: {:?}", e.position);
+                assert!(within(&e.rotation, 1e5), "seed {seed}: {:?}", e.rotation);
+                assert!(within(&e.scale, 1e6), "seed {seed}: {:?}", e.scale);
+                assert!(e.opacity.is_finite() && e.color.iter().all(|c| c.is_finite()));
+                assert_eq!(e.image.is_some(), e.kind == Kind::Image, "seed {seed}");
+                if let Some(look) = &e.image {
+                    assert!(look.width.is_finite() && look.width.abs() <= 1e7);
+                    assert!(look.pivot < 16);
+                }
+            }
+        }
+    }
+    eprintln!("reference lists: {total} inputs, {decoded} of them still decoded");
+    assert!(decoded > 0);
 }
 
 /// A snapshot that promises the biggest allowed vehicle but carries a few bytes must not make

@@ -436,11 +436,13 @@ impl Scene {
         }
     }
 
-    /// Builds queued model pieces for up to [`BUILD_BUDGET`] (at least one).
+    /// Builds queued model pieces for up to [`BUILD_BUDGET`] (at least one). Whether a model
+    /// finished building (its size is known now).
     ///
     /// # Safety
     /// `editor` must be the live editor. Game thread only.
-    pub unsafe fn pump(&mut self, code: &Code, looks: &Looks, editor: *mut UObjectBase) {
+    pub unsafe fn pump(&mut self, code: &Code, looks: &Looks, editor: *mut UObjectBase) -> bool {
+        let mut finished = false;
         for shown in &mut self.shown {
             if shown.textures_outdated() {
                 // SAFETY: per the contract.
@@ -473,12 +475,27 @@ impl Scene {
                 if *left == 0 {
                     log!("{}: built in {:?}", shown.name, since.elapsed());
                     shown.building = None;
+                    finished = true;
                 }
             }
             if started.elapsed() >= BUILD_BUDGET {
                 break;
             }
         }
+        finished
+    }
+
+    /// The size of the box around the reference `id`'s triangles along its own axes, unscaled (its
+    /// size at scale 1), in cm: once it's fully built.
+    pub fn local_size(&self, id: &str) -> Option<[f64; 3]> {
+        let shown = self.shown.iter().find(|shown| shown.id == id)?;
+        if shown.building.is_some() {
+            return None;
+        }
+        let [min, max] = shown.shape.bounds()?;
+        Some(core::array::from_fn(|axis| {
+            f64::from(max[axis]) - f64::from(min[axis])
+        }))
     }
 
     /// A number that changes whenever [`Self::fit_triangles`] would.

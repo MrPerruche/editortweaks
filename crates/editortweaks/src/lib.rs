@@ -17,7 +17,7 @@ use brickworks::modinfo::ModInfo;
 
 /// Game version this build was developed against. Informational: the loader logs it and the
 /// `hello` feature warns when the running game reports a different version.
-pub const TARGET_GAME_VERSION: &CStr = c"1.11.7";
+pub const TARGET_GAME_VERSION: &CStr = c"1.11.8";
 
 /// Describes the mod to the loader (printed in `brickworks.txt`).
 #[unsafe(no_mangle)]

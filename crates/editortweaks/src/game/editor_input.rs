@@ -254,6 +254,10 @@ pub const HIDE_SELECTION: &str = "Action_HideSelection";
 /// 0x225340): shows every hidden brick again (Alt + H; input row `UnhideAll`).
 pub const UNHIDE_ALL: &str = "Action_UnhideAll";
 
+/// `FBrActionResult Action_EditorCancel(const FBrActionParams&)` (`UBaseEditorInputComponent`, BRMK
+/// 0x221880): `ABrickEditor::OnPressedCancel` (BRMK 0xC3C60).
+pub const EDITOR_CANCEL: &str = "Action_EditorCancel";
+
 /// The handler of a button's action, e.g. [`SELECT`] or [`MOVE_CAMERA`]: called when the button is
 /// pressed and when it's released (`FBrActionParams` byte +8, see [`SELECT`]).
 pub struct ButtonAction {

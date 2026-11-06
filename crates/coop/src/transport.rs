@@ -13,6 +13,11 @@ pub trait Transport {
     fn send(&mut self, to: PeerId, bytes: &[u8], reliable: bool);
     /// Everything that arrived since the last call, with who sent it.
     fn receive(&mut self) -> Vec<(PeerId, Vec<u8>)>;
+    /// Bytes queued for `to` and not yet delivered, if the transport can tell. Lets bulk data
+    /// wait so edits don't queue behind it.
+    fn backlog(&mut self, _to: PeerId) -> Option<usize> {
+        None
+    }
 }
 
 /// Sends what the session wants sent, then feeds it what arrived.

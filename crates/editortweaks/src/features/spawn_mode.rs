@@ -33,8 +33,7 @@ use crate::prelude::*;
 pub static SPAWN_MODE: Choice = Choice::new(
     "SpawnMode",
     "Spawn mode",
-    "How your vehicle spawns when you leave the vehicle editor. Normal, God and Hardpin are the \
-     vehicle selector's spawn modes.",
+    "",
     &[
         Alternative {
             key: "Normal",

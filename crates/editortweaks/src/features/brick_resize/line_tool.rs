@@ -13,6 +13,10 @@
 //! mouse) under it: it moves once the resize key is let go (to bring the second point into view,
 //! say). The line stays where it was placed in the vehicle, shows while moving with the mouse free,
 //! and lasts until cleared or replaced, or less long (a setting, see [`LINE_LASTS`]).
+//!
+//! Whenever the line shows it can be clicked away, even when no point can be placed: a move can
+//! lose the brick it's about (a coop resend replaces every brick), which leaves nothing to snap to
+//! but a line still showing.
 
 use std::sync::Once;
 

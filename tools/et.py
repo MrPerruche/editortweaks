@@ -150,7 +150,7 @@ PACKAGE_README = """\
 editortweaks {version}{coop_note}
 Built {built} from {revision}. This build {expiry}.
 
-A mod for Brick Rigs' vehicle editor, loaded by the brickworks mod loader 0.1.0 (included).
+A mod for Brick Rigs' vehicle editor, loaded by the brickworks mod loader 0.1.0 ({loader_status}).
 Made for game version {game_version} (Steam): with another version it may not load or may crash.
 
 INSTALL
@@ -158,10 +158,7 @@ INSTALL
 2. In Steam, right-click Brick Rigs > Manage > Browse local files. That opens the game folder
    (the one with BrickRigs.exe in it).
 3. Extract everything in this zip into that folder, keeping the folders, so that you get:
-     <game folder>\\brickworks\\editortweaks.dll
-     <game folder>\\BrickRigs\\Binaries\\Win64\\brickworks.dll
-     <game folder>\\BrickRigs\\Binaries\\Win64\\xinput1_3.dll
-   (If Windows asks to replace an xinput1_3.dll, another mod loader is installed there: ask first.)
+{install_files}
 4. Start the game from Steam. The options have a new "Editor tweaks" menu.
 {coop_howto}
 IF SOMETHING GOES WRONG
@@ -171,13 +168,11 @@ If the game crashed, also the newest folder in
   %LOCALAPPDATA%\\BrickRigs\\SavedRemastered\\Crashes
 {backups}
 UNINSTALL
-Delete <game folder>\\brickworks\\editortweaks.dll (the mod). To remove the loader too, delete
-brickworks.dll and xinput1_3.dll from <game folder>\\BrickRigs\\Binaries\\Win64.
-Steam's "Verify integrity of game files" doesn't remove them.
+Delete <game folder>\\brickworks\\editortweaks.dll (the mod).{uninstall_loader}
 
 LICENSES
 editortweaks: GNU GPL v3 or later (licenses\\editortweaks-LICENSE.txt); its source is available
-from its author on request. brickworks loader: MIT (licenses\\brickworks-LICENSE.txt).
+from its author on request.{loader_license}
 
 Files (SHA-256):
 {hashes}
@@ -202,15 +197,32 @@ To restore one, copy it over the Vehicle.brv in a saved vehicle's folder.
 """
 
 
+PACKAGE_LOADER_INSTALL = """\
+     <game folder>\\brickworks\\editortweaks.dll
+     <game folder>\\BrickRigs\\Binaries\\Win64\\brickworks.dll
+     <game folder>\\BrickRigs\\Binaries\\Win64\\xinput1_3.dll
+   (If Windows asks to replace an xinput1_3.dll, another mod loader is installed there: ask first.)"""
+
+PACKAGE_NO_LOADER_INSTALL = """\
+     <game folder>\\brickworks\\editortweaks.dll
+   The loader is not in this zip: brickworks.dll and xinput1_3.dll (brickworks loader 0.1.0) must
+   already be in <game folder>\\BrickRigs\\Binaries\\Win64."""
+
+PACKAGE_UNINSTALL_LOADER = """ To remove the loader too, delete
+brickworks.dll and xinput1_3.dll from <game folder>\\BrickRigs\\Binaries\\Win64.
+Steam's "Verify integrity of game files" doesn't remove them."""
+
+
 def cmd_package(args: argparse.Namespace) -> None:
-    """A zip to give a tester: the release DLL, the loader from this game install, and a README."""
+    """A zip to give a tester: the release DLL and a README, plus the loader with `--with-loader`."""
     game = paths.find_game()
     loader = [game.win64 / "brickworks.dll", game.win64 / "xinput1_3.dll"]
-    for file in loader:
-        if not file.exists():
-            raise SystemExit(f"{file} doesn't exist: install the brickworks loader 0.1.0 first (README.md).")
-    if not KNOWN_LOADERS.get(sha256(loader[0]), "").endswith("(supported)"):
-        raise SystemExit(f"The installed loader is {KNOWN_LOADERS.get(sha256(loader[0]), 'an unknown build')}, not 0.1.0.")
+    if args.with_loader:
+        for file in loader:
+            if not file.exists():
+                raise SystemExit(f"{file} doesn't exist: install the brickworks loader 0.1.0 first (README.md).")
+        if not KNOWN_LOADERS.get(sha256(loader[0]), "").endswith("(supported)"):
+            raise SystemExit(f"The installed loader is {KNOWN_LOADERS.get(sha256(loader[0]), 'an unknown build')}, not 0.1.0.")
 
     expires = expiry_of(args)
     args.debug = False
@@ -227,11 +239,14 @@ def cmd_package(args: argparse.Namespace) -> None:
     built = datetime.now()
     files = {
         "brickworks/editortweaks.dll": dll,
-        "BrickRigs/Binaries/Win64/brickworks.dll": loader[0],
-        "BrickRigs/Binaries/Win64/xinput1_3.dll": loader[1],
         "licenses/editortweaks-LICENSE.txt": paths.PROJECT_ROOT / "LICENSE",
-        "licenses/brickworks-LICENSE.txt": paths.PROJECT_ROOT / "third_party" / "brickrust" / "LICENSE",
     }
+    if args.with_loader:
+        files |= {
+            "BrickRigs/Binaries/Win64/brickworks.dll": loader[0],
+            "BrickRigs/Binaries/Win64/xinput1_3.dll": loader[1],
+            "licenses/brickworks-LICENSE.txt": paths.PROJECT_ROOT / "third_party" / "brickrust" / "LICENSE",
+        }
     readme = PACKAGE_README.format(
         version=version,
         coop_note=" (coop building test build)" if args.coop_test else "",
@@ -239,6 +254,10 @@ def cmd_package(args: argparse.Namespace) -> None:
         revision=git_revision(),
         expiry=describe_expiry(expires).replace("stops loading", "stops loading (the mod just doesn't start)"),
         game_version=game_version(),
+        loader_status="included" if args.with_loader else "not included, it must already be installed",
+        install_files=PACKAGE_LOADER_INSTALL if args.with_loader else PACKAGE_NO_LOADER_INSTALL,
+        uninstall_loader=PACKAGE_UNINSTALL_LOADER if args.with_loader else "",
+        loader_license=" brickworks loader: MIT (licenses\\brickworks-LICENSE.txt)." if args.with_loader else "",
         coop_howto=PACKAGE_COOP_HOWTO.format(
             kind="test build" if args.coop_test else "beta",
             test_steps=PACKAGE_COOP_TEST_STEPS if args.coop_test else "",
@@ -551,7 +570,9 @@ def main() -> None:
     p.add_argument("--expires", type=parse_expiry, metavar="WHEN", help=expires_help)
     p.set_defaults(func=cmd_install)
 
-    p = sub.add_parser("package", help="a zip for a tester: release DLL, loader, README")
+    p = sub.add_parser("package", help="a zip for a tester: release DLL and README (the loader only with --with-loader)")
+    p.add_argument("--with-loader", action="store_true",
+                   help="also include the brickworks loader (brickworks.dll, xinput1_3.dll) from this game install")
     p.add_argument("--coop-test", action="store_true",
                    help="a tester's zip: coop's test-only tools and COOP-TEST.txt")
     p.add_argument("--expires", type=parse_expiry, metavar="WHEN", help=expires_help)

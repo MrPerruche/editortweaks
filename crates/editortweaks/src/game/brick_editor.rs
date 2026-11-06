@@ -202,13 +202,22 @@ type PostModifyFn = unsafe extern "C" fn(editor: *mut UObjectBase, operation: *c
 static POST_MODIFY_HOOK: OnceLock<Result<usize, String>> = OnceLock::new();
 static ORIGINAL_POST_MODIFY: OnceLock<PostModifyFn> = OnceLock::new();
 static AFTER_MODIFY: Mutex<Vec<fn(u32)>> = Mutex::new(Vec::new());
+static AFTER_UNDO_STEP: Mutex<Vec<fn()>> = Mutex::new(Vec::new());
 
 unsafe extern "C" fn post_modify_detour(editor: *mut UObjectBase, operation: *const Operation) {
     let original = *ORIGINAL_POST_MODIFY
         .get()
         .expect("hook recorded before use");
-    // SAFETY: the game's operation, live for the call; its flags are what changed.
-    let flags = unsafe { (*operation).flags };
+    // SAFETY: the game's operation, live for the call, as is the outermost one it points to (which
+    // the game reads the same way, 0xCF3C97): its flags are what changed, and the only thing
+    // keeping `PostModify` from taking an undo step is that bit (read before the call, as the
+    // operation may end with it).
+    let (flags, took_step) = unsafe {
+        (
+            (*operation).flags,
+            (*(*operation).outermost).bits & NO_UNDO_STEP == 0,
+        )
+    };
     // SAFETY: the original function with its own arguments.
     unsafe { original(editor, operation) };
     // Copied out, so that a callback may ask for more without a deadlock.
@@ -218,6 +227,15 @@ unsafe extern "C" fn post_modify_detour(editor: *mut UObjectBase, operation: *co
         .clone();
     for callback in callbacks {
         callback(flags);
+    }
+    if took_step {
+        let callbacks = AFTER_UNDO_STEP
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
+        for callback in callbacks {
+            callback();
+        }
     }
 }
 
@@ -362,6 +380,39 @@ impl BrickEditor {
         editor: *mut UObjectBase,
         callback: fn(u32),
     ) -> Result<(), String> {
+        // SAFETY: per the contract.
+        unsafe { self.hook_post_modify(editor) }?;
+        AFTER_MODIFY
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(callback);
+        Ok(())
+    }
+
+    /// Runs `callback` after every operation of editors like `editor` that took an undo step, from
+    /// now on (see [`Self::after_modify`]).
+    ///
+    /// # Safety
+    /// As for [`Self::after_modify`].
+    pub unsafe fn after_undo_step(
+        &self,
+        editor: *mut UObjectBase,
+        callback: fn(),
+    ) -> Result<(), String> {
+        // SAFETY: per the contract.
+        unsafe { self.hook_post_modify(editor) }?;
+        AFTER_UNDO_STEP
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(callback);
+        Ok(())
+    }
+
+    /// Hooks the `PostModify` in `editor`'s vtable, the first time.
+    ///
+    /// # Safety
+    /// As for [`Self::after_modify`].
+    unsafe fn hook_post_modify(&self, editor: *mut UObjectBase) -> Result<(), String> {
         const NAME: &str = "ABrickEditor::PostModify";
         // SAFETY: per the contract; the slot's offset comes from the game's own code.
         let target = unsafe {
@@ -390,13 +441,7 @@ impl BrickEditor {
             .map(|()| target as usize)
         });
         match hooked {
-            Ok(hooked) if *hooked == target as usize => {
-                AFTER_MODIFY
-                    .lock()
-                    .unwrap_or_else(PoisonError::into_inner)
-                    .push(callback);
-                Ok(())
-            }
+            Ok(hooked) if *hooked == target as usize => Ok(()),
             Ok(_) => Err(format!(
                 "{NAME}: this editor has another one than the one hooked"
             )),

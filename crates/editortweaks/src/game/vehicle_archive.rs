@@ -43,8 +43,10 @@ pub const WRITER: FunctionSig = FunctionSig {
     name: "ABrickEditor::PostModify memory writer",
     // FArchive() (+0), the vtable (+5), Offset (+12), the vtable stored (+16), ArchiveName
     // (+29), Bytes (+33), SetIsSaving (+42), SetIsPersistent's vtable offset (+59), then the
-    // component's SaveToArchive (vtable offset at +94).
-    pattern: "e8 ?? ?? ?? ?? 48 8d 05 ?? ?? ?? ?? 48 89 5d ?? 48 89 45 ?? 48 8d 4d ?? 48 8d 44 24 ?? 48 89 5d ?? 48 89 45 ?? b2 01 48 8b c3 e8 ?? ?? ?? ?? 48 8b 45 ?? 48 8d 4d ?? 33 d2 ff 90 ?? ?? 00 00 48 8b 8f ?? ?? 00 00 48 8d 45 ?? 48 89 45 ?? 4c 8d 45 ?? 48 8d 95 ?? ?? 00 00 48 8b 01 ff 90 ?? ?? 00 00",
+    // component's SaveToArchive (vtable offset at +94). The component is read from the editor
+    // at +65, whose register varies by build (`rdi` in 1.11.7, `r14` in 1.11.8): its REX and
+    // ModRM bytes are wildcards.
+    pattern: "e8 ?? ?? ?? ?? 48 8d 05 ?? ?? ?? ?? 48 89 5d ?? 48 89 45 ?? 48 8d 4d ?? 48 8d 44 24 ?? 48 89 5d ?? 48 89 45 ?? b2 01 48 8b c3 e8 ?? ?? ?? ?? 48 8b 45 ?? 48 8d 4d ?? 33 d2 ff 90 ?? ?? 00 00 ?? 8b ?? ?? ?? 00 00 48 8d 45 ?? 48 89 45 ?? 4c 8d 45 ?? 48 8d 95 ?? ?? 00 00 48 8b 01 ff 90 ?? ?? 00 00",
 };
 
 /// `UBrickEditorInterfaceComponent::SaveToArchive(FSafeArchive&)` (BRMK 0xE3890, game RVA

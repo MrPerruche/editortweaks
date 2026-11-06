@@ -3,8 +3,8 @@
 //! `docs/re/map-in-editor.md`), then a "References" section of ours, starting with the map's rows
 //! (the reference images and models' rows follow, from `features/references`):
 //!
-//! - **Show map:** a dropdown of none, then the map's garages ("Garage 3"), the one the editor was
-//!   entered from marked. A garage with a pinned spawn point of its own is listed twice: first at
+//! - **Show map:** a dropdown of none, the player's current location, then the map's garages
+//!   ("Garage 3"), the one the editor was entered from marked. A garage with a pinned spawn point of its own is listed twice: first at
 //!   that point ("Garage 3 (pinned spawn)", where the game spawns the vehicle when the vehicle
 //!   browser's spawn option is Pinned, as city covers need: unpinned, they fall), then at its
 //!   normal one. The selected garage's spawn point is marked in the editor, and the map shows
@@ -35,12 +35,14 @@ pub const EDITOR_SETTINGS: &str = "Properties.Editor";
 /// same section, after these (sections titled alike show as one, see `features/settings_list`).
 pub const SECTION: &str = "References";
 
-/// How many garage items the list can hold: after "None", what's left of a list's items.
-const MAX_GARAGES: usize = MAX_ITEMS - 1;
+/// How many garage items the list can hold: after "None" and the current location, what's left of
+/// a list's items.
+const MAX_GARAGES: usize = MAX_ITEMS - 2;
 
 const NONE: &str = "Hidden";
+const CURRENT_LOCATION: &str = "Current location";
 
-const GARAGE_DESCRIPTION: &str = "Show the map, positionned to match where your vehicle will be placed if spawned at a garage. Some garages may spawn you differently if you spawn your vehicle pinned.";
+const GARAGE_DESCRIPTION: &str = "Show the map, either at your location of when spawned at a garage. For some garages, the spawning location is different if you spawn pinned or not (For example, main bricksville garage).";
 
 /// What the row and the map key ask for, and what the row shows.
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -52,8 +54,12 @@ pub(super) struct Controls {
     pub pinned: bool,
     /// Whether the map is to show: a garage was chosen, and the map wasn't refused since.
     pub show_map: bool,
+    /// The map shows at the player's current location, rather than at a garage.
+    pub here: bool,
     /// The garage (and `pinned`) last chosen before none, for the map key to go back to.
     pub last: Option<(WeakObject, bool)>,
+    /// The current location was chosen last, and is what the map key goes back to.
+    pub last_here: bool,
     /// The editor they're for: the garage it was entered from is marked in the list.
     pub editor: Option<WeakObject>,
     /// Whether the row changed `garage` since the last tick.
@@ -66,16 +72,22 @@ impl Controls {
             garage: None,
             pinned: true,
             show_map: false,
+            here: false,
             last: None,
+            last_here: false,
             editor: None,
             asked: false,
         }
     }
 
-    /// No garage, no map; the garage is kept as the last one.
+    /// No garage or location, no map; what was chosen is kept as the last choice.
     pub fn hide(&mut self) {
         if let Some(garage) = self.garage.take() {
             self.last = Some((garage, self.pinned));
+            self.last_here = false;
+        }
+        if core::mem::take(&mut self.here) {
+            self.last_here = true;
         }
         self.show_map = false;
     }
@@ -199,11 +211,15 @@ impl List for GarageList {
                 )
             });
         }
-        labels(&marks)
+        labels(&marks, offers_here())
     }
 
     fn chosen(&self) -> usize {
         let controls = *controls();
+        let before_garages = before_garages(offers_here());
+        if controls.here {
+            return before_garages - 1;
+        }
         let Some(garage) = controls.garage else {
             return 0;
         };
@@ -216,34 +232,46 @@ impl List for GarageList {
             position,
             pinned: placement::has_pinned_point(&garages[position]).then_some(controls.pinned),
         };
-        item_of(&items(&marks(&garages, None)), wanted)
+        match item_of(&items(&marks(&garages, None)), wanted) {
+            0 => 0,
+            item => item - 1 + before_garages,
+        }
     }
 
     fn choose(&self, index: usize) -> bool {
-        let chosen = match index.checked_sub(1) {
-            None => None,
-            Some(at) => {
-                // SAFETY: the panel changes rows on the game thread.
-                let garages = unsafe { garages() };
-                let Some(item) = items(&marks(&garages, None)).get(at).copied() else {
-                    return false;
-                };
-                let Some(garage) = garages.get(item.position) else {
-                    return false;
-                };
-                // SAFETY: the map's garages are live objects.
-                let garage = unsafe { WeakObject::new(garage.actor) };
-                Some((garage, item.pinned.unwrap_or(true)))
-            }
+        let offered = offers_here();
+        let choice = if index == 0 {
+            Choice::Nothing
+        } else if offered && index == 1 {
+            Choice::Here
+        } else {
+            // SAFETY: the panel changes rows on the game thread.
+            let garages = unsafe { garages() };
+            let at = index - before_garages(offered);
+            let Some(item) = items(&marks(&garages, None)).get(at).copied() else {
+                return false;
+            };
+            let Some(garage) = garages.get(item.position) else {
+                return false;
+            };
+            // SAFETY: the map's garages are live objects.
+            let garage = unsafe { WeakObject::new(garage.actor) };
+            Choice::Garage(garage, item.pinned.unwrap_or(true))
         };
         let mut controls = controls();
-        match chosen {
-            Some((garage, pinned)) => {
+        // What was chosen until now goes, kept for the map key until this choice is hidden.
+        controls.hide();
+        match choice {
+            Choice::Nothing => {}
+            Choice::Here => {
+                controls.here = true;
+                controls.show_map = true;
+            }
+            Choice::Garage(garage, pinned) => {
                 controls.garage = Some(garage);
                 controls.pinned = pinned;
                 controls.show_map = true;
             }
-            None => controls.hide(),
         }
         controls.asked = true;
         true
@@ -253,6 +281,29 @@ impl List for GarageList {
     fn dropdown(&self) -> bool {
         true
     }
+}
+
+/// What an item of the list picks.
+enum Choice {
+    Nothing,
+    Here,
+    Garage(WeakObject, bool),
+}
+
+/// Whether the list offers the player's current location: the game's code for it was found, and the
+/// map can show at all (the location only shows the map, it has no spawn point to mark).
+fn offers_here() -> bool {
+    GAME.get().is_some_and(|game| {
+        game.player_places.is_some()
+            && game.can_show
+            && game.camera_agrees
+            && game.isolation.is_some()
+    })
+}
+
+/// How many items come before the garages: none, and the current location if `offered`.
+fn before_garages(offered: bool) -> usize {
+    1 + usize::from(offered)
 }
 
 /// What the list notes about a garage.
@@ -301,12 +352,16 @@ fn items(marks: &[Mark]) -> Vec<Item> {
         .collect()
 }
 
-/// The garage list's labels: none, then each item, e.g. "Garage 3 (entered here, pinned spawn)".
-fn labels(marks: &[Mark]) -> Vec<String> {
+/// The list's labels: none, the current location if `here`, then each item, e.g. "Garage 3 (closest,
+/// pinned)".
+fn labels(marks: &[Mark], here: bool) -> Vec<String> {
     let garages = items(marks)
         .into_iter()
         .map(|item| label(item, marks[item.position]));
-    std::iter::once(NONE.to_owned()).chain(garages).collect()
+    std::iter::once(NONE.to_owned())
+        .chain(here.then(|| CURRENT_LOCATION.to_owned()))
+        .chain(garages)
+        .collect()
 }
 
 fn label(item: Item, mark: Mark) -> String {
@@ -339,8 +394,19 @@ mod tests {
 
     #[test]
     fn the_list_starts_with_none_then_counts_the_garages() {
-        let items = labels(&[Mark::default(); 3]);
-        assert_eq!(items, ["None", "Garage 1", "Garage 2", "Garage 3"]);
+        let items = labels(&[Mark::default(); 3], false);
+        assert_eq!(items, ["Hidden", "Garage 1", "Garage 2", "Garage 3"]);
+    }
+
+    #[test]
+    fn the_current_location_comes_before_the_garages() {
+        let items = labels(&[Mark::default(); 2], true);
+        assert_eq!(
+            items,
+            ["Hidden", "Current location", "Garage 1", "Garage 2"]
+        );
+        assert_eq!(before_garages(true), 2);
+        assert_eq!(before_garages(false), 1);
     }
 
     #[test]
@@ -360,13 +426,13 @@ mod tests {
             },
         ];
         assert_eq!(
-            labels(&marks)[1..],
+            labels(&marks, false)[1..],
             [
-                "Garage 1 (entered here)",
-                "Garage 2 (pinned spawn)",
+                "Garage 1 (closest)",
+                "Garage 2 (pinned)",
                 "Garage 2",
-                "Garage 3 (entered here, pinned spawn)",
-                "Garage 3 (entered here)",
+                "Garage 3 (closest, pinned)",
+                "Garage 3 (closest)",
             ]
         );
     }
@@ -400,6 +466,6 @@ mod tests {
             };
             MAX_GARAGES
         ];
-        assert_eq!(labels(&marks).len(), MAX_ITEMS);
+        assert_eq!(labels(&marks, true).len(), MAX_ITEMS);
     }
 }

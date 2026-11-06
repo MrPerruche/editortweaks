@@ -256,8 +256,19 @@ pub static COOP_MENU: Keybind = Keybind::menu(
     "/Game/BrickRigs/UI/Textures/Icons/T_Dummy.T_Dummy",
 );
 
+/// Puts the editor's camera where the selected camera brick sees from (`camera_view`). An entry of
+/// the editor's "Editor tweaks" menu, and of its bottom bar while a camera brick is selected; no key
+/// by default.
+pub static CAMERA_VIEW: Keybind = Keybind::menu(
+    "EditorTweaks_CameraView",
+    "Go to camera view",
+    "Press in the editor with a camera brick selected (or click it in the editor's bottom bar) to see from that camera: its place, angle and zoom. Only your view changes.",
+    &[],
+    "/Game/BrickRigs/UI/Textures/Icons/T_Camera.T_Camera",
+);
+
 /// The Tools section's keybinds (with coop's).
-const TOOLS: &[&Keybind] = &[&EXPORT_MODEL, &COOP_MENU];
+const TOOLS: &[&Keybind] = &[&EXPORT_MODEL, &CAMERA_VIEW, &COOP_MENU];
 
 /// Every keybind, by section, in the order the settings list them. The sections are the
 /// changelog's headers (those having keys).

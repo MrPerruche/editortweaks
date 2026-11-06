@@ -14,6 +14,9 @@
 //!   (`property_limits::slider_limit`). So an absolute drag doesn't stop where the (hidden) cursor
 //!   meets the screen's edge, the cursor is moved back from the edges, and the drag sees it where it
 //!   would be without that ([`CursorShift`]).
+//! - The cursor of a drag stays in the game's window ([`keep_cursor_in_window`]), as a single
+//!   monitor's edges would keep it: with more monitors it would wander off to them, and show there
+//!   when the drag ends.
 //!
 //! How: the slider's mouse move handler (`game::slider_drag`) is hooked. Its clamp to the slider's
 //! range is removed from its code or put back, as the setting and the dragged slider say when a
@@ -72,8 +75,8 @@ const ALT_DRAG_CONTROL_FACTOR: f32 = 1.0 / 4.0;
 const ALT_DRAG_INTERVAL_MS: u32 = 10;
 /// The longest time an Alt-drag step covers, in seconds, so a hitch doesn't make the value jump.
 const MAX_STEP_SECONDS: f32 = 0.1;
-/// During a drag, the cursor is moved back once it's this close to the left or right edge of where
-/// it can go, as a share of that width ...
+/// During a drag past a slider's ends, the cursor is moved back once it's this close to the left or
+/// right edge of where it can go, as a share of that width ...
 const EDGE_SHARE: f32 = 1.0 / 8.0;
 /// ... to this far from that edge: still on the same side of the screen (the panel's), where it
 /// shows again after the drag.
@@ -118,7 +121,7 @@ thread_local! {
     static CURSOR_SHIFT: Cell<Option<CursorShift>> = const { Cell::new(None) };
 }
 
-/// How far the cursor of a drag was moved back from the screen's edges ([`keep_cursor_off_edges`]):
+/// How far the cursor of a drag was moved back from the screen's edges ([`keep_cursor_in_window`]):
 /// the drag sees it that much further ([`with_shifted_cursor`]), where it would be without that.
 #[derive(Clone, Copy)]
 struct CursorShift {
@@ -296,9 +299,9 @@ unsafe extern "C" fn on_mouse_move(
         // before returning.
         let reply =
             unsafe { with_shifted_cursor(event.cast_mut(), || drag_step(sliders, slider, call)) };
+        keep_cursor_in_window(lifted, modifier_keys);
         // Without lifted limits, an absolute drag stops at the slider's end, on screen.
         if lifted {
-            keep_cursor_off_edges(modifier_keys);
             // SAFETY: a live slider being dragged, on the game thread.
             unsafe { keep_drag_within_limit(sliders, slider) };
         }
@@ -358,7 +361,7 @@ unsafe fn as_still_shift_drag<R>(event: *mut PointerEvent, call: impl FnOnce() -
     }
 }
 
-/// Runs `call` with `event`'s cursor where it would be if [`keep_cursor_off_edges`] hadn't moved it:
+/// Runs `call` with `event`'s cursor where it would be if [`keep_cursor_in_window`] hadn't moved it:
 /// an absolute drag carries on from there. A relative drag doesn't read it.
 ///
 /// # Safety
@@ -381,24 +384,34 @@ unsafe fn with_shifted_cursor<R>(event: *mut PointerEvent, call: impl FnOnce() -
     }
 }
 
-/// Moves the (hidden) cursor of a drag back once it nears the left or right edge of where it can
-/// go, where it would stop: an absolute drag then goes on as far as the mouse does. Remembers how
-/// far for [`with_shifted_cursor`].
-fn keep_cursor_off_edges(modifier_keys: u16) {
-    let (Some((x, y)), Some((left, right))) = (cursor::position(), cursor::horizontal_bounds())
-    else {
+/// Keeps the (hidden) cursor of a drag in the game's window, or wherever it's confined to. Dragging
+/// past the slider's ends (`lifted`), it's also moved back once it nears the left or right edge,
+/// where it would stop: an absolute drag then goes on as far as the mouse does, and how far it was
+/// moved is remembered for [`with_shifted_cursor`]. Otherwise it just stops at the edges, as it
+/// does on a single monitor, past the slider's end anyway.
+fn keep_cursor_in_window(lifted: bool, modifier_keys: u16) {
+    let (Some((x, y)), Some(area)) = (cursor::position(), cursor::window_area()) else {
         return;
     };
-    let Some(target) = off_edge(x, left, right) else {
+    let target_y = y.clamp(area.top, area.bottom - 1);
+    let moved_back = lifted.then(|| off_edge(x, area.left, area.right)).flatten();
+    let target_x = moved_back.unwrap_or_else(|| {
+        if lifted {
+            x
+        } else {
+            x.clamp(area.left, area.right - 1)
+        }
+    });
+    if (target_x, target_y) == (x, y) || !cursor::set_position(target_x, target_y) {
         return;
-    };
-    if cursor::set_position(target, y) {
+    }
+    if moved_back.is_some() {
         let offset = CURSOR_SHIFT
             .get()
             .filter(|shift| shift.modifier_keys == modifier_keys)
             .map_or(0.0, |shift| shift.offset);
         CURSOR_SHIFT.set(Some(CursorShift {
-            offset: offset + (x - target) as f32,
+            offset: offset + (x - target_x) as f32,
             modifier_keys,
         }));
     }

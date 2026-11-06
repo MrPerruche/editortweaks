@@ -95,17 +95,74 @@ impl Image {
     /// The image as a PNG file's contents: the engine's texture import (`ImportBufferAsTexture2D`)
     /// takes files, not pixels. Fast compression: it's decoded again right away.
     pub fn to_png(&self) -> Result<Vec<u8>, String> {
+        self.encode_png(png::Compression::Fast, png::Filter::NoFilter)
+    }
+
+    /// The image as a PNG file that is meant to stay small (for sending), not quick to make.
+    pub(crate) fn to_small_png(&self) -> Result<Vec<u8>, String> {
+        self.encode_png(png::Compression::Balanced, png::Filter::Adaptive)
+    }
+
+    fn encode_png(
+        &self,
+        compression: png::Compression,
+        filter: png::Filter,
+    ) -> Result<Vec<u8>, String> {
         let not_written = |error: png::EncodingError| format!("PNG not written: {error}");
         let mut bytes = Vec::new();
         let mut encoder = png::Encoder::new(&mut bytes, self.width, self.height);
         encoder.set_color(png::ColorType::Rgba);
         encoder.set_depth(png::BitDepth::Eight);
-        encoder.set_compression(png::Compression::Fast);
-        encoder.set_filter(png::Filter::NoFilter);
+        encoder.set_compression(compression);
+        encoder.set_filter(filter);
         let mut writer = encoder.write_header().map_err(not_written)?;
         writer.write_image_data(&self.rgba).map_err(not_written)?;
         writer.finish().map_err(not_written)?;
         Ok(bytes)
+    }
+
+    /// The image as a JPEG file (`quality` 1 to 100), alpha dropped.
+    pub(crate) fn to_jpeg(&self, quality: u8) -> Result<Vec<u8>, String> {
+        let not_written = |error: jpeg_encoder::EncodingError| format!("JPEG not written: {error}");
+        let too_big = || {
+            format!(
+                "{} x {} pixels is too big for a JPEG",
+                self.width, self.height
+            )
+        };
+        let (width, height) = (
+            u16::try_from(self.width).map_err(|_| too_big())?,
+            u16::try_from(self.height).map_err(|_| too_big())?,
+        );
+        let rgb: Vec<u8> = self
+            .rgba
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .flat_map(|&[r, g, b, _]| [r, g, b])
+            .collect();
+        let mut bytes = Vec::new();
+        let mut encoder = jpeg_encoder::Encoder::new(&mut bytes, quality);
+        encoder.set_optimized_huffman_tables(true);
+        encoder
+            .encode(&rgb, width, height, jpeg_encoder::ColorType::Rgb)
+            .map_err(not_written)?;
+        Ok(bytes)
+    }
+
+    /// Whether no pixel is see-through.
+    pub(crate) fn is_opaque(&self) -> bool {
+        self.rgba
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .all(|pixel| pixel[3] == 255)
+    }
+
+    /// The image scaled down to `width` x `height` (neither bigger than the image's own size) by
+    /// averaging the pixels each new one covers.
+    pub(crate) fn scaled_down(&self, width: u32, height: u32) -> Image {
+        box_downscale(self, width, height)
     }
 }
 
@@ -180,6 +237,33 @@ pub fn decode(bytes: &[u8]) -> Result<Image, String> {
         return Ok(box_downscale(&image, width, height));
     }
     Ok(image)
+}
+
+/// The size a PNG or JPEG file declares, as [`decode`] would give it (so scaled down to
+/// [`MAX_SIDE`] if bigger), read from its header only: nothing is allocated for the pixels.
+pub(crate) fn dimensions(bytes: &[u8]) -> Result<(u32, u32), String> {
+    let (width, height) = if bytes.starts_with(&PNG_MAGIC) {
+        let limits = png::Limits { bytes: usize::MAX };
+        let decoder = png::Decoder::new_with_limits(Cursor::new(bytes), limits);
+        let reader = decoder
+            .read_info()
+            .map_err(|error| format!("not a readable PNG: {error}"))?;
+        reader.info().size()
+    } else if bytes.starts_with(&JPEG_MAGIC) {
+        let mut decoder = JpegDecoder::new(ZCursor::new(bytes));
+        decoder
+            .decode_headers()
+            .map_err(|error| format!("not a readable JPEG: {error:?}"))?;
+        let info = decoder.info().ok_or("not a readable JPEG: no header")?;
+        (u32::from(info.width), u32::from(info.height))
+    } else {
+        return Err("not a PNG or JPEG image".into());
+    };
+    check_size(width, height)?;
+    if width.max(height) > MAX_SIDE {
+        return Ok(fit_to_max_side(width, height));
+    }
+    Ok((width, height))
 }
 
 /// Fails for a declared size nobody should be asked to decode.

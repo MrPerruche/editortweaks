@@ -601,6 +601,8 @@ struct State {
     spinner_models: Option<SpinnerModels>,
     /// The line moved bricks turn about or slide along, and placing it.
     line_tool: LineTool,
+    /// Whether the editor is in a move with the mouse free, where the line shows.
+    line_shows: bool,
     /// The moved brick hovered when the line key went down with a line placed: a drag of the key
     /// from there slides the bricks along the line.
     slide_from: Option<Hover>,
@@ -656,6 +658,7 @@ impl State {
             models: None,
             spinner_models: None,
             line_tool: LineTool::new(),
+            line_shows: false,
             slide_from: None,
             pivot_taken: false,
             cross_section_keys: spinner_shape::Keys::new(),
@@ -724,6 +727,7 @@ impl State {
                 .in_move(game.modes.move_mode(editor).is_some());
             // The line shows while moving with the mouse free.
             let show_line = game.modes.moving(editor) == Some(editor_mode::Moving::Precisely);
+            self.line_shows = show_line;
             let controller = game.editor.player_controller(editor);
             // Where the vehicle is: from its bricks, else from when the line was placed.
             let vehicle = match &self.scene {
@@ -819,8 +823,9 @@ impl State {
     /// Game thread only.
     unsafe fn place_line(&mut self, game: &Game, view: Option<&View>, held: bool) {
         self.line_tool.clear_key(keybinds::CLEAR_LINE.is_held());
-        let can_be_placed =
-            held && self.drag.is_none() && matches!(self.gathered, Some(Gathered::Moving { .. }));
+        // Wherever the line shows, even in a move that lost its brick: with nothing gathered there's
+        // nothing to place, and a click clears.
+        let can_be_placed = held && self.drag.is_none() && self.line_shows;
         // The key first: a press places what showed before it.
         let vehicle = self.scene.as_ref().map(|scene| scene.vehicle);
         let pressed = self.line_tool.key(
@@ -1287,10 +1292,8 @@ impl State {
             }
             return true;
         }
-        let line_key = pressed
-            && is_fast_editing()
-            && matches!(self.gathered, Some(Gathered::Moving { .. }))
-            && keybinds::LINE_POINT.is_held();
+        let line_key =
+            pressed && is_fast_editing() && self.line_shows && keybinds::LINE_POINT.is_held();
         self.line_tool.right_button(pressed, line_key)
     }
 

@@ -10,7 +10,8 @@
 //! takes it out if it's selected already. Any other click, or bricks getting selected some other
 //! way (seen at the next tick), unselects the references (a Shift click on nothing leaves them).
 //! Clicks only pick references while the setting [`SELECTABLE`] is on, and only in the editor's
-//! default mode (not while moving bricks).
+//! default mode (not while moving bricks); leaving that mode unselects them, as does the editor's
+//! Cancel key, which then does nothing else.
 
 use brickrust::ue::coreuobject::UObjectBase;
 use model_io::pick::Ray;
@@ -45,7 +46,7 @@ const DUPLICATE_GAP: f64 = 30.0;
 /// What clicking needs from the game (after engine init).
 pub(super) struct Input {
     modes: EditorModes,
-    editor: BrickEditor,
+    pub(super) editor: BrickEditor,
     viewport: Viewport,
     selector: Selector,
     trace: LineTrace,
@@ -115,6 +116,12 @@ fn on_button(press: &Press) -> bool {
                 state.unhide_all();
                 false
             }
+            (Button::Cancel, Click::Pressed) => {
+                state.pressed = None;
+                let any = !state.selected.is_empty();
+                state.select(Vec::new());
+                any
+            }
             _ => false,
         }
     }
@@ -170,6 +177,9 @@ unsafe fn release_select(input: &Input, state: &mut State, editor: *mut UObjectB
     } else {
         state.select(vec![id]);
     }
+    // Unselecting the bricks made the game show its panel for no selection, even when the same
+    // references stay selected (a click on a selected one), which `select` doesn't refresh for.
+    state.refresh_panel = true;
     true
 }
 
@@ -257,6 +267,10 @@ fn delete_selected(state: &mut State) -> bool {
     if state.selected.is_empty() {
         return false;
     }
+    // The session's references are the host's: taken, doing nothing.
+    if state.received.is_some() {
+        return true;
+    }
     let folder = state.folder.clone();
     for id in core::mem::take(&mut state.selected) {
         if let Err(reason) = edit::remove(&mut state.sidecar, folder.as_deref(), &id) {
@@ -273,6 +287,9 @@ fn delete_selected(state: &mut State) -> bool {
 fn duplicate_selected(state: &mut State) -> bool {
     if state.selected.is_empty() {
         return false;
+    }
+    if state.received.is_some() {
+        return true;
     }
     let offset = state.scene.width_of(&state.selected).unwrap_or(0.0) + DUPLICATE_GAP;
     let mut copies = Vec::new();
@@ -299,11 +316,20 @@ fn duplicate_selected(state: &mut State) -> bool {
     true
 }
 
+/// Whether references can stay selected in `editor`: it's in its default mode, no brick selected.
+///
+/// # Safety
+/// `editor` must be the live editor. Game thread only.
+pub(super) unsafe fn keeps_references(input: &Input, editor: *mut UObjectBase) -> bool {
+    // SAFETY: per the contract.
+    unsafe { input.modes.default_mode(editor).is_some() && !bricks_selected(input, editor) }
+}
+
 /// Whether any brick of `editor` is selected (`false` if that can't be told).
 ///
 /// # Safety
 /// `editor` must be the live editor. Game thread only.
-pub(super) unsafe fn bricks_selected(input: &Input, editor: *mut UObjectBase) -> bool {
+unsafe fn bricks_selected(input: &Input, editor: *mut UObjectBase) -> bool {
     let Some(selection) = &input.selection else {
         return false;
     };

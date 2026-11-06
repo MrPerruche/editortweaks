@@ -7,7 +7,8 @@ license.workspace = true
 publish.workspace = true
 
 # Pure Rust and free of game code, so `cargo test -p model_io` runs anywhere (the mod crate's own
-# test binary needs the game's loader DLL). Every dependency is MIT or Apache-2.0.
+# test binary needs the game's loader DLL). Every dependency is MIT or Apache-2.0, except
+# jpeg-encoder: (MIT OR Apache-2.0) AND IJG (BSD-like, asks for attribution in documentation).
 [dependencies]
 # PNG decode and encode: the format reference images, model textures and the engine's texture
 # import all use. Only what the `png` crate needs by default (deflate in pure Rust).
@@ -21,3 +22,9 @@ serde_json = "1"
 serde = { version = "1", features = ["derive"] }
 tobj = { version = "4", default-features = false }
 toml = "1"
+# JPEG encode only (pure Rust): cooked reference images and textures for coop (`shared.rs`).
+# MIT or Apache-2.0.
+jpeg-encoder = { version = "0.7", default-features = false }
+# Mesh simplification (meshoptimizer's C++, built by the `cc` crate): cooked reference models for
+# coop (`shared.rs`). MIT. `.cargo/config.toml` makes its libstdc++ static.
+meshopt = "0.7.0"

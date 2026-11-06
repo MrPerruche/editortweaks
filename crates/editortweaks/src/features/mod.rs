@@ -11,6 +11,7 @@ mod axis_permutations;
 mod brick_names;
 mod brick_resize;
 mod camera_speed;
+mod camera_view;
 mod click_swap;
 mod compact_panel;
 mod connector_markers;
@@ -63,6 +64,7 @@ pub static ALL: &[&dyn Feature] = &[
     &slider_formulas::SliderFormulas,
     &slider_drag::SliderDrag,
     &axis_permutations::AxisPermutations,
+    &camera_view::CameraView,
     &thruster_size::ThrusterSize,
     &camera_speed::CameraSpeed,
     &free_pitch::FreePitch,

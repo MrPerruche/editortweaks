@@ -20,6 +20,8 @@ use crate::game::editor_file::FileInfo;
 /// folder.
 const AUTOSAVE_FOLDER: &str = "AutoSave";
 const AUTOSAVE_FILE: &str = "Autosave.brv";
+/// A saved vehicle's file in its folder.
+pub const VEHICLE_FILE: &str = "Vehicle.brv";
 
 /// Where the game saves vehicles: `SavedRemastered\Vehicles` in its local data, one folder per
 /// vehicle named after its local id.

@@ -312,6 +312,8 @@ struct Player {
     misordered: usize,
     /// Subhost: which bricks it audits next.
     rounds: Rounds,
+    /// Bricks this player's game can't make, as `features/coop` remembers them.
+    absent: std::collections::HashSet<CoopId>,
 }
 
 impl Player {
@@ -327,6 +329,7 @@ impl Player {
             differences: Vec::new(),
             misordered: 0,
             rounds: Rounds::default(),
+            absent: std::collections::HashSet::new(),
         }
     }
 
@@ -372,9 +375,12 @@ impl Player {
                     Event::OrderWanted(peer) => orders.push(peer),
                     Event::Audit(audit) => {
                         let ids = self.editor.ids();
-                        let differences = audit.compare(ids.len() as u32, order_hash(ids), |id| {
-                            self.editor.digest(id)
-                        });
+                        let differences = audit.compare_without(
+                            ids.len() as u32,
+                            order_hash(ids),
+                            &self.absent,
+                            |id| self.editor.digest(id),
+                        );
                         if differences.iter().any(|d| d.needs_snapshot()) {
                             self.differences.extend(differences);
                             self.session.request_resync();
@@ -1164,6 +1170,282 @@ fn resync_after_missed_change() {
     assert!(players[1].editor.state() == players[0].editor.state());
 }
 
+/// `op` as an edit nothing undoes, made in player `p`'s editor and sent; everything delivered.
+fn make_and_send(
+    net: &std::rc::Rc<std::cell::RefCell<MemoryNet>>,
+    players: &mut [Player],
+    p: usize,
+    op: Op,
+) {
+    players[p].editor.apply(&op);
+    players[p].session.edit(vec![op]).unwrap();
+    settle(net, players);
+}
+
+/// A new brick of `player`'s, as an edit creating it.
+fn create_of(player: &mut Player, rng: &mut Rng) -> Op {
+    let ids = player.session.new_ids(1).unwrap();
+    Op::Create {
+        ids,
+        archive: encode_bricks([new_brick(rng)].iter()),
+    }
+}
+
+/// A member's brick the subhost's game can't make (its loader skips what it can't load) goes for
+/// everyone at once: no snapshot, so the member keeps its undo steps (and selection).
+#[test]
+fn a_brick_the_subhost_cannot_make_goes_for_everyone() {
+    let (net, mut players, ids) = session_of(21, 2, 3);
+    let mut rng = Rng(21);
+    // A step to undo later, which must survive.
+    let step = players[1].make(Op::Move {
+        id: ids[0],
+        transform: place(1.0),
+    });
+    players[1].session.edit_undoable(step).unwrap();
+    settle(&net, &mut players);
+
+    let create = create_of(&mut players[1], &mut rng);
+    let Op::Create { ids: made, .. } = &create else {
+        unreachable!()
+    };
+    let made = made[0];
+    make_and_send(&net, &mut players, 1, create);
+
+    // The subhost's editor didn't make it: the mod tells the session what it holds.
+    players[0].editor.apply(&Op::Delete { id: made });
+    let held = players[0].editor.ids();
+    assert_eq!(players[0].session.settle(&held), 1);
+    settle(&net, &mut players);
+
+    all_equal(&players);
+    assert!(players[1].editor.find(made).is_none());
+    assert_eq!((players[1].drifts, players[2].drifts), (0, 0));
+
+    // Later edits raise no alarm, and the step before it can still be undone.
+    make_and_send(
+        &net,
+        &mut players,
+        0,
+        Op::Move {
+            id: ids[1],
+            transform: place(2.0),
+        },
+    );
+    assert_eq!((players[1].drifts, players[2].drifts), (0, 0));
+    assert!(players[1].step_back(false));
+    settle(&net, &mut players);
+    all_equal(&players);
+}
+
+/// What a coop test hit: after one brick the subhost's game couldn't make (a mod only the member
+/// has), every later edit, whoever's, must leave the member its undo steps.
+#[test]
+fn a_brick_the_subhost_cannot_make_costs_the_member_nothing_later() {
+    let (net, mut players, ids) = session_of(22, 1, 3);
+    let mut rng = Rng(22);
+    let create = create_of(&mut players[1], &mut rng);
+    let Op::Create { ids: made, .. } = &create else {
+        unreachable!()
+    };
+    let made = made[0];
+    make_and_send(&net, &mut players, 1, create);
+    players[0].editor.apply(&Op::Delete { id: made });
+    let held = players[0].editor.ids();
+    players[0].session.settle(&held);
+    settle(&net, &mut players);
+    // The next audit is what found the difference in that test, and started it all.
+    players[0].audit(1);
+    settle(&net, &mut players);
+
+    for round in 0..5 {
+        edit(
+            &mut players,
+            1,
+            vec![Op::Move {
+                id: ids[0],
+                transform: place(round as f32),
+            }],
+        );
+        settle(&net, &mut players);
+        make_and_send(
+            &net,
+            &mut players,
+            0,
+            Op::Move {
+                id: ids[1],
+                transform: place(round as f32 + 10.0),
+            },
+        );
+        assert_eq!(players[1].drifts, 0, "round {round}: the vehicle came back");
+        assert!(players[1].step_back(false), "round {round}: no undo step");
+        settle(&net, &mut players);
+    }
+    all_equal(&players);
+}
+
+/// The other way round: the subhost's game has the brick, a member's doesn't. The session still
+/// counts it there (it's in the vehicle), so edits go on with no snapshot, the brick's own too.
+#[test]
+fn a_brick_only_the_member_cannot_make_costs_it_nothing() {
+    let (net, mut players, ids) = session_of(23, 1, 3);
+    let mut rng = Rng(23);
+    let create = create_of(&mut players[0], &mut rng);
+    let Op::Create { ids: made, .. } = &create else {
+        unreachable!()
+    };
+    let made = made[0];
+    make_and_send(&net, &mut players, 0, create);
+    players[1].editor.apply(&Op::Delete { id: made });
+    players[1].absent.insert(made);
+
+    for round in 0..5 {
+        make_and_send(
+            &net,
+            &mut players,
+            0,
+            Op::Move {
+                id: made,
+                transform: place(round as f32),
+            },
+        );
+        players[0].audit(4);
+        settle(&net, &mut players);
+        edit(
+            &mut players,
+            1,
+            vec![Op::Move {
+                id: ids[0],
+                transform: place(round as f32 + 10.0),
+            }],
+        );
+        settle(&net, &mut players);
+        assert_eq!(players[1].drifts, 0, "round {round}: the vehicle came back");
+        assert!(players[1].step_back(false), "round {round}: no undo step");
+        settle(&net, &mut players);
+    }
+    assert!(
+        players[0].editor.find(made).is_some(),
+        "the subhost keeps it"
+    );
+    assert!(players[1].editor.find(made).is_none());
+}
+
+/// The loop seen in a real session: the subhost's session counted bricks its editor didn't have, so
+/// each snapshot (of the editor) disagreed with each next commit's check, whose member asked for
+/// another snapshot, for ever, losing its selection and undo steps each time. One snapshot mends it.
+#[test]
+fn a_snapshot_settles_what_the_session_counted_wrong() {
+    let (net, mut players, ids) = session_of(22, 1, 3);
+    let mut rng = Rng(22);
+    let create = create_of(&mut players[1], &mut rng);
+    let Op::Create { ids: made, .. } = &create else {
+        unreachable!()
+    };
+    let made = made[0];
+    make_and_send(&net, &mut players, 1, create);
+    players[0].editor.apply(&Op::Delete { id: made });
+
+    // Nobody told the session; the member notices some other way and asks.
+    players[1].session.request_resync();
+    settle(&net, &mut players);
+    assert_eq!(players[1].drifts, 1);
+    assert!(players[1].editor.find(made).is_none());
+
+    for n in 0..5 {
+        make_and_send(
+            &net,
+            &mut players,
+            n % 2,
+            Op::Move {
+                id: ids[n % 3],
+                transform: place(n as f32),
+            },
+        );
+    }
+    assert_eq!(
+        players[1].drifts, 1,
+        "snapshots don't come after every edit"
+    );
+    same_vehicles(&players);
+}
+
+/// What only the subhost's editor has gets to the members with the next commit's check.
+#[test]
+fn bricks_only_the_subhost_has_reach_the_members() {
+    let (net, mut players, ids) = session_of(23, 1, 2);
+    let mut rng = Rng(23);
+    let extra = players[0].session.new_ids(1).unwrap()[0];
+    let archive = encode_bricks([new_brick(&mut rng)].iter());
+    players[0].editor.apply(&Op::Create {
+        ids: vec![extra],
+        archive,
+    });
+    let held = players[0].editor.ids();
+    assert_eq!(players[0].session.settle(&held), 0);
+    make_and_send(
+        &net,
+        &mut players,
+        0,
+        Op::Move {
+            id: ids[0],
+            transform: place(3.0),
+        },
+    );
+    assert_eq!(players[1].drifts, 1);
+    same_vehicles(&players);
+    assert!(players[1].editor.find(extra).is_some());
+}
+
+/// A member's edit the subhost can't read mustn't leave the member waiting for its commit for ever:
+/// it gets the subhost's vehicle, and audits reach it again.
+#[test]
+fn an_unreadable_proposal_gets_the_member_a_snapshot() {
+    let (mut host, request, id) = hosting_with(5);
+    host.send_snapshot(request, vec![id], vec![]).unwrap();
+    host.take_outgoing();
+    host.take_events();
+
+    // A proposal saying it holds more ops than may be read: its last bytes are the count.
+    let mut junk = Message::Propose {
+        local: 1,
+        ops: vec![],
+    }
+    .encode(1);
+    let count = junk.len() - 4;
+    junk[count..].copy_from_slice(&u32::MAX.to_le_bytes());
+    host.receive(5, &junk);
+    let events = host.take_events();
+    assert!(
+        events.iter().any(|e| matches!(e, Event::BadMessage { .. })),
+        "{events:?}"
+    );
+    assert!(
+        events.iter().any(|e| matches!(e, Event::SnapshotWanted(_))),
+        "{events:?}"
+    );
+}
+
+/// An edit past what can be sent is lost, and the member says so: the subhost's vehicle comes back.
+#[test]
+fn an_edit_past_the_cap_asks_for_the_vehicle_instead() {
+    let (net, mut players, ids) = session_of(24, 1, 1);
+    let far_too_many = vec![
+        Op::Move {
+            id: ids[0],
+            transform: place(1.0),
+        };
+        coop::ops::caps::OPS_PER_BATCH + 1
+    ];
+    assert_eq!(
+        players[1].session.edit(far_too_many),
+        Err(coop::SessionError::TooManyOps)
+    );
+    settle(&net, &mut players);
+    assert_eq!(players[1].drifts, 1);
+    same_vehicles(&players);
+}
+
 /// The subhost leaves its editor (to test the vehicle): members go on editing, the subhost's
 /// session commits their edits, and the mod keeps the edits it can't make yet. Back in the editor
 /// with the same vehicle, it makes them in order and everyone agrees again, with no snapshot.
@@ -1354,6 +1636,13 @@ fn place(x: f32) -> Transform {
 fn all_equal(players: &[Player]) {
     for player in &players[1..] {
         assert_eq!(player.drifts, 0, "{} drifted", player.peer);
+    }
+    same_vehicles(players);
+}
+
+/// Everyone has the subhost's vehicle (drifts on the way or not).
+fn same_vehicles(players: &[Player]) {
+    for player in &players[1..] {
         assert!(
             player.editor.state() == players[0].editor.state(),
             "{}: {}",

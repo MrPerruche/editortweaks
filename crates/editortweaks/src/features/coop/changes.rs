@@ -21,7 +21,7 @@
 //! [`step_back_asked`]).
 
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use ::coop::{CoopId, Groups, Op, Transform};
 use brickrust::ue::coreuobject::UObjectBase;
@@ -95,6 +95,8 @@ struct Changes {
     finished: Vec<Edit>,
     /// Undo (false) and redo (true) asked for by the player, not made yet.
     step_backs: Vec<bool>,
+    /// Bricks of the session's vehicle this game can't make (a mod's): they have no object here.
+    absent: HashSet<CoopId>,
     /// While coop applies a remote edit: what's created is recorded in `applied`, and nothing is
     /// an edit of ours.
     applying: bool,
@@ -189,7 +191,18 @@ pub fn forget_all() {
         changes.graves.clear();
         changes.finished.clear();
         changes.step_backs.clear();
+        changes.absent.clear();
     });
+}
+
+/// Remembers `ids` as bricks of the session this game can't make.
+pub fn mark_absent(ids: impl IntoIterator<Item = CoopId>) {
+    with(|changes| changes.absent.extend(ids));
+}
+
+/// The bricks of the session this game can't make.
+pub fn absent() -> HashSet<CoopId> {
+    with(|changes| changes.absent.clone())
 }
 
 pub fn id_of(object: Object) -> Option<CoopId> {
@@ -215,6 +228,7 @@ pub fn object(id: CoopId) -> Option<Object> {
 /// The object with coop id `id`, which forgets it (it's about to be deleted).
 pub fn take_object(id: CoopId) -> Option<Object> {
     with(|changes| {
+        changes.absent.remove(&id);
         let object = changes.objects.remove(&id)?;
         changes.ids.remove(&object);
         changes.places.remove(&id);

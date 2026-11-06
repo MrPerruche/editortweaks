@@ -9,10 +9,12 @@
 use std::time::{Duration, Instant};
 
 use ::coop::PeerId;
+use ::coop::match_watch::MatchWatch;
 use ::coop::transport::Transport;
 
 use super::log::coop_log;
 use crate::game::steam::{Friend, Steam};
+use crate::game::weak_object::WeakObject;
 
 /// Our channel of Steam's messages ("ET"). The game itself talks over SteamSockets, not messages.
 pub const CHANNEL: i32 = 0x4554;
@@ -28,7 +30,8 @@ const PROBLEM: i32 = 5;
 /// A session's peer whose connection ended.
 pub struct Closed {
     pub peer: PeerId,
-    /// It ended it on purpose (its game closed, say), rather than the connection failing.
+    /// It ended it on purpose (its game closed, say), or left the match we were both in, rather
+    /// than the connection failing.
     pub by_peer: bool,
 }
 
@@ -49,6 +52,9 @@ pub struct SteamTransport {
     lost_at: Instant,
     /// Peers reported lost, so they're reported once.
     lost: Vec<PeerId>,
+    /// Who of the session's peers is in our match, and which match that is.
+    match_watch: MatchWatch,
+    watched_match: Option<WeakObject>,
 }
 
 impl SteamTransport {
@@ -72,6 +78,8 @@ impl SteamTransport {
             own_id: steam.own_id(),
             lost_at: Instant::now(),
             lost: Vec::new(),
+            match_watch: MatchWatch::default(),
+            watched_match: None,
         })
     }
 
@@ -121,14 +129,28 @@ impl SteamTransport {
             .map(|(_, name)| name.clone())
     }
 
-    /// The session's peers whose connection Steam closed since the last call (checked every
-    /// second).
-    pub fn take_lost(&mut self) -> Vec<Closed> {
+    /// The session's peers that left our match, or whose connection Steam closed, since the last
+    /// call (checked every second). `read_match` gives the match now and its players, if any. A
+    /// player closing the game shows in the match at once, while Steam takes about 15 seconds to
+    /// give up on them.
+    pub fn take_lost(
+        &mut self,
+        read_match: impl FnOnce() -> Option<(WeakObject, Vec<PeerId>)>,
+    ) -> Vec<Closed> {
         if self.lost_at.elapsed() < LOST_EVERY {
             return Vec::new();
         }
         self.lost_at = Instant::now();
         let mut newly = Vec::new();
+        for peer in self.left_match(read_match) {
+            if !self.lost.contains(&peer) {
+                self.lost.push(peer);
+                newly.push(Closed {
+                    peer,
+                    by_peer: true,
+                });
+            }
+        }
         for &peer in &self.expected {
             let Some(state) = self.steam.peer_connection(peer).map(|c| c.state) else {
                 continue;
@@ -145,6 +167,26 @@ impl SteamTransport {
         newly
     }
 
+    /// The session's peers that were in our match and aren't any more. Only within one match with
+    /// us in it: a map changing empties the list for everyone, and the session ends with the match.
+    fn left_match(
+        &mut self,
+        read_match: impl FnOnce() -> Option<(WeakObject, Vec<PeerId>)>,
+    ) -> Vec<PeerId> {
+        let now = if self.expected.is_empty() {
+            None
+        } else {
+            read_match().filter(|(_, players)| players.contains(&self.own_id))
+        };
+        let current = now.as_ref().map(|(current, _)| *current);
+        if current != self.watched_match {
+            self.match_watch = MatchWatch::default();
+            self.watched_match = current;
+        }
+        let players = now.as_ref().map(|(_, players)| players.as_slice());
+        self.match_watch.gone(&self.expected, players)
+    }
+
     /// Logs how Steam reaches `peer`, to see in game that the traffic is relayed.
     pub fn log_connection(&self, peer: PeerId) {
         match self.steam.peer_connection(peer) {
@@ -156,6 +198,20 @@ impl SteamTransport {
                 connection.flags
             ),
             None => coop_log!("Steam has no connection to {peer}"),
+        }
+    }
+
+    /// Logs what is queued toward `peer` and how fast it goes, to see bulk data waiting.
+    pub fn log_queue(&self, peer: PeerId) {
+        match self.steam.peer_queue(peer) {
+            Some(queue) => coop_log!(
+                "Steam queue to {peer}: {} bytes pending, rate {} B/s, sent {:.0} B/s, ping {} ms",
+                queue.pending,
+                queue.send_rate,
+                queue.out_bytes_per_sec,
+                queue.ping
+            ),
+            None => coop_log!("Steam has no queue to {peer}"),
         }
     }
 
@@ -191,5 +247,9 @@ impl Transport for SteamTransport {
         let mut messages = self.steam.receive(CHANNEL);
         messages.retain(|(sender, _)| self.allowed(*sender));
         messages
+    }
+
+    fn backlog(&mut self, to: PeerId) -> Option<usize> {
+        self.steam.peer_queue(to).map(|queue| queue.pending)
     }
 }

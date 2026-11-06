@@ -19,7 +19,7 @@
 //! Peers are untrusted: what each may send is limited (`limits`), on a clock the mod gives
 //! ([`Session::tick`]).
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 
 use crate::audit::{Audit, Digest};
 use crate::framing::{self, Assembler};
@@ -28,6 +28,7 @@ use crate::limits::{Ban, Flood, Limits};
 use crate::message::{Member, Message, PeerId, PeerInfo, RefuseReason, caps};
 use crate::ops::{Op, Value};
 use crate::presence::View;
+use crate::references::{CHUNK, Chunk, Entry, Level};
 use crate::undo::{Change, History, StepBack};
 use crate::wire::DecodeError;
 
@@ -126,6 +127,25 @@ pub enum Event {
         peer: PeerId,
         what: Flood,
     },
+    /// Subhost: `peer` takes this level of references from now on (`None`: off).
+    ReferenceLevelAsked {
+        peer: PeerId,
+        level: Option<Level>,
+    },
+    /// Subhost: `peer` wants this reference's data, from its start.
+    ReferenceWanted {
+        peer: PeerId,
+        content: u64,
+    },
+    /// Member: the subhost's references, as it holds them for us (`references`).
+    ReferenceList(Vec<Entry>),
+    /// Member: a piece of a reference's data from the subhost. Nothing is checked yet:
+    /// `references::Receiving::data` only takes what it asked for.
+    ReferenceData {
+        content: u64,
+        offset: u32,
+        data: Vec<u8>,
+    },
     /// A peer sent something we couldn't read (logged by the mod, otherwise ignored).
     BadMessage {
         peer: PeerId,
@@ -153,6 +173,9 @@ pub enum SessionError {
     NotLoaded,
     /// More bricks than the archive can count, or the slot ran out of ids.
     TooManyBricks,
+    /// An edit too big to send ([`crate::ops::caps::OPS_PER_BATCH`]): it's lost, and a snapshot was
+    /// asked for.
+    TooManyOps,
 }
 
 #[derive(Debug, Clone)]
@@ -664,6 +687,11 @@ impl Session {
                 record(&mut host.history, 0);
                 Ok(())
             }
+            // The subhost couldn't read it: the edit is lost, and its vehicle comes back.
+            Role::Guest(guest) if guest.loaded && ops.len() > crate::ops::caps::OPS_PER_BATCH => {
+                self.request_resync();
+                Err(SessionError::TooManyOps)
+            }
             Role::Guest(guest) if guest.loaded => {
                 guest.next_local += 1;
                 let local = guest.next_local;
@@ -694,6 +722,9 @@ impl Session {
         ids: Vec<CoopId>,
         vehicle: Vec<u8>,
     ) -> Result<(), SessionError> {
+        // The member takes `ids` for the bricks there are: were the session to count others, the
+        // next commit's check would ask for another snapshot, and so on for ever.
+        self.settle(&ids);
         let Role::Host(host) = &mut self.role else {
             return Err(SessionError::NotSubhost);
         };
@@ -718,6 +749,31 @@ impl Session {
             },
         );
         Ok(())
+    }
+
+    /// Subhost: makes the session's bricks those of the editor, `ids`. An edit may have named bricks
+    /// the editor couldn't make (the game's loader skips what it can't load): those go for everyone,
+    /// as a commit of deletes, so members keep their selection and undo steps. Bricks only the
+    /// editor has are just counted in: the next commit's check gets members a snapshot with them.
+    /// How many went.
+    pub fn settle(&mut self, ids: &[CoopId]) -> usize {
+        let Role::Host(host) = &mut self.role else {
+            return 0;
+        };
+        let held: HashSet<CoopId> = ids.iter().copied().collect();
+        let mut gone: Vec<CoopId> = host.live.ids().filter(|id| !held.contains(id)).collect();
+        gone.sort_unstable();
+        for &id in ids {
+            if host.live.insert(id) {
+                host.retired.remove(&id);
+            }
+        }
+        let count = gone.len();
+        if count > 0 {
+            let deletes = gone.into_iter().map(|id| Op::Delete { id }).collect();
+            self.commit(SUBHOST_SLOT, 0, deletes);
+        }
+        count
     }
 
     /// Subhost: describes the editor to the members that have the vehicle (see `audit`): it has
@@ -801,6 +857,50 @@ impl Session {
         }
     }
 
+    /// Member: tells the subhost how much of its references we take (`None`: none). Also right
+    /// after joining.
+    pub fn reference_level(&mut self, level: Option<Level>) {
+        if let Role::Guest(guest) = &self.role {
+            let host = guest.host;
+            let level = Level::to_wire(level);
+            self.out.send(host, &Message::ReferenceLevel { level });
+        }
+    }
+
+    /// Member: asks the subhost for a reference's data, from its start.
+    pub fn want_reference(&mut self, content: u64) {
+        if let Role::Guest(guest) = &self.role {
+            let host = guest.host;
+            self.out.send(host, &Message::ReferenceWant { content });
+        }
+    }
+
+    /// Subhost: gives `peer`, a member, the references it holds for it.
+    pub fn send_reference_list(&mut self, peer: PeerId, entries: Vec<Entry>) {
+        if self.has_member(peer) {
+            self.out.send(peer, &Message::ReferenceList { entries });
+        }
+    }
+
+    /// Subhost: gives a member a piece of a reference's data.
+    pub fn send_reference_data(&mut self, chunk: Chunk) {
+        if chunk.data.len() <= CHUNK && self.has_member(chunk.peer) {
+            self.out.send(
+                chunk.peer,
+                &Message::ReferenceData {
+                    content: chunk.content,
+                    offset: chunk.offset,
+                    data: chunk.data,
+                },
+            );
+        }
+    }
+
+    /// Whether we're the subhost and `peer` is in the session.
+    fn has_member(&self, peer: PeerId) -> bool {
+        matches!(&self.role, Role::Host(host) if host.members.iter().any(|m| m.member.peer == peer))
+    }
+
     /// What the local player has selected, for others to see.
     pub fn select(&mut self, mut ids: Vec<CoopId>) {
         ids.truncate(crate::message::caps::SELECTION);
@@ -850,7 +950,32 @@ impl Session {
             Ok(None) => {}
             // Not ours at all: some other mod's traffic on the channel. Dropped quietly.
             Err(DecodeError::NotOurs) => {}
-            Err(error) => self.events.push(Event::BadMessage { peer, error }),
+            Err(error) => {
+                self.events.push(Event::BadMessage { peer, error });
+                self.unreadable(peer);
+            }
+        }
+    }
+
+    /// Something from `peer` couldn't be read. If it was an edit, its author thinks it's on its way
+    /// and the others never get it, so the two drift apart: what the subhost has mends it. A member
+    /// waiting for its own unread edit's commit would otherwise never be settled (see
+    /// [`Guest::settled_at`]) and so never audited. Snapshots stay within their allowance.
+    fn unreadable(&mut self, peer: PeerId) {
+        match &mut self.role {
+            Role::Host(host) => {
+                let commit = host.commit;
+                let request = host
+                    .members
+                    .iter_mut()
+                    .find(|m| m.member.peer == peer)
+                    .and_then(|m| m.wait(commit));
+                if let Some(request) = request {
+                    self.want_snapshot(request);
+                }
+            }
+            Role::Guest(guest) if guest.host == peer => self.request_resync(),
+            _ => {}
         }
     }
 
@@ -1089,6 +1214,14 @@ impl Session {
                 others.into_iter().for_each(|p| self.out.send(p, &message));
                 self.events.push(Event::Camera { slot, view });
             }
+            Message::ReferenceLevel { level } => {
+                if let Some(level) = Level::from_wire(level) {
+                    self.events.push(Event::ReferenceLevelAsked { peer, level });
+                }
+            }
+            Message::ReferenceWant { content } => {
+                self.events.push(Event::ReferenceWanted { peer, content });
+            }
             Message::Leave => {
                 host.members.retain(|m| m.member.peer != peer);
                 self.assembler.forget(peer);
@@ -1266,6 +1399,16 @@ impl Session {
             }
             Message::Selection { slot, ids } => self.events.push(Event::Selection { slot, ids }),
             Message::Camera { slot, view } => self.events.push(Event::Camera { slot, view }),
+            Message::ReferenceList { entries } => self.events.push(Event::ReferenceList(entries)),
+            Message::ReferenceData {
+                content,
+                offset,
+                data,
+            } => self.events.push(Event::ReferenceData {
+                content,
+                offset,
+                data,
+            }),
             Message::Kick | Message::Close => {
                 let reason = if matches!(message, Message::Kick) {
                     EndReason::Kicked

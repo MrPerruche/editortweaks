@@ -104,6 +104,30 @@ const _: () = assert!(core::mem::offset_of!(ConnectionInfo, pop_relay) == 172);
 const _: () = assert!(core::mem::offset_of!(ConnectionInfo, state) == 176);
 const _: () = assert!(core::mem::offset_of!(ConnectionInfo, flags) == 440);
 
+/// `SteamNetConnectionRealTimeStatus_t` (120 bytes, Valve's `steamnetworkingtypes.h`): the live
+/// numbers of a connection. Only the ping, the rates and the pending bytes are read.
+#[repr(C)]
+struct RealTimeStatus {
+    _state: i32,
+    ping: i32,
+    _connection_quality_local: f32,
+    _connection_quality_remote: f32,
+    _out_packets_per_sec: f32,
+    out_bytes_per_sec: f32,
+    _in_packets_per_sec: f32,
+    _in_bytes_per_sec: f32,
+    send_rate_bytes_per_second: i32,
+    pending_unreliable: i32,
+    pending_reliable: i32,
+    sent_unacked_reliable: i32,
+    _queue_time_usec: i64,
+    _reserved: [u32; 16],
+}
+
+const _: () = assert!(size_of::<RealTimeStatus>() == 120);
+const _: () = assert!(core::mem::offset_of!(RealTimeStatus, pending_reliable) == 40);
+const _: () = assert!(core::mem::offset_of!(RealTimeStatus, _queue_time_usec) == 48);
+
 /// What Steam says about the connection it keeps with one peer.
 #[derive(Clone, Debug)]
 pub struct PeerConnection {
@@ -117,6 +141,39 @@ pub struct PeerConnection {
     pub flags: i32,
     /// The relay's location code (like `fra`), `None` if not applicable.
     pub relay_pop: Option<String>,
+}
+
+/// How much is waiting to go to one peer, and how fast it goes (see `Steam::peer_queue`).
+#[derive(Clone, Copy, Debug)]
+pub struct PeerQueue {
+    /// Bytes Steam holds for the peer: not yet sent, or sent but not yet acknowledged.
+    pub pending: usize,
+    /// The send rate Steam allows, in bytes per second.
+    pub send_rate: i32,
+    /// The bytes per second actually sent lately.
+    pub out_bytes_per_sec: f32,
+    /// Round-trip time in milliseconds.
+    pub ping: i32,
+}
+
+impl PeerQueue {
+    fn from_status(status: &RealTimeStatus) -> Self {
+        // Steam reports byte counts that can't be negative; a negative one counts as none.
+        let pending = [
+            status.pending_unreliable,
+            status.pending_reliable,
+            status.sent_unacked_reliable,
+        ]
+        .into_iter()
+        .map(|bytes| usize::try_from(bytes).unwrap_or(0))
+        .sum();
+        Self {
+            pending,
+            send_rate: status.send_rate_bytes_per_second,
+            out_bytes_per_sec: status.out_bytes_per_sec,
+            ping: status.ping,
+        }
+    }
 }
 
 impl PeerConnection {
@@ -212,7 +269,7 @@ struct Api {
         messages: Interface,
         peer: *const Identity,
         info: *mut ConnectionInfo,
-        quick_status: *mut c_void,
+        quick_status: *mut RealTimeStatus,
     ) -> i32,
 }
 
@@ -428,6 +485,24 @@ impl Steam {
         };
         // `k_ESteamNetworkingConnectionState_None`: no such session.
         (state != 0).then(|| PeerConnection::from_info(&info))
+    }
+
+    /// How much is queued toward `peer` and how fast it goes (`None` if it has no session with
+    /// them). Never exposes the peer's address.
+    pub fn peer_queue(self, peer: u64) -> Option<PeerQueue> {
+        let peer = Identity::steam_id(peer);
+        // SAFETY: every field of `ConnectionInfo` is an integer or an array of them, so all-zero
+        // bytes are a valid value.
+        let mut info: ConnectionInfo = unsafe { core::mem::zeroed() };
+        // SAFETY: every field of `RealTimeStatus` is a number or an array of them, so all-zero
+        // bytes are a valid value.
+        let mut status: RealTimeStatus = unsafe { core::mem::zeroed() };
+        // SAFETY: a valid identity, and `info` and `status` are the 696 and 120 bytes Steam fills
+        // in. `info` is passed as `peer_connection` passes it, zeroed.
+        let state =
+            unsafe { (self.0.connection_info)(self.0.messages, &peer, &mut info, &mut status) };
+        // `k_ESteamNetworkingConnectionState_None`: no such session.
+        (state != 0).then(|| PeerQueue::from_status(&status))
     }
 
     /// Sends `bytes` (at most 512 KiB) to `to` on `channel`. Steam copies the data. `false` if

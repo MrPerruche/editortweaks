@@ -7,8 +7,11 @@
 //!   vehicle's space, with the garage's spawn box and the vehicle's bounding box: the game puts
 //!   the bounding box's centre on the spawn point (see [`placement`]).
 //! - The map also shows around the vehicle, as it will be once the vehicle is spawned at the
-//!   selected garage. [`keybinds::SHOW_MAP`] goes to no garage and back to the last one (if none,
-//!   the one the editor was opened from, else the first). The editor actor is teleported to where
+//!   selected garage, or from the vehicle browser at the player's current location: on the ground
+//!   under the vehicle they drive or their character, tilted like the ground, where the game finds
+//!   room for it ([`placement::fit_on_ground`], as of when chosen; only a preview, nothing spawns).
+//!   [`keybinds::SHOW_MAP`] goes to nothing and back to the last choice (if none, the garage the
+//!   editor was opened from, else the first). The editor actor is teleported to where
 //!   the vehicle will land, and the game's hiding of the map is skipped
 //!   (`game::hidden_components`); characters and vehicles stay hidden from this player's view only
 //!   (`game::hidden_actors`). The editor goes back where it was when the map is hidden, and when
@@ -39,7 +42,7 @@ use brickrust::ue::coreuobject::{EObjectFlags, GObjects, UObjectBase};
 use brickrust::ue::uclass::UStruct;
 
 use self::isolation::{Isolated, Isolation};
-use self::placement::{GaragePlace, Landing, Pose, VehicleBox};
+use self::placement::{BoxHit, GaragePlace, Landing, Pose, VehicleBox};
 use super::editor_frame;
 use super::keybinds;
 use crate::framework::{hook, timings};
@@ -56,7 +59,9 @@ use crate::game::hidden_actors::{self, HiddenActors};
 use crate::game::hidden_components;
 use crate::game::line_batcher::{self, Line, LineBatcher};
 use crate::game::net_mode::{self, NetMode, Role};
+use crate::game::player_place::{self, PlayerPlace, PlayerPlaces};
 use crate::game::reflection::{self, BoolField, Getter, NativeThunk, SingleCall};
+use crate::game::spawn_trace::{self, SpawnTrace};
 use crate::game::vehicle_box;
 use crate::game::weak_object::WeakObject;
 use crate::game::world;
@@ -97,6 +102,10 @@ struct Game {
     bounds: LocalBounds,
     actors: Actors,
     garages: Garages,
+    /// Where the player is, for "Current location"; without it, only garages are offered.
+    player_places: Option<PlayerPlaces>,
+    /// The game's queries for placing a vehicle there; without them, it's placed right there.
+    spawn_trace: Option<SpawnTrace>,
     lines: LineBatcher,
     net: NetMode,
     /// `AActor::bReplicates`: a replicated editor would move for other players too.
@@ -182,6 +191,11 @@ fn engine_init() -> Result<(), String> {
         bounds: LocalBounds::find()?,
         actors: actor::find()?,
         garages: garage::find()?,
+        player_places: optional(player_place::find(), "no current location in the Map rows"),
+        spawn_trace: optional(
+            spawn_trace::find(),
+            "the current location doesn't look for room as the game does",
+        ),
         lines: line_batcher::find()?,
         net: net_mode::find()?,
         replicates: reflection::bool_field(class("Actor")?.cast(), "bReplicates")?,
@@ -496,12 +510,15 @@ unsafe fn tick(game: &Game, state: &mut State, editor: *mut UObjectBase) -> bool
         controls.show_map = false;
         force = true;
     }
-    // The map key goes to no garage, or back to the last one.
+    // The map key goes to nothing, or back to the last choice.
     if pressed {
         force = true;
-        if garage.is_some() {
+        if garage.is_some() || controls.here {
             controls.hide();
             garage = None;
+        } else if controls.last_here {
+            controls.here = true;
+            controls.show_map = true;
         } else {
             // SAFETY: per the contract.
             garage = unsafe { select_last_garage(game, editor, &mut controls) };
@@ -512,8 +529,8 @@ unsafe fn tick(game: &Game, state: &mut State, editor: *mut UObjectBase) -> bool
         force = true;
     }
 
-    // Does the map show? Only with a garage, and what keeps the editor and the world apart.
-    let mut want_map = controls.show_map && garage.is_some();
+    // Does the map show? Only with a place for it, and what keeps the editor and the world apart.
+    let mut want_map = controls.show_map && (garage.is_some() || controls.here);
     if want_map && (force || !state.shown) {
         // SAFETY: per the contract.
         match unsafe { may_show(game, editor) } {
@@ -527,11 +544,11 @@ unsafe fn tick(game: &Game, state: &mut State, editor: *mut UObjectBase) -> bool
     }
 
     // The box is worked out again when it may have changed, but not while bricks are being moved
-    // (the move only counts once it ends) and only if a garage shows where it lands.
+    // (the move only counts once it ends) and only if a place shows where it lands.
     // SAFETY: per the contract.
     let moving = unsafe { game.modes.moving(editor) }.is_some();
     let mut new_box = false;
-    if garage.is_some()
+    if (garage.is_some() || controls.here)
         && (state.vehicle_box.is_none() || (!moving && BOX_DIRTY.load(Ordering::Relaxed)))
     {
         BOX_DIRTY.store(false, Ordering::Relaxed);
@@ -539,11 +556,19 @@ unsafe fn tick(game: &Game, state: &mut State, editor: *mut UObjectBase) -> bool
         state.vehicle_box = unsafe { refresh_box(game, editor) };
         new_box = true;
     }
-    if let Some(garage) = garage
-        && (force || new_box)
-    {
-        // SAFETY: per the contract.
-        unsafe { work_out_landing(game, state, &garage, force) };
+    if force || new_box {
+        if let Some(garage) = garage {
+            // SAFETY: per the contract.
+            unsafe { work_out_landing(game, state, &garage, force) };
+        } else if controls.here {
+            // SAFETY: per the contract.
+            if !unsafe { work_out_standing(game, state, editor) } {
+                log!("the map isn't shown: the player has no vehicle or character to find");
+                controls.hide();
+                controls.last_here = false;
+                want_map = false;
+            }
+        }
     }
 
     let mut show = want_map && state.landing.is_some();
@@ -562,11 +587,11 @@ unsafe fn tick(game: &Game, state: &mut State, editor: *mut UObjectBase) -> bool
         place_editor(game, state, editor, controller, show);
         let hide = state.shown;
         hide_others(game, state, editor, controller, hide);
-        draw(game, state, editor, garage.as_ref());
+        draw(game, state, editor, garage.as_ref(), controls.here);
     }
 
     *panel::controls() = controls;
-    (controls.garage, controls.pinned) != (asked.garage, asked.pinned)
+    (controls.garage, controls.pinned, controls.here) != (asked.garage, asked.pinned, asked.here)
 }
 
 /// The garage `editor` was opened from (its actor), if it was one.
@@ -790,6 +815,117 @@ unsafe fn work_out_landing(game: &Game, state: &mut State, garage: &Garage, log_
         );
     }
     state.landing = Some((vehicle, landing));
+}
+
+/// Where the vehicle stands at the player's current location, from the box worked out last. Whether
+/// the player could be found.
+///
+/// # Safety
+/// `editor` must be the live editor. Game thread only.
+unsafe fn work_out_standing(game: &Game, state: &mut State, editor: *mut UObjectBase) -> bool {
+    let Some(places) = &game.player_places else {
+        return false;
+    };
+    // SAFETY: per the contract; the controller is the live player's, or null.
+    let place = unsafe {
+        let controller = game.editor.player_controller(editor);
+        if controller.is_null() {
+            None
+        } else {
+            places.of(controller)
+        }
+    };
+    let Some(place) = place else {
+        state.landing = None;
+        return false;
+    };
+    state.landing = state.vehicle_box.map(|vehicle| {
+        // SAFETY: per the contract; the place's actors are the live player's, or null (left out).
+        (vehicle, unsafe {
+            spawned_at(game, editor, &place, &vehicle)
+        })
+    });
+    true
+}
+
+/// Where the game puts a vehicle spawned at `place` (`docs/re/map-in-editor.md`, "Current
+/// location"): on the ground under it, tilted like the ground, then where it finds room. If the
+/// queries weren't found, on the place itself, with no search for room.
+///
+/// # Safety
+/// `editor` must be the live editor, and the place's actors live or null. Game thread only.
+unsafe fn spawned_at(
+    game: &Game,
+    editor: *mut UObjectBase,
+    place: &PlayerPlace,
+    vehicle: &VehicleBox,
+) -> Landing {
+    let forward = Quat::from_rotator(math::widen(place.rotation)).rotate([1.0, 0.0, 0.0]);
+    let Some(traces) = &game.spawn_trace else {
+        let rotation = placement::on_surface([0.0, 0.0, 1.0], forward);
+        return placement::fit_on_ground(
+            math::widen(place.location),
+            rotation,
+            vehicle,
+            |_, _| false,
+            |_, _, _| None,
+        );
+    };
+    let live = |actor: *mut UObjectBase| (!actor.is_null()).then_some(actor);
+    let under: Vec<_> = [place.character, place.vehicle]
+        .into_iter()
+        .filter_map(live)
+        .collect();
+    // The player's current vehicle is replaced by the new one before the game looks for room.
+    let replaced: Vec<_> = live(place.vehicle).into_iter().collect();
+    // SAFETY: per the contract; the editor is left out of every query, the place's actors are live.
+    unsafe {
+        let ground = traces.ground(editor, &under, place.location);
+        let (point, normal) = match &ground {
+            Some(hit) => (
+                math::widen(hit.impact_point),
+                math::widen(hit.impact_normal),
+            ),
+            None => (math::widen(place.location), [0.0, 0.0, 1.0]),
+        };
+        let rotation = placement::on_surface(normal, forward);
+        let turned = math::narrow(rotation.to_rotator());
+        placement::fit_on_ground(
+            point,
+            rotation,
+            vehicle,
+            |center, half| {
+                let center = math::narrow(center);
+                traces
+                    .sweep_box(
+                        editor,
+                        &replaced,
+                        center,
+                        center,
+                        math::narrow(half),
+                        turned,
+                        true,
+                    )
+                    .is_some()
+            },
+            |from, to, half| {
+                traces
+                    .sweep_box(
+                        editor,
+                        &replaced,
+                        math::narrow(from),
+                        math::narrow(to),
+                        math::narrow(half),
+                        turned,
+                        false,
+                    )
+                    .map(|hit| BoxHit {
+                        location: math::widen(hit.location),
+                        started_inside: hit.start_penetrating,
+                    })
+            },
+        )
+    }
 }
 
 /// The smallest box around every editor object's bounds, in the vehicle's space, as the game's
@@ -1020,15 +1156,22 @@ unsafe fn show_hidden(game: &Game, state: &mut State) {
 }
 
 /// Draws the selected `garage`'s spawn point (a cross), its spawn box and the vehicle's box, in the
-/// vehicle's space where the editor is now; clears them if none is selected.
+/// vehicle's space where the editor is now; at the player's current location (`here`), the cross
+/// and the vehicle's box; clears them if nothing is selected.
 ///
 /// # Safety
 /// `editor` must be the live editor. Game thread only.
-unsafe fn draw(game: &Game, state: &mut State, editor: *mut UObjectBase, garage: Option<&Garage>) {
+unsafe fn draw(
+    game: &Game,
+    state: &mut State,
+    editor: *mut UObjectBase,
+    garage: Option<&Garage>,
+    here: bool,
+) {
     // SAFETY: per the contract.
     unsafe {
         let batcher = game.lines.batcher();
-        let landing = state.landing.filter(|_| garage.is_some());
+        let landing = state.landing.filter(|_| garage.is_some() || here);
         let (Some((vehicle, landing)), false) = (landing, batcher.is_null()) else {
             clear_lines(game, state);
             return;

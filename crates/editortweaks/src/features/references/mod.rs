@@ -18,17 +18,24 @@
 //! (see [`vehicle`]), and the vehicle is that folder's from then on: its references are written
 //! there with each autosave, marked with it ([`write_autosave`], [`follow_autosave`]). Recovering
 //! the autosave shows them; once another vehicle is autosaved there they're stale and not shown.
+//! The editor's undo and redo go through changes of the references too, in order with its own steps
+//! ([`undo`]).
 //!
 //! The "Reference fit" view mode (`view_modes`) measures bricks against the model references
 //! ([`fit_key`], [`fit_triangles`]), and makes its material with [`looks`].
+//!
+//! In a coop session a member shows the session's references instead of the sidecar's, read-only, and
+//! keeps them with the vehicle when it's saved ([`received`]).
 
 mod edit;
 mod files;
 mod loading;
 pub(crate) mod looks;
 mod panel;
+pub mod received;
 mod scene;
 mod select;
+mod undo;
 mod vehicle;
 
 use std::collections::HashSet;
@@ -39,7 +46,8 @@ use std::time::{Duration, Instant, SystemTime};
 
 use brickrust::ue::coreuobject::UObjectBase;
 use model_io::fit::Surface;
-use model_io::sidecar::{Kind, Sidecar, SourceMode};
+use model_io::history::History;
+use model_io::sidecar::{Kind, Reference, Sidecar, SourceMode};
 
 use self::loading::Loaded;
 use self::looks::Looks;
@@ -55,6 +63,7 @@ use crate::game::mesh_component::MeshComponents;
 use crate::game::outline::{self, Outlines};
 use crate::game::reflection::{self, Getter};
 use crate::game::textures::Textures;
+use crate::game::undo_redo;
 use crate::game::vehicle_box::VehicleBoxes;
 use crate::game::weak_object::WeakObject;
 use crate::math;
@@ -146,12 +155,28 @@ struct State {
     key_held: bool,
     /// Changes not written to the sidecar yet: since when.
     unwritten: Option<Instant>,
+    /// The changes that can be undone ([`undo`]), of the list of references.
+    history: History<Vec<Reference>>,
+    /// The references as of the last step in [`Self::history`], which the next one starts from.
+    baseline: Vec<Reference>,
+    /// Changes not in the history yet: where the game's history was at the first one.
+    edited_at: Option<i64>,
+    /// The game's steps taken at the last undo or redo asked: more now end the redos.
+    seen_steps: u64,
     /// An open file dialog, the kind of reference it adds and whether it links or copies the file.
     browsing: Option<(Kind, SourceMode, Receiver<Option<PathBuf>>)>,
     /// The panel lists different rows now: have it list them again.
     refresh_panel: bool,
     /// The editor's side panel, once found.
     panel: Option<WeakObject>,
+    /// Showing the session's references ([`received`]), not the sidecar's. An unsaved vehicle's own
+    /// are kept here meanwhile.
+    received: Option<Sidecar>,
+    /// What the panel last said about them.
+    received_status: String,
+    /// The folder's vehicle file when last looked at while showing the session's references: it
+    /// changing means the game saved over it.
+    saved_stamp: Option<(PathBuf, Option<Stamp>)>,
 }
 
 // SAFETY: weak pointers and the scene, only used on the game thread.
@@ -183,9 +208,16 @@ impl State {
             shown: true,
             key_held: false,
             unwritten: None,
+            history: History::new(),
+            baseline: Vec::new(),
+            edited_at: None,
+            seen_steps: 0,
             browsing: None,
             refresh_panel: false,
             panel: None,
+            received: None,
+            received_status: String::new(),
+            saved_stamp: None,
         }
     }
 
@@ -250,14 +282,38 @@ impl State {
     }
 
     /// After a change: has the references shown at the next tick, and written to the sidecar once
-    /// nothing changed for [`WRITE_DELAY`] (an unsaved vehicle's stay in memory).
+    /// nothing changed for [`WRITE_DELAY`] (an unsaved vehicle's stay in memory), which also makes
+    /// the changes until then one step to undo.
     fn save(&mut self) {
         self.last_poll = None;
         self.unwritten = Some(Instant::now());
+        self.edited_at.get_or_insert_with(undo_redo::position);
+    }
+
+    /// Makes the changes so far a step to undo, if any.
+    fn commit(&mut self) {
+        let Some(at) = self.edited_at.take() else {
+            return;
+        };
+        if self.sidecar.references != self.baseline {
+            let after = self.sidecar.references.clone();
+            let before = core::mem::replace(&mut self.baseline, after.clone());
+            self.history.record(before, after, at);
+        }
+    }
+
+    /// Forgets the steps to undo if the references aren't what the last one left, with no change
+    /// under way: another vehicle's, or changed on disk.
+    fn forget_outside_changes(&mut self) {
+        if self.edited_at.is_none() && self.sidecar.references != self.baseline {
+            self.history.clear();
+            self.baseline.clone_from(&self.sidecar.references);
+        }
     }
 
     /// Writes changes not written yet, now.
     fn flush(&mut self) {
+        self.commit();
         if self.unwritten.take().is_some() {
             self.write();
         }
@@ -265,6 +321,7 @@ impl State {
 
     /// Writes the references to the sidecar (an unsaved vehicle's stay in memory).
     fn write(&mut self) {
+        self.commit();
         let Some(folder) = self.folder.clone() else {
             return;
         };
@@ -278,8 +335,10 @@ impl State {
         for problem in edit::make_missing_copies(&mut self.sidecar, &folder) {
             log!("{problem}");
         }
+        // Copies made aren't changes of the player's.
+        self.baseline.clone_from(&self.sidecar.references);
         self.sidecar.vehicle = vehicle::mark_for(&folder);
-        match self.sidecar.write(&folder) {
+        match received::seal(&self.sidecar).write(&folder) {
             Ok(()) => {
                 self.sidecar_stamp = Some(vehicle::stamp(&vehicle::sidecar_path(&folder)));
             }
@@ -345,6 +404,9 @@ impl Feature for References {
     }
 
     fn on_load(&self) -> LoadResult {
+        if let Err(reason) = undo::listen() {
+            log!("references can't be undone: {reason}");
+        }
         brick_editor::after_tick(after_tick)
     }
 
@@ -388,6 +450,8 @@ fn find() -> Result<Code, String> {
 
 fn after_tick(editor: *mut UObjectBase, _delta: f32) {
     let Some(code) = CODE.get() else { return };
+    // SAFETY: the live editor, ticking.
+    unsafe { undo::watch_steps(code, editor) };
     let mut guard = STATE.lock().unwrap_or_else(PoisonError::into_inner);
     let state = &mut *guard;
 
@@ -475,7 +539,10 @@ unsafe fn tick(
         state.scene.loaded(loaded);
     }
     // SAFETY: the live editor, on the game thread.
-    unsafe { state.scene.pump(code, looks, editor) };
+    if unsafe { state.scene.pump(code, looks, editor) } {
+        // The Size row shows the model's size from now on.
+        state.refresh_panel = true;
+    }
 
     if state
         .unwritten
@@ -485,17 +552,17 @@ unsafe fn tick(
     }
 
     // The selection: references go with their removal or hiding, all of them when bricks got
-    // selected.
+    // selected or the editor is doing something else: the panel doesn't show them then, so their
+    // outline would say they're selected while nothing else does.
     if !state.selected.is_empty() {
         // SAFETY: the live editor, on the game thread.
-        let bricks = code
+        let keep = code
             .input
             .as_ref()
-            .is_some_and(|input| unsafe { select::bricks_selected(input, editor) });
+            .is_none_or(|input| unsafe { select::keeps_references(input, editor) });
         let mut kept = state.selected.clone();
         kept.retain(|id| {
-            !bricks
-                && !state.hides(id)
+            keep && !state.hides(id)
                 && state
                     .sidecar
                     .references
@@ -603,15 +670,19 @@ unsafe fn poll(code: &Code, editor: *mut UObjectBase, state: &mut State) -> Vec<
         if !first_autosave {
             state.selected.clear();
             state.hidden.clear();
+            state.history.clear();
         }
         state.refresh_panel = true;
     } else if open_autosaved {
         follow_autosave(state);
     }
 
-    if let Some(folder) = state.folder.clone() {
+    if !show_session_references(state)
+        && let Some(folder) = state.folder.clone()
+    {
         read_sidecar(state, &folder);
     }
+    state.forget_outside_changes();
     state.last_seen = Some(Seen {
         folder: state.folder.clone(),
         sidecar: state.sidecar.clone(),
@@ -629,6 +700,54 @@ unsafe fn poll(code: &Code, editor: *mut UObjectBase, state: &mut State) -> Vec<
             shown: state.shown,
         })
         .collect()
+}
+
+/// A member's session references in place of the sidecar's ([`received`]), and the sidecar's back
+/// after them. Whether they're shown. The game saving over the open folder's vehicle writes them
+/// there, as the vehicle itself was replaced. Its autosave into that folder doesn't: that sidecar
+/// goes with the player's own `Vehicle.brv`.
+fn show_session_references(state: &mut State) -> bool {
+    let Some(list) = received::list() else {
+        if let Some(own) = state.received.take() {
+            log!("back to the vehicle's own references");
+            state.sidecar = own;
+            state.sidecar_stamp = None;
+            state.saved_stamp = None;
+            state.received_status.clear();
+            state.selected.clear();
+            state.refresh_panel = true;
+        }
+        return false;
+    };
+    if state.received.is_none() {
+        log!("showing the session's references");
+        state.commit();
+        state.received = Some(core::mem::take(&mut state.sidecar));
+        state.selected.clear();
+        state.refresh_panel = true;
+    }
+    state.unwritten = None;
+    state.sidecar.references = list;
+    let status = received::status();
+    if state.received_status != status {
+        state.received_status = status;
+        state.refresh_panel = true;
+    }
+    // Forgotten: the sidecar there is read afresh when the session's references go.
+    state.sidecar_stamp = None;
+    if let Some(folder) = state.folder.clone() {
+        let stamp = vehicle::stamp(&folder.join(vehicle::VEHICLE_FILE));
+        let saved =
+            matches!(&state.saved_stamp, Some((known, seen)) if *known == folder && *seen != stamp);
+        state.saved_stamp = Some((folder, stamp));
+        if saved {
+            log!("the vehicle was saved: the session's references go with it");
+            state.write();
+        }
+    } else {
+        state.saved_stamp = None;
+    }
+    true
 }
 
 /// Reads the sidecar in `folder` again if it changed on disk.
@@ -706,7 +825,7 @@ fn carry_over(seen: &Seen, to: &Path) {
             log!("{problem}");
         }
         sidecar.vehicle = vehicle::mark_for(to);
-        sidecar.write(to)
+        received::seal(&sidecar).write(to)
     });
     let from = seen
         .folder
@@ -761,10 +880,17 @@ fn write_autosave(sidecar: &Sidecar, folder: &Path) {
         log!("autosaved: references not written along: {reason}");
         return;
     }
-    let sidecar = Sidecar {
+    let mut sidecar = Sidecar {
         vehicle: vehicle::mark_for(folder),
         ..sidecar.clone()
     };
+    if received::active() {
+        // Their files don't last: the session's references are copied at once.
+        for problem in edit::make_missing_copies(&mut sidecar, folder) {
+            log!("{problem}");
+        }
+        sidecar = received::seal(&sidecar);
+    }
     if sidecar.vehicle.is_none() {
         log!("autosaved: references not written along: the autosave can't be read");
         return;

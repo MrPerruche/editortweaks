@@ -148,6 +148,11 @@ impl LiveSet {
         self.ids.contains(&id)
     }
 
+    /// Every brick, in no particular order.
+    pub fn ids(&self) -> impl Iterator<Item = CoopId> + '_ {
+        self.ids.iter().copied()
+    }
+
     pub fn len(&self) -> usize {
         self.ids.len()
     }

@@ -22,6 +22,10 @@
 //!   steps (32-bit, linear) are that depth times 2^-24, so a narrower view tells apart faces nearer
 //!   together. The sky, a sphere around the view hundreds of km wide, shrinks to fit inside while
 //!   the view is orthographic: no depth could reach it and still tell apart nearby bricks' faces.
+//! - Temporal AA's jitter stops while the view is orthographic: it moves a perspective view by less
+//!   than a pixel, but an orthographic one by its depth in cm times that, so with the game's TAA
+//!   setting the view would seem to jump around every frame (`docs/re/editor-camera.md`,
+//!   "Temporal AA"). Edges aren't smoothed by TAA meanwhile.
 //! - The game's zoom notification says which view it is: "Perspective" and the zoom (0 to 100), or
 //!   "Orthographic" and the view's width, at each zoom step and each switch (`Label`).
 //! - Leaving the editor switches back to perspective at once: the game's view of the vehicle or
@@ -58,6 +62,7 @@ use super::keybinds;
 use super::mouse_moves::{self, Handling, Movement};
 use crate::framework::{hook, timings};
 use crate::game::camera_manager::{self, ApplyCameraModifiersFn, ViewInfo, ViewTargets};
+use crate::game::console_variable::{self, ConsoleCommands, ConsoleVariables};
 use crate::game::editor_camera::{self, EditorCamera, EditorCode};
 use crate::game::editor_input::{self, CameraFlags, ZoomSteps};
 use crate::game::editor_object::Vector;
@@ -96,6 +101,9 @@ const ASPECT: f32 = 9.0 / 16.0;
 const PIXELS_ACROSS: f32 = 1920.0;
 /// How fast the orthographic zoom glides if the game's speed isn't found (see `blend::glide`).
 const GLIDE_SPEED: f32 = 10.0;
+/// How many places temporal AA's jitter goes through: 0 stops it. Nothing but the renderer uses it,
+/// so setting it from the console keeps the game's options working.
+const TEMPORAL_SAMPLES: &str = "r.TemporalAASamples";
 
 const _: () = assert!(WIDTHS[0] > 0.0 && WIDTHS[1] >= WIDTHS[0] && FAR > SKY_SHARE * FAR);
 
@@ -123,6 +131,7 @@ static STATE: Mutex<State> = Mutex::new(State {
     tooltip: None,
     pan: [0.0; 2],
     pan_depth: None,
+    temporal_samples: None,
 });
 
 struct Parts {
@@ -141,6 +150,14 @@ struct Parts {
     zoom: Option<ZoomSteps>,
     /// The game's zoom notification; without it, it stays as it is.
     tooltip: Option<ZoomNotification>,
+    /// Temporal AA's jitter; without it, it stays on.
+    jitter: Option<Jitter>,
+}
+
+/// What stops temporal AA's jitter.
+struct Jitter {
+    variables: ConsoleVariables,
+    commands: ConsoleCommands,
 }
 
 #[derive(Clone, Copy)]
@@ -188,6 +205,8 @@ struct State {
     pan: [f32; 2],
     /// While panning the perspective view: how deep what follows the mouse is (cm).
     pan_depth: Option<f32>,
+    /// While temporal AA's jitter is stopped: [`TEMPORAL_SAMPLES`] before (0: already stopped).
+    temporal_samples: Option<i32>,
 }
 
 #[derive(Clone, Copy)]
@@ -270,6 +289,15 @@ fn engine_init() -> Result<(), String> {
         sky: optional(world_sky::find(), "the sky stays as it is"),
         zoom: optional(editor_input::zoom_steps(), "zoom steps stay the game's"),
         tooltip: zoom_code.and_then(|code| optional(zoom_notification::find(code), NO_TOOLTIP)),
+        jitter: optional(
+            console_variable::find().and_then(|variables| {
+                Ok(Jitter {
+                    variables,
+                    commands: console_variable::commands()?,
+                })
+            }),
+            "with the game's TAA setting the orthographic view jumps around",
+        ),
     };
     let tooltip = zoom_code.filter(|_| parts.tooltip.is_some());
     let zoom = parts
@@ -534,6 +562,7 @@ impl Parts {
                     log!("perspective view: the editor isn't viewed");
                 }
                 self.put_sky_back(state);
+                self.start_jitter(state, manager);
                 return;
             };
             state.editor_viewed = true;
@@ -597,8 +626,58 @@ impl Parts {
                     }
                 }
             }
-            if !matches!(state.mode, Mode::Orthographic) {
+            if matches!(state.mode, Mode::Orthographic) {
+                self.stop_jitter(state, frame.editor);
+            } else {
                 state.last = None;
+                self.start_jitter(state, frame.editor);
+            }
+        }
+    }
+
+    /// Stops temporal AA's jitter, if it isn't yet (see the module's documentation).
+    ///
+    /// # Safety
+    /// `world` must be a live object in the view's world. Game thread only.
+    unsafe fn stop_jitter(&self, state: &mut State, world: *mut UObjectBase) {
+        let Some(jitter) = &self.jitter else { return };
+        if state.temporal_samples.is_some() {
+            return;
+        }
+        // SAFETY: per the contract.
+        unsafe {
+            let samples = jitter.variables.float(TEMPORAL_SAMPLES).unwrap_or(0.0) as i32;
+            state.temporal_samples = Some(samples);
+            if samples > 0 {
+                jitter.commands.run(world, &format!("{TEMPORAL_SAMPLES} 0"));
+            }
+            // What says whether temporal AA is on at all, and temporal upsampling, which jitters
+            // whatever the samples (`docs/re/editor-camera.md`, "Temporal AA"). Absent: 0.
+            let variable = |name| jitter.variables.float(name);
+            log!(
+                "temporal AA's jitter stopped ({samples} samples before; AA method {:?}, \
+                 upsampling {:?}, screen percentage {:?})",
+                variable("r.DefaultFeature.AntiAliasing"),
+                variable("r.TemporalAA.Upsampling"),
+                variable("r.ScreenPercentage"),
+            );
+        }
+    }
+
+    /// Lets temporal AA's jitter go on as before, if it was stopped.
+    ///
+    /// # Safety
+    /// As for [`Self::stop_jitter`].
+    unsafe fn start_jitter(&self, state: &mut State, world: *mut UObjectBase) {
+        let (Some(jitter), Some(samples)) = (&self.jitter, state.temporal_samples.take()) else {
+            return;
+        };
+        if samples > 0 {
+            // SAFETY: per the contract.
+            unsafe {
+                jitter
+                    .commands
+                    .run(world, &format!("{TEMPORAL_SAMPLES} {samples}"));
             }
         }
     }

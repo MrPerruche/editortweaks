@@ -232,6 +232,21 @@ pub unsafe fn turn_camera(interface: usize, turn: Quat) {
     }
 }
 
+/// Sets the camera's rotation (in the world) of the editor whose view target interface is at
+/// `interface`, for the frame before the game copies the player's view rotation to it.
+///
+/// # Safety
+/// As for [`turn_camera`].
+pub unsafe fn set_camera_rotation(interface: usize, rotation: [f32; 3]) {
+    // SAFETY: per the contract, as in `turn_camera`.
+    unsafe {
+        (interface as *mut u8)
+            .add(ROTATION)
+            .cast::<[f32; 3]>()
+            .write_unaligned(rotation);
+    }
+}
+
 /// A direction (or distance) in the world, in the editor's space: what moving the camera by it
 /// means to the game, which keeps its location in the editor's space. The same while the editor
 /// isn't turned.

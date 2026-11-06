@@ -18,7 +18,7 @@
 //! vehicle comes with its bricks' groups. The objects a load makes are matched to the op's coop ids
 //! in order; another count (e.g. the game adding mirror counterparts) means the editor drifted.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use ::coop::vehicle::Vehicle;
 use ::coop::{CoopId, GroupKind, Groups, Op, Transform, Value};
@@ -41,6 +41,8 @@ pub struct Outcome {
     /// Ops refused as impossible here (a property this game doesn't have, a value it can't hold,
     /// a reorder without the game's reorder, a group without knowing where groups are kept).
     pub refused: usize,
+    /// Bricks this game can't make (a mod's): the loader skipped them, and the rest are in order.
+    pub skipped: Vec<CoopId>,
 }
 
 /// Where coop edits.
@@ -97,13 +99,17 @@ impl Target<'_> {
             coop_log!("couldn't load the session's vehicle: {reason}");
             return drifted;
         }
-        // SAFETY: the objects the load just made; game thread. The editor is live.
+        // SAFETY: the objects the load just made; game thread.
+        let made = unsafe { made_of(&vehicle.archive, &created, ids) };
+        let ids_here = ids_of(ids, made.as_deref());
+        // SAFETY: as above. The editor is live.
         unsafe {
-            adopt(self.game, &created, ids);
+            adopt(self.game, &created, &ids_here);
             changes::remember_order(&objects(self.game, self.editor));
         }
-        if created.len() == vehicle.groups.len() {
-            changes::applying(|| self.operation(|| self.regroup_all(&created, &vehicle.groups)));
+        if let Some(made) = made.as_ref().filter(|_| vehicle.groups.len() == ids.len()) {
+            let groups: Vec<Groups> = made.iter().map(|&object| vehicle.groups[object]).collect();
+            changes::applying(|| self.operation(|| self.regroup_all(&created, &groups)));
             remember_all_groups(self.game);
         } else if vehicle.groups.is_empty() {
             coop_log!("the session's vehicle came without its groups: they may differ here");
@@ -113,9 +119,30 @@ impl Target<'_> {
             created.len(),
             ids.len()
         );
+        if created.len() != ids.len() {
+            log_classes(&vehicle.archive);
+        }
         Outcome {
-            drifted: created.len() != ids.len(),
+            drifted: made.is_none(),
+            skipped: skipped_of(ids, made.as_deref()),
             ..Outcome::default()
+        }
+    }
+
+    /// Makes the bricks `ids` the selection, as a click would (those that are here). Nothing for no
+    /// bricks, nor outside the default mode: coop only loads in it.
+    pub fn select(&self, ids: &[CoopId]) {
+        let bricks: Vec<Object> = ids.iter().filter_map(|&id| changes::object(id)).collect();
+        let Ok(selector) = &self.game.selector else {
+            return;
+        };
+        // SAFETY: the editor is live (it's ticking); game thread.
+        let Some(mode) = (unsafe { self.game.modes.default_mode(self.editor) }) else {
+            return;
+        };
+        if !bricks.is_empty() {
+            // SAFETY: the editor's default mode, and its live objects (they have coop ids).
+            unsafe { selector.select(mode, &bricks, false) };
         }
     }
 
@@ -157,7 +184,9 @@ impl Target<'_> {
             });
             found.push(brick.ok_or_else(|| format!("object {index} is elsewhere"))?);
         }
+        let absent = changes::absent();
         changes::watch(self.editor, self.component);
+        changes::mark_absent(absent);
         let ids: Vec<CoopId> = found.iter().map(|brick| brick.id).collect();
         let reordered = !ids.iter().eq(known.iter().map(|brick| &brick.id));
         // SAFETY: as above.
@@ -191,7 +220,7 @@ impl Target<'_> {
                     match op {
                         Op::Create { ids, archive } => {
                             self.destroy(&mut doomed);
-                            outcome.drifted |= !self.create(ids, archive);
+                            self.create(ids, archive, &mut outcome);
                         }
                         Op::Delete { id } => doomed.extend(changes::take_object(*id)),
                         Op::Move { id, transform } => {
@@ -256,11 +285,12 @@ impl Target<'_> {
         outcome
     }
 
-    /// Loads one created op's objects; whether they match its ids.
-    fn create(&self, ids: &[CoopId], archive: &[u8]) -> bool {
+    /// Loads one created op's objects, telling `outcome` if they aren't what its ids say.
+    fn create(&self, ids: &[CoopId], archive: &[u8], outcome: &mut Outcome) {
         if let Some(reason) = unfit(archive, ids.len()) {
             coop_log!("refused to create {} objects: {reason}", ids.len());
-            return false;
+            outcome.drifted = true;
+            return;
         }
         let mut result = Ok(());
         // Nested: only this load's objects. Imported, they would replace the selection.
@@ -272,20 +302,21 @@ impl Target<'_> {
         });
         if let Err(reason) = result {
             coop_log!("couldn't create {} objects: {reason}", ids.len());
-            return false;
+            outcome.drifted = true;
+            return;
         }
         // SAFETY: the objects the load just made; game thread.
-        unsafe { adopt(self.game, &created, ids) };
+        let made = unsafe { made_of(archive, &created, ids) };
+        // SAFETY: as above.
+        unsafe { adopt(self.game, &created, &ids_of(ids, made.as_deref())) };
         // Their groups are numbers the loader picked here: the author's follow as ops.
         self.regroup_all(&created, &vec![[0; 2]; created.len()]);
         if created.len() != ids.len() {
-            coop_log!(
-                "creating {} objects made {}: the editor drifted",
-                ids.len(),
-                created.len()
-            );
+            coop_log!("creating {} objects made {}", ids.len(), created.len());
+            log_classes(archive);
         }
-        created.len() == ids.len()
+        outcome.drifted |= made.is_none();
+        outcome.skipped.extend(skipped_of(ids, made.as_deref()));
     }
 
     /// Moves the brick with coop id `id`; false if it couldn't (unknown here, or the editor's
@@ -552,6 +583,58 @@ fn unfit(archive: &[u8], count: usize) -> Option<String> {
         }
         Ok(_) => None,
     }
+}
+
+/// Which of `archive`'s objects, whose ids are `ids`, a load of it made as `created` (the game's
+/// loader skips classes it doesn't have, such as a brick of a mod not installed here); `None` if
+/// that can't be told.
+///
+/// # Safety
+/// `created` must be live objects. Game thread only.
+unsafe fn made_of(archive: &[u8], created: &[Object], ids: &[CoopId]) -> Option<Vec<usize>> {
+    if created.len() == ids.len() {
+        return Some((0..ids.len()).collect());
+    }
+    let header = ::coop::archive::read_header(archive).ok()?;
+    let classes: Vec<String> = created
+        .iter()
+        // SAFETY: per the contract. A live object's class is a live class with a name.
+        .map(|&object| unsafe {
+            reflection::name_text(reflection::struct_name(reflection::class_of(object.cast())))
+        })
+        .collect();
+    header.made_objects(&classes)
+}
+
+/// The ids of the objects made: `made` of `ids` (`None`, it can't be told: in order, as far as they
+/// go, and the session's vehicle is asked for).
+fn ids_of(ids: &[CoopId], made: Option<&[usize]>) -> Vec<CoopId> {
+    match made {
+        Some(made) => made.iter().map(|&object| ids[object]).collect(),
+        None => ids.to_vec(),
+    }
+}
+
+/// The ids of the objects not made.
+fn skipped_of(ids: &[CoopId], made: Option<&[usize]>) -> Vec<CoopId> {
+    let Some(made) = made else {
+        return Vec::new();
+    };
+    let made: HashSet<usize> = made.iter().copied().collect();
+    ids.iter()
+        .enumerate()
+        .filter(|(object, _)| !made.contains(object))
+        .map(|(_, &id)| id)
+        .collect()
+}
+
+/// Logs what classes `archive` asks for, after the game's loader skipped some.
+fn log_classes(archive: &[u8]) {
+    let classes = match ::coop::archive::read_header(archive) {
+        Ok(header) => header.class_names.join(", "),
+        Err(error) => error.to_string(),
+    };
+    coop_log!("  the game here lacks some of these classes: {classes}");
 }
 
 /// A place's location to a tenth of a centimetre, to find the bricks that may be there.

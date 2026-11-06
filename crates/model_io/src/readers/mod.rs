@@ -8,9 +8,11 @@ pub mod stl;
 use std::path::Path;
 
 use crate::model::Model;
+use crate::shared;
 use crate::space::ImportSettings;
 
-/// The model formats references can be made from (`docs/model-io.md`, "Formats").
+/// The model formats references can be made from (`docs/model-io.md`, "Formats"), and the cooked
+/// one coop sends them in.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Format {
     /// glTF 2.0: `.gltf` (with its `.bin` and image files next to it) or `.glb`.
@@ -19,15 +21,19 @@ pub enum Format {
     Obj,
     /// STL, binary or text.
     Stl,
+    /// A model cooked for coop (`shared::cook_model`): `.etmodel`, already in the editor's space,
+    /// with its textures inside.
+    Shared,
 }
 
 impl Format {
     /// File extensions (lowercase) and their format.
-    pub const EXTENSIONS: [(&'static str, Format); 4] = [
+    pub const EXTENSIONS: [(&'static str, Format); 5] = [
         ("gltf", Format::Gltf),
         ("glb", Format::Gltf),
         ("obj", Format::Obj),
         ("stl", Format::Stl),
+        (shared::EXTENSION, Format::Shared),
     ];
 
     /// The format of `path`, by its extension.
@@ -42,14 +48,15 @@ impl Format {
     /// The import settings a new reference of this format starts with.
     pub fn default_settings(self) -> ImportSettings {
         match self {
-            Format::Gltf | Format::Obj => ImportSettings::default(),
+            Format::Gltf | Format::Obj | Format::Shared => ImportSettings::default(),
             Format::Stl => ImportSettings::stl(),
         }
     }
 
-    /// glTF's axes and units are part of the format: the panel doesn't offer them.
+    /// glTF's axes and units are part of the format (and a cooked model's are the editor's): the
+    /// panel doesn't offer them.
     pub fn has_fixed_space(self) -> bool {
-        self == Format::Gltf
+        matches!(self, Format::Gltf | Format::Shared)
     }
 }
 
@@ -61,12 +68,28 @@ pub fn read(path: &Path) -> Result<Model, String> {
         Format::Gltf => gltf::read(path),
         Format::Obj => obj::read(path),
         Format::Stl => stl::read(path),
+        Format::Shared => read_shared(path),
     }
     .map_err(|error| format!("{}: {error}", path.display()))?;
     model
         .validate()
         .map_err(|error| format!("{}: {error}", path.display()))?;
     Ok(model)
+}
+
+/// The biggest cooked file read: a limit on the file system's word, not on the model's.
+const MAX_SHARED_BYTES: u64 = 512 << 20;
+
+/// Reads a cooked model: companions it has none of, so it is only the file.
+fn read_shared(path: &Path) -> Result<Model, String> {
+    let size = std::fs::metadata(path)
+        .map_err(|error| error.to_string())?
+        .len();
+    if size > MAX_SHARED_BYTES {
+        return Err(format!("{size} bytes is too big a file"));
+    }
+    let bytes = std::fs::read(path).map_err(|error| error.to_string())?;
+    shared::read_model(&bytes)
 }
 
 #[cfg(test)]
@@ -78,6 +101,7 @@ mod tests {
         assert_eq!(Format::of(Path::new("a/b/Car.GLB")), Some(Format::Gltf));
         assert_eq!(Format::of(Path::new("car.obj")), Some(Format::Obj));
         assert_eq!(Format::of(Path::new("car.stl")), Some(Format::Stl));
+        assert_eq!(Format::of(Path::new("abc.ETMODEL")), Some(Format::Shared));
         assert_eq!(Format::of(Path::new("car.fbx")), None);
         assert_eq!(Format::of(Path::new("car")), None);
     }

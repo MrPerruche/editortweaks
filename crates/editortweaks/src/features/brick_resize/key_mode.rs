@@ -35,9 +35,7 @@ const TOGGLE: u8 = 1;
 pub(super) static KEY_MODE: Choice = Choice::new(
     "FastEditingKey",
     "Fast editing key",
-    "Hold: fast editing while the key is held. Tap to toggle: a quick tap of the key turns fast \
-     editing on or off; holding it still fast edits while held. While it's on, the middle mouse \
-     button doesn't pivot the camera.",
+    "Whether you must hold the key to fast edit, or tap to toggle fast editing.",
     &[
         Alternative {
             key: "Hold",

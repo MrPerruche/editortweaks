@@ -729,8 +729,9 @@ pub fn parameter_offset(
 pub struct Parameters([u8; Parameters::SIZE]);
 
 impl Parameters {
-    /// Room for an `FHitResult` (0x88 bytes) and a few more parameters.
-    pub const SIZE: usize = 0x100;
+    /// Room for an `FHitResult` (0x88 bytes) and the rest of a box trace's parameters (about 0x110
+    /// bytes in all).
+    pub const SIZE: usize = 0x180;
 
     pub fn new() -> Self {
         Self([0; Self::SIZE])

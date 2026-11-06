@@ -6,12 +6,19 @@ use crate::ids::{CoopId, ORIGINAL_SLOT, Slot};
 use crate::ops::Transform;
 
 /// The players' colors, with their names (sRGB, 0 to 1: the outline draws after tone mapping).
-/// Away from the game's own outline colors (orange selection, green and red validity).
-pub const COLORS: [(&str, [f32; 3]); 4] = [
+/// Away from the game's own outline colors (orange selection, green and red validity) and the line
+/// tool's purple. As many as a session is likely to hold, the most distinct first.
+pub const COLORS: [(&str, [f32; 3]); 10] = [
     ("cyan", [0.0, 0.85, 1.0]),
     ("magenta", [1.0, 0.2, 0.85]),
     ("lime", [0.6, 1.0, 0.1]),
     ("blue", [0.25, 0.4, 1.0]),
+    ("yellow", [1.0, 0.92, 0.15]),
+    ("white", [1.0, 1.0, 1.0]),
+    ("pink", [1.0, 0.6, 0.75]),
+    ("mint", [0.45, 1.0, 0.75]),
+    ("tan", [0.8, 0.65, 0.42]),
+    ("teal", [0.0, 0.55, 0.55]),
 ];
 
 /// How many others the outline can show at once (the material's spare colors).
@@ -195,8 +202,18 @@ mod tests {
 
     #[test]
     fn colors_cycle_past_the_palette() {
-        let members: Vec<Slot> = (1..=6).collect();
-        assert_eq!(color_of(&members, 5).0, color_of(&members, 1).0);
+        let count = COLORS.len() as Slot;
+        let members: Vec<Slot> = (1..=count + 2).collect();
+        assert_eq!(color_of(&members, count + 1).0, color_of(&members, 1).0);
+    }
+
+    #[test]
+    fn a_full_palette_of_players_all_differ() {
+        let members: Vec<Slot> = (1..=COLORS.len() as Slot).collect();
+        let mut names: Vec<_> = members.iter().map(|&s| color_of(&members, s).0).collect();
+        names.sort_unstable();
+        names.dedup();
+        assert_eq!(names.len(), COLORS.len());
     }
 
     #[test]

@@ -87,6 +87,11 @@ impl Writer {
         self.u32(v.to_bits());
     }
 
+    /// As its bits, like [`Writer::f32`].
+    pub fn f64(&mut self, v: f64) {
+        self.u64(v.to_bits());
+    }
+
     /// A count of items to follow. Callers keep counts under the matching read cap.
     pub fn count(&mut self, n: usize) {
         self.u32(u32::try_from(n).expect("count fits in u32"));
@@ -170,6 +175,10 @@ impl<'a> Reader<'a> {
 
     pub fn f32(&mut self) -> Result<f32> {
         Ok(f32::from_bits(self.u32()?))
+    }
+
+    pub fn f64(&mut self) -> Result<f64> {
+        Ok(f64::from_bits(self.u64()?))
     }
 
     /// A count, refused when over `max`. Also refused when even one byte per item couldn't fit in

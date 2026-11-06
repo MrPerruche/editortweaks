@@ -1,2 +1,7 @@
 [build]
 target = "x86_64-pc-windows-gnu"
+
+[env]
+# meshopt (model_io's mesh simplifier) is C++: without this its build links libstdc++ dynamically
+# and the DLL would import libstdc++-6.dll, which players don't have.
+CXXSTDLIB_STATIC = "1"

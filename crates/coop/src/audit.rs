@@ -160,6 +160,25 @@ impl Audit {
         }
         differences
     }
+
+    /// [`Audit::compare`] for an editor without the bricks `absent`, which its game can't make (a
+    /// mod's): they're no difference. Where they'd be in the order isn't known here, so with any
+    /// of them the order isn't compared.
+    pub fn compare_without(
+        &self,
+        count: u32,
+        order: u32,
+        absent: &HashSet<CoopId>,
+        digest: impl FnMut(CoopId) -> Option<Digest>,
+    ) -> Vec<Difference> {
+        let mut differences = self.compare(count + absent.len() as u32, order, digest);
+        differences.retain(|difference| match difference {
+            Difference::Missing(id) => !absent.contains(id),
+            Difference::Order => absent.is_empty(),
+            _ => true,
+        });
+        differences
+    }
 }
 
 /// Which bricks the subhost describes next: those changed lately first, then the next ones going
@@ -278,6 +297,28 @@ mod tests {
         );
         assert!(differences.iter().all(|d| d.needs_snapshot()));
         assert!(!Difference::Order.needs_snapshot());
+
+        // Without a brick its game can't make: no difference, whatever the order then is.
+        let absent = HashSet::from([id(2)]);
+        let without = |n: CoopId| (n != id(2)).then(|| same(n).unwrap());
+        assert_eq!(audit.compare_without(2, 0, &absent, without), vec![]);
+        // But one more brick gone is, and so is any other difference.
+        assert_eq!(
+            audit.compare_without(1, 0, &absent, without),
+            vec![Difference::Count {
+                subhost: 3,
+                here: 2
+            }]
+        );
+        assert_eq!(
+            audit.compare_without(2, 0, &absent, |n| (n != id(2)).then(|| d(9))),
+            vec![Difference::Place(id(1))]
+        );
+        // And nothing absent is `compare`.
+        assert_eq!(
+            audit.compare_without(3, 0, &HashSet::new(), same),
+            vec![Difference::Order]
+        );
     }
 
     #[test]

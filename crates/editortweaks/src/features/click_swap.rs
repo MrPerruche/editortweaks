@@ -33,8 +33,7 @@ use crate::prelude::*;
 pub static SWAP_CLICKS: Toggle = Toggle::new(
     "SwapClicks",
     "Swap left and right click",
-    "In the vehicle editor, the left mouse button does what the right one does, and the other way \
-     around. Menus keep their clicks.",
+    "The left and right click swap only applies in the editor.",
     false,
 );
 

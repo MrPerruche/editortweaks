@@ -14,15 +14,17 @@
 //! bricks can stand in the map without physics, characters or sensors noticing them, and clicks go
 //! through the map to the bricks.
 
+use core::cell::Cell;
 use core::ffi::c_void;
-use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
+use std::sync::{Once, OnceLock};
 
 use brickrust::ue::coreuobject::UObjectBase;
 
 use crate::framework::hook;
 use crate::framework::sig::{self, FunctionSig, SigMatch};
 use crate::framework::timings;
+use crate::prelude::log;
 
 /// `GetEditorTraceParams`, by its start: the channel set to 3, then the player controller's hidden
 /// components added to the query's ignored ones (the controller's offset at +12, the list's at
@@ -167,6 +169,74 @@ pub fn as_editor<T>(query: impl FnOnce() -> T) -> T {
     result
 }
 
+/// What makes a sweep through the engine's Blueprint library (`UKismetSystemLibrary`) the query the
+/// game's own C++ makes: the library can't ask for these.
+#[derive(Clone, Copy, Debug)]
+pub struct GameQuery {
+    /// The channel to trace, if not the one the library was asked for.
+    pub channel: Option<u32>,
+    /// Object types that block, on top of those the library's responses block.
+    pub blocks: &'static [u8],
+    /// `FCollisionQueryParams::bFindInitialOverlaps`: false makes the sweep ignore what it starts
+    /// inside of.
+    pub find_initial_overlaps: bool,
+    /// `FCollisionQueryParams::bIgnoreTouches`.
+    pub ignore_touches: bool,
+}
+
+thread_local! {
+    static GAME_QUERY: Cell<Option<GameQuery>> = const { Cell::new(None) };
+    static GAME_QUERY_RAN: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Runs `sweep`, a sweep made through the engine's Blueprint library, as `query` says, and whether
+/// the hook on the engine's sweep saw it (else it ran as the library made it).
+pub fn as_game_query<T>(query: GameQuery, sweep: impl FnOnce() -> T) -> (T, bool) {
+    GAME_QUERY.set(Some(query));
+    GAME_QUERY_RAN.set(false);
+    let result = sweep();
+    GAME_QUERY.set(None);
+    (result, GAME_QUERY_RAN.get())
+}
+
+/// Offsets of the flags of `FCollisionQueryParams` in the shipping game, after two 8-byte names (in
+/// BRMK, with 12-byte names, they're 8 bytes later: `ABrickVehicle::GetVehicleSpawnOffset` and
+/// `ABrickPlayerController::SweepPawnOrMarker` write the first two there).
+const QUERY_COMPLEX: usize = 0x10;
+const QUERY_FIND_INITIAL_OVERLAPS: usize = 0x11;
+const QUERY_RETURN_PHYSICAL_MATERIAL: usize = 0x13;
+const QUERY_IGNORE_BLOCKS: usize = 0x14;
+const QUERY_IGNORE_TOUCHES: usize = 0x15;
+
+/// Sets the flags of `params`, the library's `FCollisionQueryParams` on its stack, if they are where
+/// they should be: the library asks for a simple trace returning physical materials, the
+/// constructor finds initial overlaps, and nothing is ignored. Whether it could.
+///
+/// # Safety
+/// `params` must be the live, writable `FCollisionQueryParams` of a library trace asking for simple
+/// collision.
+unsafe fn set_query_flags(params: *const c_void, query: GameQuery) -> bool {
+    let params = params.cast_mut().cast::<u8>();
+    // SAFETY: per the contract; every offset lies within the struct.
+    unsafe {
+        let is = |offset: usize, value: u8| params.add(offset).read() == value;
+        let found = is(QUERY_COMPLEX, 0)
+            && is(QUERY_FIND_INITIAL_OVERLAPS, 1)
+            && is(QUERY_RETURN_PHYSICAL_MATERIAL, 1)
+            && is(QUERY_IGNORE_BLOCKS, 0)
+            && is(QUERY_IGNORE_TOUCHES, 0);
+        if found {
+            params
+                .add(QUERY_FIND_INITIAL_OVERLAPS)
+                .write(u8::from(query.find_initial_overlaps));
+            params
+                .add(QUERY_IGNORE_TOUCHES)
+                .write(u8::from(query.ignore_touches));
+        }
+        found
+    }
+}
+
 /// The address the `lea rcx, [rip + displacement]` starting the match loads.
 ///
 /// # Safety
@@ -250,6 +320,39 @@ unsafe extern "C" fn sweep_detour(
 ) -> bool {
     let _span = timings::span("game::editor_trace::sweep_detour");
     let original = *ORIGINAL_SWEEP.get().expect("hook recorded before use");
+    if let Some(query) = GAME_QUERY.get() {
+        static FLAGS_MOVED: Once = Once::new();
+        GAME_QUERY_RAN.set(true);
+        // SAFETY: `as_game_query` runs library traces of simple collision only, whose parameters
+        // are on the library's stack for the call; `responses` is valid for the call.
+        unsafe {
+            if !set_query_flags(params, query) {
+                FLAGS_MOVED.call_once(|| {
+                    log!(
+                        "a collision query's flags aren't where expected: where a vehicle spawns \
+                         may be off in tight places"
+                    )
+                });
+            }
+            let mut blocking = (*responses).0;
+            for &object_type in query.blocks {
+                blocking[usize::from(object_type)] = BLOCK;
+            }
+            return timings::game("UWorld::SweepSingleByChannel", || {
+                original(
+                    world,
+                    hit,
+                    start,
+                    end,
+                    rotation,
+                    query.channel.unwrap_or(channel),
+                    shape,
+                    params,
+                    &ResponseParams(blocking),
+                )
+            });
+        }
+    }
     // SAFETY: as in `line_trace_detour`.
     unsafe {
         match editor_channel(channel) {

@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use model_io::readers::Format;
 use model_io::sidecar::{self, Kind, Reference, Sidecar, SourceMode};
 
-use super::files;
+use super::{files, received};
 
 /// A new reference of `kind` for the file at `path`, with a new id, a link or a copy as `mode`
 /// asks (a copy only once there's a folder). Returns its id.
@@ -95,6 +95,29 @@ pub fn remove(sidecar: &mut Sidecar, folder: Option<&Path>, id: &str) -> Result<
     Ok(())
 }
 
+/// Going from the references `from` to `to` by an undo or a redo: removes the copies only `from`
+/// uses, unless their original files are gone, as [`remove`] does. [`make_missing_copies`] makes
+/// them again if the step is undone in turn. What couldn't be removed is told.
+pub fn remove_copies_left(from: &[Reference], to: &[Reference], folder: &Path) -> Vec<String> {
+    let mut problems = Vec::new();
+    for reference in from {
+        let Some(relative) = &reference.source.copy else {
+            continue;
+        };
+        if to
+            .iter()
+            .any(|kept| kept.source.copy.as_ref() == Some(relative))
+            || !Path::new(&reference.source.path).is_file()
+        {
+            continue;
+        }
+        if let Err(problem) = sidecar::remove_copy(folder, relative) {
+            problems.push(format!("{}: {problem}", reference.name));
+        }
+    }
+    problems
+}
+
 /// Makes the copies asked for while there was no folder (or that went missing).
 pub fn make_missing_copies(sidecar: &mut Sidecar, folder: &Path) -> Vec<String> {
     let mut problems = Vec::new();
@@ -115,7 +138,12 @@ fn copy_of(folder: &Path, reference: &Reference) -> Result<String, String> {
         folder,
         &reference.id,
         &PathBuf::from(&reference.source.path),
-        sidecar::DEFAULT_COPY_LIMIT,
+        // A coop host's reference is under its level's limits, and has no other file to fall back on.
+        if received::is_received(&reference.source.path) {
+            u64::MAX
+        } else {
+            sidecar::DEFAULT_COPY_LIMIT
+        },
     )
     // Companion files left out (outside the model's folder) aren't reported yet.
     .map(|copied| copied.relative)
