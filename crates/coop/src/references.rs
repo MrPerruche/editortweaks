@@ -390,6 +390,177 @@ fn read_finite(r: &mut Reader, what: &'static str) -> Result<f32> {
     }
 }
 
+// --- Members' edits ---
+
+/// Where a reference is and how it looks: what a member may change of one of the host's
+/// references (an entry's settings, but its name).
+#[derive(Clone, Debug, PartialEq)]
+pub struct Look {
+    pub position: [f64; 3],
+    pub rotation: [f64; 3],
+    pub scale: [f64; 3],
+    pub mirror: [bool; 3],
+    pub opacity: f32,
+    pub color: [f32; 3],
+    /// Some exactly for an image.
+    pub image: Option<ImageLook>,
+}
+
+/// A member's change of one of the host's references (`Message::ReferenceEdit`). The host makes it
+/// as its own, and the next lists tell everyone.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Edit {
+    /// The reference `id` now has this look.
+    Set { id: String, look: Look },
+    /// The reference `id` is removed.
+    Remove { id: String },
+}
+
+impl Edit {
+    pub fn id(&self) -> &str {
+        match self {
+            Self::Set { id, .. } | Self::Remove { id } => id,
+        }
+    }
+}
+
+/// `edits` with only the last edit of each reference, in the order of those (several changes of a
+/// slider while one message waits go as one).
+pub fn coalesce(edits: Vec<Edit>) -> Vec<Edit> {
+    let mut kept: Vec<Edit> = Vec::new();
+    for edit in edits {
+        kept.retain(|earlier| earlier.id() != edit.id());
+        kept.push(edit);
+    }
+    kept
+}
+
+/// Writes `edits` (at most [`MAX_ENTRIES`]: one per reference).
+pub fn write_edits(w: &mut Writer, edits: &[Edit]) {
+    let edits = &edits[..edits.len().min(MAX_ENTRIES)];
+    w.count(edits.len());
+    for edit in edits {
+        match edit {
+            Edit::Set { id, look } => {
+                w.u8(0);
+                w.str(id);
+                for v in look
+                    .position
+                    .iter()
+                    .chain(&look.rotation)
+                    .chain(&look.scale)
+                {
+                    w.f64(*v);
+                }
+                look.mirror.iter().for_each(|&m| w.bool(m));
+                w.f32(look.opacity);
+                look.color.iter().for_each(|&c| w.f32(c));
+                w.bool(look.image.is_some());
+                if let Some(image) = &look.image {
+                    w.f64(image.width);
+                    w.bool(image.flip_x);
+                    w.bool(image.flip_y);
+                    w.bool(image.double_sided);
+                    w.bool(image.pixelated);
+                    w.u8(image.pivot);
+                }
+            }
+            Edit::Remove { id } => {
+                w.u8(1);
+                w.str(id);
+            }
+        }
+    }
+}
+
+/// Reads edits written by [`write_edits`], refusing what no honest member sends: numbers past what
+/// a list may hold, a reference edited twice. Whether each names a reference, and an image's look
+/// an image, is for the host to see.
+pub fn read_edits(r: &mut Reader) -> Result<Vec<Edit>> {
+    let n = r.count("reference edits", MAX_ENTRIES)?;
+    let mut edits: Vec<Edit> = Vec::new();
+    for _ in 0..n {
+        let tag = r.u8()?;
+        let id = read_id(r)?;
+        let edit = match tag {
+            0 => {
+                let position = read_vector(r, POSITION_LIMIT, "reference position")?;
+                let rotation = read_vector(r, ROTATION_LIMIT, "reference rotation")?;
+                let scale = read_vector(r, SCALE_LIMIT, "reference scale")?;
+                let mirror = [r.bool()?, r.bool()?, r.bool()?];
+                let opacity = read_finite(r, "reference opacity")?;
+                let color = [
+                    read_finite(r, "reference colour")?,
+                    read_finite(r, "reference colour")?,
+                    read_finite(r, "reference colour")?,
+                ];
+                let image = if r.bool()? {
+                    Some(read_image(r)?)
+                } else {
+                    None
+                };
+                Edit::Set {
+                    id,
+                    look: Look {
+                        position,
+                        rotation,
+                        scale,
+                        mirror,
+                        opacity,
+                        color,
+                        image,
+                    },
+                }
+            }
+            1 => Edit::Remove { id },
+            tag => {
+                return Err(DecodeError::BadTag {
+                    what: "reference edit",
+                    tag,
+                });
+            }
+        };
+        if edits.iter().any(|other| other.id() == edit.id()) {
+            return Err(DecodeError::BadValue("reference edited twice"));
+        }
+        edits.push(edit);
+    }
+    Ok(edits)
+}
+
+/// A reference id: letters, digits, `_` and `-`, 1 to 32 bytes.
+fn read_id(r: &mut Reader) -> Result<String> {
+    let id = r.str("reference id", ID_BYTES)?;
+    let id_ok = !id.is_empty()
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_');
+    if id_ok {
+        Ok(id)
+    } else {
+        Err(DecodeError::BadValue("reference id"))
+    }
+}
+
+fn read_image(r: &mut Reader) -> Result<ImageLook> {
+    let width = r.f64()?;
+    if !(width.is_finite() && width.abs() <= WIDTH_LIMIT) {
+        return Err(DecodeError::BadValue("reference width"));
+    }
+    let look = ImageLook {
+        width,
+        flip_x: r.bool()?,
+        flip_y: r.bool()?,
+        double_sided: r.bool()?,
+        pixelated: r.bool()?,
+        pivot: r.u8()?,
+    };
+    if look.pivot >= PIVOTS {
+        return Err(DecodeError::BadValue("reference pivot"));
+    }
+    Ok(look)
+}
+
 // --- Fitting references under a level ---
 
 /// How big a reference is, as the host has it.
@@ -1102,6 +1273,75 @@ mod tests {
     use super::*;
 
     const MIB: u64 = 1 << 20;
+
+    fn look(x: f64) -> Look {
+        Look {
+            position: [x, 0.0, 0.0],
+            rotation: [0.0; 3],
+            scale: [1.0; 3],
+            mirror: [false, true, false],
+            opacity: 0.5,
+            color: [1.0, 0.5, 0.25],
+            image: Some(ImageLook {
+                width: 120.0,
+                flip_x: true,
+                flip_y: false,
+                double_sided: true,
+                pixelated: false,
+                pivot: 1,
+            }),
+        }
+    }
+
+    fn edits_round_trip(edits: &[Edit]) -> Result<Vec<Edit>> {
+        let mut w = Writer::new();
+        write_edits(&mut w, edits);
+        let bytes = w.finish();
+        let mut r = Reader::new(&bytes);
+        let read = read_edits(&mut r)?;
+        r.finish()?;
+        Ok(read)
+    }
+
+    #[test]
+    fn edits_round_trip_and_refuse_nonsense() {
+        let edits = vec![
+            Edit::Set {
+                id: "a".into(),
+                look: look(5.0),
+            },
+            Edit::Remove { id: "b-2_c".into() },
+        ];
+        assert_eq!(edits_round_trip(&edits).unwrap(), edits);
+        let set = |id: &str, look: Look| Edit::Set {
+            id: id.into(),
+            look,
+        };
+        assert!(edits_round_trip(&[set("a", look(f64::NAN))]).is_err());
+        assert!(edits_round_trip(&[set("a", look(1e9))]).is_err());
+        assert!(edits_round_trip(&[set("a/b", look(0.0))]).is_err());
+        assert!(edits_round_trip(&[set("", look(0.0))]).is_err());
+        let mut pivot = look(0.0);
+        pivot.image.as_mut().unwrap().pivot = PIVOTS;
+        assert!(edits_round_trip(&[set("a", pivot)]).is_err());
+        let mut color = look(0.0);
+        color.color[1] = f32::INFINITY;
+        assert!(edits_round_trip(&[set("a", color)]).is_err());
+        let twice = [set("a", look(1.0)), Edit::Remove { id: "a".into() }];
+        assert!(edits_round_trip(&twice).is_err());
+    }
+
+    #[test]
+    fn coalescing_keeps_each_references_last_edit() {
+        let set = |id: &str, x| Edit::Set {
+            id: id.into(),
+            look: look(x),
+        };
+        let edits = vec![set("a", 1.0), set("b", 1.0), set("a", 2.0), set("a", 3.0)];
+        assert_eq!(coalesce(edits), vec![set("b", 1.0), set("a", 3.0)]);
+        let removed = vec![set("a", 1.0), Edit::Remove { id: "a".into() }];
+        assert_eq!(coalesce(removed), vec![Edit::Remove { id: "a".into() }]);
+    }
 
     fn entry(id: &str, content: u64, bytes: u32) -> Entry {
         Entry {

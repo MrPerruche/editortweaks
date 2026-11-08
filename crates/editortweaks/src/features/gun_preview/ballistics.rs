@@ -1,8 +1,9 @@
 //! How a gun's shot flies, as the game flies it (no game code here: plain numbers in, plain numbers
 //! out). Found in BRMK 1.11.6; see `docs/re/guns.md`, "Trajectories".
 //!
-//! - The muzzle is the gun's first connector, moved to the farthest barrel connector in front of
-//!   it ([`muzzle`], `UBrick::CalcMuzzleTransform`), short of any hidden barrel. Barrels up to
+//! - The muzzle is the gun's first connector, moved to the farthest connector of a barrel connected
+//!   to the gun in front of it ([`muzzle`], `UBrick::CalcMuzzleTransform`), short of any hidden
+//!   barrel. Barrels up to
 //!   `MaxBarrelLength` long make the shot faster and stronger ([`scaled`],
 //!   `UGunBrick::UpdateBarrels`).
 //! - A projectile only falls: its movement adds gravity (times its `GravityScale`) and nothing
@@ -14,6 +15,8 @@
 //!   coincide ([`coincide`]) fire one projectile together (`UProjectileManagerComponent::
 //!   SpawnProjectile` merges the first projectile of each shot into one fired by a coinciding gun
 //!   the same frame).
+//! - It's a ball, and meets things as one (the world tells where its middle is when it touches,
+//!   and how thick what it touched is, as the game measures it with the ball: [`Contact`]).
 //! - What it hits, it damages, then goes through if it has enough penetration left (see
 //!   `game::penetration`), turning randomly by up to [`MAX_VEER`] times the share of its
 //!   penetration that crossing used, and going on from where it entered with that thing left out
@@ -51,8 +54,9 @@ const BARREL_FACING: f64 = 0.1;
 /// [`BARREL_ANGLE`] of its axis and facing its way, as `CalcMuzzleTransform` (lambda BRMK 0x77A20)
 /// finds it. The shot leaves from there, along that connector's axis.
 ///
-/// The game counts every barrel, hidden or not, and doesn't need them to touch. Here hiding a
-/// barrel takes it off: the connectors of `hidden` barrels in line cut off those from there on.
+/// `barrels` are those of the gun's part (connected to it, see `parts`): the game counts every
+/// barrel of the part, hidden or not, and doesn't need them to touch. Here hiding a barrel takes it
+/// off: the connectors of `hidden` barrels in line cut off those from there on.
 pub fn muzzle(
     gun: Frame,
     barrels: impl IntoIterator<Item = Frame>,

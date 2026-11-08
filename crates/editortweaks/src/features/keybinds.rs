@@ -21,6 +21,10 @@
 //! Default keys are `FKey` names, which Unreal derives from Windows' virtual keys: the top row's
 //! digits (`One`..) are the same physical keys on every layout (on AZERTY, the one typing `&`),
 //! letters follow the layout like the game's own (a letter's key is where the layout puts it).
+//!
+//! The mod is released: to change a keybind's default key, give it a new action name too (e.g.
+//! `EditorTweaks_DragSelect2`), so the binding players have saved under the old name doesn't keep
+//! the old key. Otherwise never rename an action: players would lose their binding.
 
 use std::sync::{Mutex, Once, OnceLock, PoisonError};
 
@@ -142,6 +146,16 @@ pub static CLEAR_LINE: Keybind = Keybind::new(
     &[],
 );
 
+/// Pressed, opens a box to type an exact length (`brick_resize`): the size of a brick's face hovered
+/// while fast editing or just dragged, or while moving bricks the line's length (the moved bricks
+/// slide along it). Enter commits, Escape cancels.
+pub static TYPE_LENGTH: Keybind = Keybind::new(
+    "EditorTweaks_TypeLength",
+    "Type length",
+    "Press to type an exact length, then Enter (Escape cancels; math like the sliders', x is the length now; start with + or - to add or take away): the size of the brick's face under the mouse while fast editing, or of the face just resized (for a few seconds); while fast editing moved bricks, the length of the line placed when one of its points is on the moved bricks (they slide along it), or right after turning them about the line, the angle they turned (in degrees).",
+    &["Enter"],
+);
+
 /// Clicked while fast editing (the resize key held) on a brick, gives its looks (color, material,
 /// pattern and the pattern's scale, rotation and offset) to the selected bricks and the bricks made
 /// next (`copy_properties`).
@@ -161,11 +175,11 @@ pub static COPY_PROPERTIES: Keybind = Keybind::new(
     &["Ctrl+MiddleMouseButton"],
 );
 
-/// Slows down mouse moves of bricks and of the camera while held (`move_slowdown`).
+/// Slows down mouse moves of bricks while held, not the camera's (`move_slowdown`).
 pub static SLOW_MOVES: Keybind = Keybind::new(
     "EditorTweaks_SlowMoves",
     "Slow",
-    "Hold to move and rotate bricks and turn the camera slower with the mouse",
+    "Hold to move and rotate bricks slower with the mouse",
     &["LeftControl", "RightControl"],
 );
 
@@ -286,6 +300,7 @@ static SECTIONS: [Section; 6] = [
             &NEXT_SPINNER_SHAPE,
             &SLIDE_ALONG_LINE,
             &CLEAR_LINE,
+            &TYPE_LENGTH,
             &COPY_LOOKS,
             &COPY_PROPERTIES,
         ],
@@ -426,6 +441,40 @@ impl Keybind {
                 .map(|key| DefaultKey::parse(key))
                 .any(|key| modifiers_held(&key.modifiers) && key_held(key.key)),
         }
+    }
+
+    /// Whether a press of the key Unreal calls `name`, with the modifier keys held now, is a press
+    /// of it (others may be held too). By its default keys if the bindings can't be read. Game
+    /// thread only.
+    pub fn is_pressed_by(&self, name: &str) -> bool {
+        let pressed_by = |key: &str, modifiers: &Modifiers| {
+            click_swap::pressed_for(key) == name && modifiers_held(modifiers)
+        };
+        let bound = (|| {
+            let action = *self.action.get()?;
+            let players = PLAYERS.get()?;
+            // SAFETY: on the game thread, per the contract; the input is the local player's.
+            unsafe {
+                let input = players.local()?;
+                let mut pressed = false;
+                players.chords(input, action, |chord| {
+                    let modifiers = Modifiers {
+                        shift: chord.shift,
+                        ctrl: chord.ctrl,
+                        alt: chord.alt,
+                        cmd: chord.cmd,
+                    };
+                    pressed |= pressed_by(&chord.key.to_string(), &modifiers);
+                });
+                Some(pressed)
+            }
+        })();
+        bound.unwrap_or_else(|| {
+            self.keys
+                .iter()
+                .map(|key| DefaultKey::parse(key))
+                .any(|key| pressed_by(key.key, &key.modifiers))
+        })
     }
 
     /// The key it's bound to, for people: its first binding, e.g. "Shift" or "Ctrl+Q" (its first

@@ -8,7 +8,9 @@ use brickrust::ue::coreuobject::UObjectBase;
 use brickrust::ue::uclass::{UFunction, UStruct};
 
 use crate::framework::sig::FunctionSig;
-use crate::game::reflection;
+use crate::game::kismet::{self, Texts};
+use crate::game::reflection::{self, Function, Parameters};
+use crate::game::text::Text;
 
 /// `NumberToText(float Value, ENumericValueType, int32 MaxFractionalDigits, bool bShowUnit,
 /// bool bAlwaysSign, bool bZeroAsUnlimited)` (RVA 0xEE5D90): the text of slider labels, tooltips
@@ -50,6 +52,73 @@ pub struct UnitConversion {
 // happen on the game thread.
 unsafe impl Send for UnitConversion {}
 unsafe impl Sync for UnitConversion {}
+
+/// The reflected [`NUMBER_TO_TEXT`], called through `ProcessEvent` (no signature needed): a number
+/// as the game's UI writes it, in the player's units for the `*Auto` value types.
+pub struct NumberText {
+    library: *mut UObjectBase,
+    function: Function,
+    value: usize,
+    value_type: usize,
+    decimals: usize,
+    units: usize,
+    result: usize,
+    texts: Texts,
+}
+
+// SAFETY: the class default object and the reflection records live as long as the game; calls
+// only happen on the game thread.
+unsafe impl Send for NumberText {}
+unsafe impl Sync for NumberText {}
+
+/// Finds [`NumberText`]. After engine init.
+pub fn number_text() -> Result<NumberText, String> {
+    let class =
+        reflection::find_class("UIFunctionLibrary").ok_or("class UIFunctionLibrary not found")?;
+    // SAFETY: a live class.
+    let library = unsafe { reflection::default_object(class) }
+        .ok_or("UIFunctionLibrary has no default object")?;
+    let function = Function::find(class, "NumberToText")?;
+    Ok(NumberText {
+        library,
+        value: function.parameter("Value", "FloatProperty", 4)?,
+        value_type: function.parameter("ValueType", "EnumProperty", 1)?,
+        decimals: function.parameter("MaxFractionalDigits", "IntProperty", 4)?,
+        units: function.parameter("bIncludeUnits", "BoolProperty", 1)?,
+        result: function.parameter("ReturnValue", "TextProperty", size_of::<Text>() as i32)?,
+        function,
+        texts: kismet::texts()?,
+    })
+}
+
+/// The value of `ENumericValueType::<entry>` (e.g. `DistanceAuto`), by its reflected name.
+pub fn value_type(entry: &str) -> Result<u8, String> {
+    let value =
+        reflection::enum_value("ENumericValueType", &format!("ENumericValueType::{entry}"))?;
+    u8::try_from(value).map_err(|_| format!("ENumericValueType::{entry} is {value}"))
+}
+
+impl NumberText {
+    /// `NumberToText(value, value_type, decimals, units)`: `value` (stored, e.g. cm) as shown, with
+    /// at most `decimals` decimals, and its unit if `units`.
+    ///
+    /// # Safety
+    /// Game thread only.
+    pub unsafe fn text(&self, value: f32, value_type: u8, decimals: i32, units: bool) -> String {
+        let mut parameters = Parameters::new();
+        // SAFETY: on the game thread; each value goes to its parameter's reflected offset, the
+        // others stay zero (false). The result is a new text, ours to release.
+        unsafe {
+            reflection::put(&mut parameters, self.value, value);
+            reflection::put(&mut parameters, self.value_type, value_type);
+            reflection::put(&mut parameters, self.decimals, decimals);
+            reflection::put(&mut parameters, self.units, units);
+            self.function.call(self.library, &mut parameters);
+            self.texts
+                .string(reflection::take::<Text>(&parameters, self.result))
+        }
+    }
+}
 
 /// Room for `ConvertToRealUnits`' parameters (12 bytes in game 1.11.7).
 const PARAMS_SIZE: usize = 32;

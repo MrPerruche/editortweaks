@@ -101,6 +101,16 @@ impl Key {
         self.details = core::ptr::null_mut();
         self.controller = core::ptr::null_mut();
     }
+
+    /// Lets go of its details, as its destructor would: for a key taken from `InputKey` instead of
+    /// passed on (the function destroys the key it's given, so whoever takes it must).
+    ///
+    /// # Safety
+    /// As [`Self::rename`].
+    pub unsafe fn discard(&mut self) {
+        // SAFETY: per the contract.
+        unsafe { self.rename(self.name) };
+    }
 }
 
 /// What players look through: `APlayerController::PlayerCameraManager`'s `ViewTarget.Target` (all

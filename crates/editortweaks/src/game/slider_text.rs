@@ -154,6 +154,23 @@ impl ExactText {
     }
 }
 
+/// Unreal prints at most this many decimals here: the most a slider's edit text can need.
+pub const MAX_EDIT_DIGITS: usize = MAX_DIGITS;
+
+/// What a slider's text box shows to edit `stored`, with at most `max_digits` decimals: the exact
+/// text ([`ExactText::find`]) when it fits, else the shown value (`stored * factor`) rounded to
+/// `max_digits`. `None` when there's no exact text (the game's own text is shown then).
+pub fn edit_text(stored: f32, factor: f32, max_digits: usize) -> Option<ExactText> {
+    let exact = ExactText::find(stored, factor)?;
+    if exact.digits <= max_digits {
+        return Some(exact);
+    }
+    Some(ExactText {
+        shown: stored * factor,
+        digits: max_digits,
+    })
+}
+
 /// `stored` written for use inside a formula, in the shown unit, so that a formula of just this
 /// number gives back `stored` (see [`ExactText`]). Very large or tiny numbers are written as
 /// `m*(10^e)` or `m/(10^e)`: Unreal's formula parser reads a number's digits into an integer.

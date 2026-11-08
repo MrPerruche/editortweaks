@@ -165,6 +165,13 @@ fn gun(shot: &Preview, context: &Context) -> Text {
     if let Some(explosion) = explosion(shot, units) {
         lines.push(format!("Explosion: {explosion}"));
     }
+    // What it touches and measures armor with: a ball this wide, not a line.
+    if let Some(radius) = shot.projectile.radius.filter(|radius| *radius > 0.0) {
+        lines.push(format!(
+            "Projectile size: {} wide",
+            units.short(2.0 * radius)
+        ));
+    }
     let gravity = shot.projectile.gravity_scale;
     if (gravity - 1.0).abs() > 1e-3 {
         lines.push(format!("Gravity: ×{}", num(gravity)));

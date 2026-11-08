@@ -1,0 +1,10 @@
+[package]
+name = "typed_formula"
+description = "Evaluates the formulas players type as exact lengths in the editor (no game code)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+# No dependencies on purpose: pure logic, so `cargo test -p typed_formula` runs anywhere.
+[dependencies]

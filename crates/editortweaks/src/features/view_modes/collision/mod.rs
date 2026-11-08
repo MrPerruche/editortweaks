@@ -610,11 +610,11 @@ fn describe(shapes: &Shapes, scale: Vector, flat_hulls: usize) -> String {
         parts.push(format!("{flat_hulls} flat hull(s) not shown"));
     }
     if let Some(sphere) = shapes.spheres.first() {
-        let smallest = scale.iter().fold(f32::MAX, |a, &b| a.min(b.abs()));
+        // Scaled by Z, as the game's engine does (see `mesh`).
         parts.push(format!(
             "first sphere's radius {} cm, {} cm scaled",
             sphere.radius,
-            sphere.radius * smallest
+            sphere.radius * scale[2].abs()
         ));
     }
     if shapes.ignored > 0 {

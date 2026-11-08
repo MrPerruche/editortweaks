@@ -31,7 +31,7 @@ mod gun_preview;
 mod hello;
 /// The mod's rebindable keys, which other features read.
 mod keybinds;
-mod map_in_editor;
+pub mod map_in_editor;
 /// Shared hook of clicks on the game's menu buttons, where features add buttons (not a feature).
 mod menu_buttons;
 mod model_export;
@@ -41,6 +41,8 @@ mod move_slowdown;
 /// Shared hook of property panels' numeric rows updating (not a feature).
 mod number_rows;
 mod ortho_view;
+/// Shared hook of the game's popups being confirmed, where features open popups (not a feature).
+mod popup_answers;
 mod precise_moves;
 mod precise_sliders;
 mod property_limits;
@@ -53,6 +55,7 @@ mod slider_formulas;
 mod spawn_mode;
 mod suspension_arrows;
 mod thruster_size;
+mod update_check;
 mod view_modes;
 
 /// All features, in load order.
@@ -93,6 +96,7 @@ pub static ALL: &[&dyn Feature] = &[
     &model_export::ModelExport,
     &editor_menu::EditorMenu,
     &coop::Coop,
+    &update_check::UpdateCheck,
 ];
 
 /// Every feature's settings, by section of the menu, in the menu's order (see `settings_menu`).
@@ -103,10 +107,12 @@ pub static SETTINGS: &[&[Section]] = &[
     &model_export::SETTINGS,
     &PREVIEWS,
     &coop::SETTINGS,
+    &update_check::SETTINGS,
 ];
 
 /// The settings of the editor itself: which buttons select, the camera's pitch, what a box picks,
-/// how selected bricks' connectors show, how far sliders drag, how compact the side
+/// how selected bricks' connectors show, how far sliders drag, how many decimals a slider shows
+/// when typing, how compact the side
 /// panel is.
 static EDITOR: [Section; 1] = [Section {
     title: "Editor",
@@ -116,6 +122,7 @@ static EDITOR: [Section; 1] = [Section {
         Setting::Choice(&drag_select::PICKS),
         Setting::Toggle(&connector_markers::AXIS_COLORS),
         Setting::Toggle(&slider_drag::LIFT_SLIDER_LIMITS),
+        Setting::Count(&precise_sliders::EDIT_DECIMALS),
         Setting::Choice(&compact_panel::COMPACT_PANEL),
     ],
     // The side panel's "Spawn mode" and "Disable lighting" rows set them; the others are only in

@@ -220,13 +220,17 @@ struct NumbersRange {
     max: Numbers,
 }
 
-impl From<Setting> for Value {
-    fn from(setting: Setting) -> Self {
-        match setting {
+impl TryFrom<Setting> for Value {
+    type Error = String;
+
+    /// How the menu shows `setting`; a [`Setting::Note`] can't be shown.
+    fn try_from(setting: Setting) -> Result<Self, String> {
+        Ok(match setting {
             Setting::Toggle(toggle) => Value::Check(toggle),
             Setting::Choice(choice) => Value::List(choice),
             Setting::Count(count) => Value::Number(count),
-        }
+            Setting::Note(note) => return Err(format!("{} is a note, not shown", note.key)),
+        })
     }
 }
 
@@ -502,7 +506,7 @@ impl Rows {
             setting.key(),
             setting.name(),
             setting.description(),
-            setting.into(),
+            setting.try_into()?,
             changed,
         )
     }

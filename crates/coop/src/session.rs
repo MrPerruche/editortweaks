@@ -27,9 +27,9 @@ use crate::ids::{CoopId, IdAllocator, LiveSet, ORIGINAL_SLOT, SUBHOST_SLOT, Slot
 use crate::limits::{Ban, Flood, Limits};
 use crate::message::{Member, Message, PeerId, PeerInfo, RefuseReason, caps};
 use crate::ops::{Op, Value};
-use crate::presence::View;
-use crate::references::{CHUNK, Chunk, Entry, Level};
-use crate::undo::{Change, History, StepBack};
+use crate::presence::{MapPlace, View};
+use crate::references::{CHUNK, Chunk, Edit, Entry, Level};
+use crate::undo::{Change, History, Selection, StepBack};
 use crate::wire::DecodeError;
 
 /// A frame for the transport to send.
@@ -139,6 +139,13 @@ pub enum Event {
     },
     /// Member: the subhost's references, as it holds them for us (`references`).
     ReferenceList(Vec<Entry>),
+    /// Subhost: `peer`, a member, changed our references (checked as read, not yet against them).
+    ReferenceEdited {
+        peer: PeerId,
+        edits: Vec<Edit>,
+    },
+    /// Member: where the subhost's map shows around the vehicle now (`None`: it doesn't).
+    MapPlace(Option<MapPlace>),
     /// Member: a piece of a reference's data from the subhost. Nothing is checked yet:
     /// `references::Receiving::data` only takes what it asked for.
     ReferenceData {
@@ -234,6 +241,8 @@ struct Host {
     deferred: Vec<(u64, SnapshotRequest)>,
     /// Joiners waiting for the subhost's answer, with their names.
     asking: Vec<(PeerId, String)>,
+    /// Where our map shows, as members were told.
+    map_place: Option<MapPlace>,
 }
 
 struct Pending {
@@ -430,6 +439,7 @@ impl Session {
             history: History::default(),
             deferred: Vec::new(),
             asking: Vec::new(),
+            map_place: None,
         });
         Ok(ids)
     }
@@ -632,6 +642,24 @@ impl Session {
         self.send_edit(ops, |history, local| history.record(changes, local))
     }
 
+    /// The local player's selection changed (it isn't sent with edits, but undo takes it back, as
+    /// the game's own does). `with_edit`: along with their newest edit, which undoing then
+    /// selects back; else a step of its own.
+    pub fn selection_changed(
+        &mut self,
+        selection: Selection,
+        with_edit: bool,
+    ) -> Result<(), SessionError> {
+        let history = match &mut self.role {
+            Role::Host(host) => &mut host.history,
+            Role::Guest(guest) if guest.loaded => &mut guest.history,
+            Role::Guest(_) => return Err(SessionError::NotLoaded),
+            Role::Idle | Role::Joining { .. } => return Err(SessionError::NotInSession),
+        };
+        history.select(selection, with_edit);
+        Ok(())
+    }
+
     /// Undoes the local player's newest step still to undo, as a new edit: what it makes, for the
     /// editor to make too. `None` if there's nothing to undo.
     pub fn undo(&mut self) -> Result<Option<StepBack>, SessionError> {
@@ -659,11 +687,11 @@ impl Session {
         if back.ops.is_empty() {
             // Nothing to send (only skipped changes, or ones only the other way does something
             // for), so nothing waits for a commit either.
-            history.push(!redo, other_way, 0);
+            history.push_reversed(!redo, other_way, 0);
             return Ok(Some(back));
         }
         self.send_edit(back.ops.clone(), |history, local| {
-            history.push(!redo, other_way, local)
+            history.push_reversed(!redo, other_way, local)
         })?;
         Ok(Some(back))
     }
@@ -873,6 +901,32 @@ impl Session {
             let host = guest.host;
             self.out.send(host, &Message::ReferenceWant { content });
         }
+    }
+
+    /// Member: tells the subhost how we changed its references.
+    pub fn edit_references(&mut self, edits: Vec<Edit>) {
+        if edits.is_empty() {
+            return;
+        }
+        if let Role::Guest(guest) = &self.role {
+            let host = guest.host;
+            self.out.send(host, &Message::ReferenceEdit { edits });
+        }
+    }
+
+    /// Subhost: where our map shows around the vehicle (`None`: it doesn't). Members are told when
+    /// it changes, and who joins when let in.
+    pub fn show_map_place(&mut self, place: Option<MapPlace>) {
+        let Role::Host(host) = &mut self.role else {
+            return;
+        };
+        if host.map_place == place {
+            return;
+        }
+        host.map_place = place;
+        let peers: Vec<PeerId> = host.members.iter().map(|m| m.member.peer).collect();
+        let message = Message::MapPlace { place };
+        peers.into_iter().for_each(|p| self.out.send(p, &message));
     }
 
     /// Subhost: gives `peer`, a member, the references it holds for it.
@@ -1222,6 +1276,9 @@ impl Session {
             Message::ReferenceWant { content } => {
                 self.events.push(Event::ReferenceWanted { peer, content });
             }
+            Message::ReferenceEdit { edits } if !edits.is_empty() => {
+                self.events.push(Event::ReferenceEdited { peer, edits });
+            }
             Message::Leave => {
                 host.members.retain(|m| m.member.peer != peer);
                 self.assembler.forget(peer);
@@ -1250,6 +1307,10 @@ impl Session {
         host.members.push(member);
         self.assembler.forget(peer);
         self.out.send(peer, &Message::JoinAccepted { slot });
+        if let Some(place) = host.map_place {
+            let message = Message::MapPlace { place: Some(place) };
+            self.out.send(peer, &message);
+        }
         self.want_snapshot(request);
         self.broadcast_members();
     }
@@ -1400,6 +1461,7 @@ impl Session {
             Message::Selection { slot, ids } => self.events.push(Event::Selection { slot, ids }),
             Message::Camera { slot, view } => self.events.push(Event::Camera { slot, view }),
             Message::ReferenceList { entries } => self.events.push(Event::ReferenceList(entries)),
+            Message::MapPlace { place } => self.events.push(Event::MapPlace(place)),
             Message::ReferenceData {
                 content,
                 offset,
@@ -2120,6 +2182,58 @@ mod tests {
             &host.take_events()[..],
             [Event::SnapshotWanted(SnapshotRequest { peer: 2, .. })]
         ));
+    }
+
+    #[test]
+    fn members_follow_the_subhosts_map_place() {
+        let place = crate::message::tests::sample_map_place();
+        let mut host = Session::new(info());
+        let original = host.host(7, "h".into(), settings(), 1).unwrap();
+        // Shown before anyone joined: who joins is told.
+        host.show_map_place(Some(place));
+        assert!(host.take_outgoing().is_empty());
+        let mut guest = Session::new(info());
+        guest.join(1, "1234".into(), "g".into()).unwrap();
+        guest
+            .take_outgoing()
+            .into_iter()
+            .for_each(|o| host.receive(2, &o.bytes));
+        pump(&mut host, 1, &mut guest, 2);
+        let request = snapshot_request(&mut host);
+        host.send_snapshot(request, original, vec![]).unwrap();
+        pump(&mut host, 1, &mut guest, 2);
+        host.take_events();
+        let places = |guest: &mut Session| -> Vec<Option<MapPlace>> {
+            guest
+                .take_events()
+                .into_iter()
+                .filter_map(|e| match e {
+                    Event::MapPlace(place) => Some(place),
+                    _ => None,
+                })
+                .collect()
+        };
+        assert_eq!(places(&mut guest), vec![Some(place)]);
+
+        // The same again: nothing goes out.
+        host.show_map_place(Some(place));
+        assert!(host.take_outgoing().is_empty());
+        let moved = MapPlace {
+            location: [0.0, 0.0, -5_000.0],
+            ..place
+        };
+        host.show_map_place(Some(moved));
+        let out = host.take_outgoing();
+        assert!(out.iter().all(|o| o.reliable));
+        out.into_iter().for_each(|o| guest.receive(1, &o.bytes));
+        assert_eq!(places(&mut guest), vec![Some(moved)]);
+        host.show_map_place(None);
+        pump(&mut host, 1, &mut guest, 2);
+        assert_eq!(places(&mut guest), vec![None]);
+
+        // Members don't tell anyone.
+        guest.show_map_place(Some(place));
+        assert!(guest.take_outgoing().is_empty());
     }
 
     #[test]

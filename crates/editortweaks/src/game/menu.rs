@@ -574,6 +574,21 @@ impl WindowManager {
         }
     }
 
+    /// The widget showing as the main screen (the main menu, the HUD, the editor, the menu while
+    /// it's open), if one does. `UWindowManagerWidget::SetActiveWidget` (BRMK 0x44D1E0) clears it
+    /// and closes every popup (`CloseAllPopups`) when the screen changes, then sets it once the new
+    /// widget has loaded: a popup opened before then is closed at once (`docs/re/popups.md`).
+    ///
+    /// # Safety
+    /// Game thread only.
+    pub unsafe fn active_widget(&self) -> Option<*mut UObjectBase> {
+        // SAFETY: on the game thread; the field is an object pointer of the manager's class.
+        unsafe {
+            let widget = field::<*mut UObjectBase>(self.manager()?, self.active_widget);
+            (!widget.is_null()).then_some(widget)
+        }
+    }
+
     /// The current world's window manager.
     ///
     /// # Safety

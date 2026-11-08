@@ -2,6 +2,7 @@
 
 pub mod cursor;
 pub mod file_dialog;
+pub mod https;
 pub mod keyboard;
 pub mod memory;
 pub mod timer;

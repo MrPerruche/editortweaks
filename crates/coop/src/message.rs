@@ -6,8 +6,10 @@
 use crate::audit::{Audit, Digest};
 use crate::ids::{Check, CoopId, Slot};
 use crate::ops::{Op, read_ids, read_ops, write_ids, write_ops};
-use crate::presence::View;
-use crate::references::{CHUNK, Entry, Level, read_entries, write_entries};
+use crate::presence::{MapPlace, View};
+use crate::references::{
+    CHUNK, Edit, Entry, Level, read_edits, read_entries, write_edits, write_entries,
+};
 use crate::wire::{DecodeError, Reader, Result, Writer};
 
 /// A peer's address on the transport: a SteamID64 over Steam, any made-up number elsewhere.
@@ -15,7 +17,7 @@ pub type PeerId = u64;
 
 pub const MAGIC: [u8; 2] = *b"ET";
 /// Bumped whenever a message changes.
-pub const PROTOCOL: u16 = 8;
+pub const PROTOCOL: u16 = 9;
 /// magic + protocol + kind + session.
 pub const HEADER_LEN: usize = 2 + 2 + 1 + 4;
 
@@ -160,6 +162,14 @@ pub enum Message {
         offset: u32,
         data: Vec<u8>,
     },
+    /// Member to subhost: changes of the subhost's references, which the subhost makes as its own.
+    ReferenceEdit {
+        edits: Vec<Edit>,
+    },
+    /// Subhost to member: where the subhost's map shows (`None`: it doesn't).
+    MapPlace {
+        place: Option<MapPlace>,
+    },
 }
 
 impl Message {
@@ -190,6 +200,8 @@ impl Message {
             Self::ReferenceList { .. } => 22,
             Self::ReferenceWant { .. } => 23,
             Self::ReferenceData { .. } => 24,
+            Self::ReferenceEdit { .. } => 25,
+            Self::MapPlace { .. } => 26,
         }
     }
 
@@ -327,6 +339,22 @@ impl Message {
                 w.u64(*content);
                 w.u32(*offset);
                 w.bytes(data);
+            }
+            Self::ReferenceEdit { edits } => write_edits(&mut w, edits),
+            Self::MapPlace { place } => {
+                w.bool(place.is_some());
+                if let Some(place) = place {
+                    place
+                        .location
+                        .iter()
+                        .chain(&place.rotation)
+                        .chain(&place.spawn_point)
+                        .for_each(|&v| w.f32(v));
+                    w.bool(place.spawn_box.is_some());
+                    if let Some(half) = place.spawn_box {
+                        half.iter().for_each(|&v| w.f32(v));
+                    }
+                }
             }
         }
         w.finish()
@@ -522,6 +550,33 @@ impl Message {
                 offset: r.u32()?,
                 data: r.bytes("reference data", CHUNK)?.to_vec(),
             },
+            25 => Self::ReferenceEdit {
+                edits: read_edits(&mut r)?,
+            },
+            26 => {
+                let place = if r.bool()? {
+                    let mut three = || -> Result<[f32; 3]> { Ok([r.f32()?, r.f32()?, r.f32()?]) };
+                    let (location, rotation, spawn_point) = (three()?, three()?, three()?);
+                    let spawn_box = if r.bool()? {
+                        Some([r.f32()?, r.f32()?, r.f32()?])
+                    } else {
+                        None
+                    };
+                    let place = MapPlace {
+                        location,
+                        rotation,
+                        spawn_point,
+                        spawn_box,
+                    };
+                    if !place.is_sane() {
+                        return Err(DecodeError::BadValue("map place"));
+                    }
+                    Some(place)
+                } else {
+                    None
+                };
+                Self::MapPlace { place }
+            }
             tag => {
                 return Err(DecodeError::BadTag {
                     what: "message",
@@ -535,7 +590,7 @@ impl Message {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::ops::{Transform, Value};
     use crate::references::{ImageLook, Kind};
@@ -706,7 +761,63 @@ mod tests {
                 offset: 16384,
                 data: vec![9; 100],
             },
+            Message::ReferenceEdit {
+                edits: vec![crate::references::Edit::Remove { id: "ab".into() }],
+            },
+            Message::MapPlace { place: None },
+            Message::MapPlace {
+                place: Some(sample_map_place()),
+            },
+            Message::MapPlace {
+                place: Some(MapPlace {
+                    spawn_box: None,
+                    ..sample_map_place()
+                }),
+            },
         ]
+    }
+
+    pub(crate) fn sample_map_place() -> MapPlace {
+        MapPlace {
+            location: [123_456.5, -98_765.25, 4_321.0],
+            rotation: [1.5, -90.0, 0.25],
+            spawn_point: [10.0, -20.0, 30.0],
+            spawn_box: Some([400.0, 250.0, 300.0]),
+        }
+    }
+
+    #[test]
+    fn nonsense_map_places_are_refused() {
+        let good = sample_map_place();
+        let bad = [
+            MapPlace {
+                location: [f32::NAN, 0.0, 0.0],
+                ..good
+            },
+            MapPlace {
+                location: [0.0, 0.0, 2e7],
+                ..good
+            },
+            MapPlace {
+                rotation: [0.0, f32::INFINITY, 0.0],
+                ..good
+            },
+            MapPlace {
+                spawn_point: [0.0, 2e6, 0.0],
+                ..good
+            },
+            MapPlace {
+                spawn_box: Some([-1.0, 1.0, 1.0]),
+                ..good
+            },
+        ];
+        for place in bad {
+            let bytes = Message::MapPlace { place: Some(place) }.encode(3);
+            assert!(
+                matches!(Message::decode(&bytes), Err(DecodeError::BadValue(_))),
+                "{place:?}"
+            );
+        }
     }
 
     #[test]

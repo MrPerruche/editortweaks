@@ -300,6 +300,12 @@ pub fn refresh(page: &'static Page) {
     }
 }
 
+/// The root of the menu last opened: `MainMenu` in the main menu, `InGameMenu` in a world, empty
+/// before any (or if this feature is off).
+pub fn menu_root() -> String {
+    state().root.clone()
+}
+
 /// Opens the context `path` below `menu`'s root (the root itself if empty).
 ///
 /// # Safety

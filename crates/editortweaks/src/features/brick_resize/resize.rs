@@ -253,11 +253,31 @@ impl Resize {
         bounds
     }
 
-    /// The size giving the brick a box as big as `bounds`.
+    /// The one axis the grip drags (in the brick's frame), if it drags only one: a face's size can
+    /// be typed (see [`Self::size_with_extent`]), not an edge's or a corner's.
+    pub fn axis(&self) -> Option<usize> {
+        let mut axes = self.grip.part.axes();
+        match (axes.next(), axes.next()) {
+            (Some(axis), None) => Some(axis),
+            _ => None,
+        }
+    }
+
+    /// The size giving the box `extent` (cm) from the dragged side to the opposite one along the
+    /// one axis dragged (see [`Self::axis`]), the opposite side staying.
+    pub fn size_with_extent(&self, extent: f64) -> Option<Vec3> {
+        let axis = self.axis()?;
+        let mut sides = self.bounds.point(self.grip.part.sides);
+        sides[axis] = self.anchor()[axis] + f64::from(self.grip.part.sides[axis]) * extent;
+        Some(self.size_for(&self.resized(sides)))
+    }
+
+    /// The size giving the brick a box as big as `bounds`: along an axis whose extent didn't
+    /// change, exactly the size it had (scaling by `extent / extent` could round).
     pub fn size_for(&self, bounds: &Bounds) -> Vec3 {
         core::array::from_fn(|axis| {
             let before = self.bounds.extent(axis);
-            if before > 0.0 {
+            if before > 0.0 && bounds.extent(axis) != before {
                 self.size[axis] * bounds.extent(axis) / before
             } else {
                 self.size[axis]

@@ -156,10 +156,11 @@ impl Mesh {
         }
     }
 
-    /// `FKSphereElem::GetFinalScaled`: its radius scaled by the smallest scale, its center scaled.
+    /// `FKSphereElem::GetFinalScaled` as the game's engine has it: its radius scaled by the Z scale
+    /// only (stock UE takes the smallest; `docs/re/collision-shapes.md`), its center scaled. For a
+    /// wheel, X is its width and Z its radius, tyre pressure included.
     fn add_sphere(&mut self, shape: &SphereShape) {
-        let smallest = self.scale.iter().fold(f64::MAX, |a, &b| a.min(b.abs()));
-        let radius = f64::from(shape.radius) * smallest;
+        let radius = f64::from(shape.radius) * self.scale[2].abs();
         let center = scaled(self.scale, math::widen(shape.center));
         self.add_round(center, Quat::IDENTITY, radius, 0.0);
     }
@@ -364,13 +365,13 @@ mod tests {
             ..Shapes::default()
         };
         assert!(!scales_linearly(&shapes));
-        let scale = [2.0, 1.0, 1.0];
+        // A wheel's: X its width (the smallest here), Z its radius.
+        let scale = [0.5, 1.5, 1.5];
         let built = triangles(&shapes, scale);
-        // Scaled back up by the component, every vertex is 10 (the smallest scale) from the
-        // center.
+        // Scaled back up by the component, every vertex is 15 (the Z scale) from the center.
         for vertex in &built.triangles.positions {
             let world: Vec3 = core::array::from_fn(|axis| f64::from(vertex[axis] * scale[axis]));
-            assert!((math::length(world) - 10.0).abs() < 1e-3);
+            assert!((math::length(world) - 15.0).abs() < 1e-3);
         }
         assert!(volume(&built.triangles) > 0.0);
         // Smooth: one vertex per point, shared all around.

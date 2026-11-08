@@ -24,8 +24,9 @@
 //! The "Reference fit" view mode (`view_modes`) measures bricks against the model references
 //! ([`fit_key`], [`fit_triangles`]), and makes its material with [`looks`].
 //!
-//! In a coop session a member shows the session's references instead of the sidecar's, read-only, and
-//! keeps them with the vehicle when it's saved ([`received`]).
+//! In a coop session a member shows the session's references instead of the sidecar's, and keeps
+//! them with the vehicle when it's saved ([`received`]). Its changes of them go to the host, which
+//! makes them for everyone.
 
 mod edit;
 mod files;
@@ -74,6 +75,10 @@ const POLL: Duration = Duration::from_secs(1);
 
 /// How long after the last change the sidecar is written (a slider drag changes it every frame).
 const WRITE_DELAY: Duration = Duration::from_millis(400);
+
+/// How long a member's change of a host's reference shows as it is here, whatever the host's lists
+/// say meanwhile (they may not have it yet).
+const HOLD_OWN_EDITS: Duration = Duration::from_secs(3);
 
 pub struct References;
 
@@ -174,6 +179,14 @@ struct State {
     received: Option<Sidecar>,
     /// What the panel last said about them.
     received_status: String,
+    /// The session's references as the host last listed them.
+    received_list: Vec<Reference>,
+    /// The session's references as the host has them, as far as we know: as listed, then with the
+    /// changes sent since ([`received::edits_between`]).
+    received_sent: Vec<Reference>,
+    /// The host's references changed here lately, and when: lists keep showing them as they are
+    /// here for [`HOLD_OWN_EDITS`], until the host's catch up.
+    received_held: Vec<(String, Instant)>,
     /// The folder's vehicle file when last looked at while showing the session's references: it
     /// changing means the game saved over it.
     saved_stamp: Option<(PathBuf, Option<Stamp>)>,
@@ -217,6 +230,9 @@ impl State {
             panel: None,
             received: None,
             received_status: String::new(),
+            received_list: Vec::new(),
+            received_sent: Vec::new(),
+            received_held: Vec::new(),
             saved_stamp: None,
         }
     }
@@ -714,12 +730,16 @@ fn show_session_references(state: &mut State) -> bool {
             state.sidecar_stamp = None;
             state.saved_stamp = None;
             state.received_status.clear();
+            state.received_list.clear();
+            state.received_sent.clear();
+            state.received_held.clear();
             state.selected.clear();
             state.refresh_panel = true;
         }
         return false;
     };
-    if state.received.is_none() {
+    let first = state.received.is_none();
+    if first {
         log!("showing the session's references");
         state.commit();
         state.received = Some(core::mem::take(&mut state.sidecar));
@@ -727,7 +747,59 @@ fn show_session_references(state: &mut State) -> bool {
         state.refresh_panel = true;
     }
     state.unwritten = None;
-    state.sidecar.references = list;
+    let now = Instant::now();
+    state
+        .received_held
+        .retain(|(_, at)| now.duration_since(*at) < HOLD_OWN_EDITS);
+    if first || list != state.received_list {
+        // The host's list changed: it's what shows, but for references changed here lately (the
+        // host may not have had the change yet: ours show, and go again at the next poll if the
+        // host's differ). References hidden here (opacity 0) stay hidden.
+        let mut shown = Vec::new();
+        for reference in &list {
+            let mine = state
+                .sidecar
+                .references
+                .iter()
+                .find(|mine| mine.id == reference.id);
+            let held = state
+                .received_held
+                .iter()
+                .any(|(id, _)| *id == reference.id);
+            match mine {
+                Some(mine) if held => shown.push(mine.clone()),
+                // Removed here.
+                None if held => {}
+                _ => {
+                    let mut reference = reference.clone();
+                    if mine.is_some_and(|mine| mine.opacity <= 0.0) {
+                        reference.opacity = 0.0;
+                    }
+                    shown.push(reference);
+                }
+            }
+        }
+        state.sidecar.references = shown;
+        state.received_sent = list.clone();
+        state.received_list = list;
+        state.selected.retain(|id| {
+            state
+                .received_list
+                .iter()
+                .any(|reference| reference.id == *id)
+        });
+    } else {
+        // Ours changed: it goes to the host.
+        let edits = received::edits_between(&mut state.received_sent, &state.sidecar.references);
+        if !edits.is_empty() {
+            log!("{} changes of the host's references sent", edits.len());
+            for edit in &edits {
+                state.received_held.retain(|(id, _)| id != edit.id());
+                state.received_held.push((edit.id().to_owned(), now));
+            }
+            received::send(edits);
+        }
+    }
     let status = received::status();
     if state.received_status != status {
         state.received_status = status;

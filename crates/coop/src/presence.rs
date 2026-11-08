@@ -116,6 +116,38 @@ impl View {
     }
 }
 
+/// Where the subhost's map shows around the vehicle (`features/map_in_editor`): where its editor
+/// stands in the world. Everyone is in the same match, so members showing the map put their editor
+/// there too and see the same ground under the same bricks.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct MapPlace {
+    /// The editor's location in the world (cm) and its rotation (pitch, yaw, roll in degrees).
+    pub location: [f32; 3],
+    pub rotation: [f32; 3],
+    /// The spawn point in the editor's space, and the garage's spawn box' half size (cm) if the
+    /// map shows at a garage: what the subhost's player sees marked.
+    pub spawn_point: [f32; 3],
+    pub spawn_box: Option<[f32; 3]>,
+}
+
+impl MapPlace {
+    /// How far from the world's origin an editor may stand (cm): far past any map.
+    pub const MAX_WORLD: f32 = 1e7;
+    /// How far a rotation's angles may go (degrees), as for bricks.
+    pub const MAX_ANGLE: f32 = 1e4;
+
+    /// Whether every number is finite and within the caps. Subhosts' places are refused otherwise.
+    pub fn is_sane(&self) -> bool {
+        let within = |values: &[f32; 3], max: f32| values.iter().all(|v| v.abs() <= max);
+        within(&self.location, Self::MAX_WORLD)
+            && within(&self.rotation, Self::MAX_ANGLE)
+            && within(&self.spawn_point, Transform::MAX_LOCATION)
+            && self.spawn_box.is_none_or(|half| {
+                within(&half, Transform::MAX_LOCATION) && half.iter().all(|&v| v >= 0.0)
+            })
+    }
+}
+
 /// When the local camera goes out: soon after it moves, now and then anyway, so who joined since
 /// sees it too. `None` (not looking at the editor) goes out once.
 #[derive(Default)]

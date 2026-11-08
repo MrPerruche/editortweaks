@@ -10,6 +10,9 @@
 //!   stays still meanwhile;
 //! - a setting makes the resize key a toggle: a quick tap turns all this on or off, holding it
 //!   still works meanwhile (see [`key_mode`], and [`is_fast_editing`] for the rest of the mod);
+//! - a press of the resize key (held or tapped) gives the keyboard back to the 3D view
+//!   (`game::game_focus`): a game button hovered on the way keeps it otherwise, and Enter would
+//!   press that button instead of typing a length;
 //! - hold Ctrl ([`keybinds::SNAP_RESIZE`]) while dragging: the part snaps to the point of another
 //!   brick nearest the mouse among its corners, the middles of its edges and faces, where bricks'
 //!   edges cross each other or faces, and halfway between those crossings; else along the edge
@@ -21,6 +24,14 @@
 //!   a moment before the button doesn't unsnap;
 //! - releasing the button makes it one step to undo. With mirror mode on, the brick's counterpart
 //!   changes along;
+//! - a face dragged shows its size just past it, in light blue and the editor's unit (see
+//!   [`line_label`]). Right after, [`keybinds::TYPE_LENGTH`] (Enter, Alt let go) opens a text box
+//!   on it to type the size it should have, as in CAD (see [`typed_length`]): the same resize
+//!   again, to that size (one more step to undo). With fast
+//!   editing toggled on, the face under the mouse comes first. A face stays ready for
+//!   [`FACE_LASTS`] after a drag or a typed size, unless its brick changes otherwise (an undo, a
+//!   move), is deselected or the box is cancelled (see [`SizedFace`]); edges and corners have no
+//!   size to type;
 //! - hold the model key too ([`keybinds::MODEL_EDITING`], the middle or either thumb mouse button
 //!   by default): the bricks' models replace their boxes, for what the mouse points at, drags and
 //!   snaps to: their faces, edges and vertices (see [`model`]). Dragging one resizes the box like
@@ -49,7 +60,8 @@
 //!
 //! - hold Alt: the box of the moved brick under the mouse shows, and the part the mouse is on;
 //! - Alt + drag: the grabbed point follows the mouse, in the plane across the vehicle's axis the
-//!   camera looks along the most, by the game's grid steps while its snapping is on. With Ctrl held
+//!   camera looks along the most, by the game's grid steps while its snapping is on. A click with
+//!   the mouse exactly where it was pressed moves nothing (see [`Moving::pressed_at`]). With Ctrl held
 //!   when pressing, the grabbed point is the brick's own snap point nearest the mouse (a corner, an
 //!   edge's middle, a face's center...), marked (blue) on its piece before the press;
 //! - hold Ctrl while dragging: the grabbed point snaps like a resize does, to bricks not moved;
@@ -63,12 +75,19 @@
 //! - with Alt held, a click of the line key ([`keybinds::LINE_POINT`], the right mouse button)
 //!   places a point where snapping finds one, on any brick; two make a line, which shows while
 //!   moving with the mouse free (see [`line_tool`]; the right button moves the camera again once
-//!   Alt is let go). While there's a line, Alt + drag turns the moved bricks about it instead, the
-//!   grabbed point going round it as near the mouse as it can, and Alt + a drag of the line key
-//!   slides them along it (so does a drag with [`keybinds::SLIDE_ALONG_LINE`] held, no key by
-//!   default: Alt + Shift switches Windows' keyboard layout); Ctrl turns them to where the grabbed
-//!   face or edge matches the target best (R: the next way), or slides the grabbed point level with
-//!   it (see [`hinge`]);
+//!   Alt is let go), its length written beside it in the editor's unit (see [`line_label`]; so is
+//!   the dashed line's from a first point to the mouse, to measure). With one of the line's points on
+//!   the moved bricks, [`keybinds::TYPE_LENGTH`] (Enter) types the length it should have, and
+//!   they slide along it to make it so (see [`typed_length`]). While there's a line, Alt + drag
+//!   turns the moved bricks about it instead, the grabbed point going round it as near the mouse
+//!   as it can, and Alt + a drag of the line key slides them along it (so does a drag with
+//!   [`keybinds::SLIDE_ALONG_LINE`] held, no key by default: Alt + Shift switches Windows'
+//!   keyboard layout); Ctrl turns them to where the grabbed face or edge matches the target best
+//!   (R: the next way), or slides the grabbed point level with it (see [`hinge`]). A turn's angle
+//!   shows past the grabbed point, in light purple; right after, [`keybinds::TYPE_LENGTH`] types
+//!   the angle it should have instead of the line's length, for [`TURN_LASTS`] or until the move
+//!   changes otherwise (see [`TurnedHinge`]): the same turn again from where the drag started, to
+//!   that angle, the way it was dragged;
 //! - releasing the button leaves the move going: a click ends it as usual (one undo step), the
 //!   gizmo still works meanwhile. The game's own brick snapping (to connectors) stays off for
 //!   these moves (`MoveMode::keep_snapping_off`), the gizmo's drags still have it.
@@ -104,6 +123,7 @@ mod draw;
 mod geometry;
 mod hinge;
 mod key_mode;
+mod line_label;
 mod line_tool;
 mod model;
 mod motion;
@@ -114,12 +134,14 @@ mod snap;
 mod spinner;
 mod spinner_curve;
 mod spinner_shape;
+mod typed_length;
 
 use std::collections::HashSet;
 use std::sync::{Mutex, Once, OnceLock, PoisonError, TryLockError};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use brickrust::ue::coreuobject::UObjectBase;
+use brickrust::ue::fname::FName;
 
 use super::editor_buttons::{self, Button, Click, Press};
 use super::keybinds;
@@ -148,6 +170,7 @@ use crate::prelude::*;
 use draw::{Drawing, PixelSize};
 use geometry::{Bounds, Frame, Ray, Vec3};
 use hinge::Hinge;
+use line_label::{LineLabels, Segment};
 use line_tool::LineTool;
 use model::{BrickModel, Element, Models};
 use motion::{Aim, Grab, Motion, Orientation};
@@ -155,6 +178,7 @@ use resize::{Grip, Resize};
 use scene::{Piece, Placed, Scene, View};
 use snap::Snapper;
 use spinner::{SpinnerBrick, SpinnerModels};
+use typed_length::Ready;
 
 /// Whether fast editing is on: the resize key ([`keybinds::RESIZE_BRICKS`]) is held, or, with the
 /// "Fast editing key" setting on "Tap to toggle", a tap of it has toggled it on (see [`key_mode`]).
@@ -194,6 +218,24 @@ static LOG_SNAPPING_ON: Once = Once::new();
 static LOG_TURNED: Once = Once::new();
 static LOG_HINGE: Once = Once::new();
 static LOG_SLID: Once = Once::new();
+static LOG_TYPED: Once = Once::new();
+static LOG_REFUSED: Once = Once::new();
+
+static LOG_FACE_TYPED: Once = Once::new();
+static LOG_FACE_CHANGED: Once = Once::new();
+
+/// What the label says when a length can't be typed (see [`typed_length`]): the line's, or over a
+/// brick's edge or corner; and for how long.
+const LINE_REFUSAL: &str = "Put one point on the moved bricks";
+const FACE_REFUSAL: &str = "Sizes are typed on faces";
+const REFUSAL_SHOWS: Duration = Duration::from_secs(3);
+/// How long a face dragged (or given a typed size) stays ready for its size to be typed.
+const FACE_LASTS: Duration = Duration::from_secs(10);
+/// How long a turn about the line (or one given a typed angle) stays ready for its angle to be
+/// typed; the line's length is typed again after.
+const TURN_LASTS: Duration = Duration::from_secs(10);
+static LOG_TURN_TYPED: Once = Once::new();
+static LOG_TURN_CHANGED: Once = Once::new();
 static LOG_CURSOR: Once = Once::new();
 static LOG_NO_PLACES: Once = Once::new();
 static LOG_NO_INTERFACE: Once = Once::new();
@@ -356,6 +398,21 @@ pub fn nearest_hovered_brick() -> Option<*mut UObjectBase> {
     }
     let (scene, hover) = (state.scene.as_ref()?, state.hover.as_ref()?);
     scene.get(hover.nearest).object.get_live()
+}
+
+/// A key the player's input got (`key`, `EInputEvent` `event`), before the game and the keybinds
+/// (called by `click_swap`'s hook): whether typing a line's length takes it (see
+/// [`typed_length`]), so that nothing else gets it.
+///
+/// # Safety
+/// `key` must be a valid name (of the live name pool). Game thread only.
+pub unsafe fn typed_key(key: &FName, event: i32) -> bool {
+    if !typed_length::is_listening() {
+        return false;
+    }
+    // SAFETY: per the contract.
+    let name = unsafe { crate::game::reflection::name_text(key) };
+    typed_length::key(&name, event)
 }
 
 /// Whether fast editing drags something now (a resize, a move, a spinner's handle). Game thread
@@ -532,6 +589,10 @@ struct Moving {
     /// The mirror plane's axis (0 to 2) while mirror mode is on: the moved bricks' counterparts
     /// move along, mirrored.
     mirror: Option<usize>,
+    /// Where the mouse was pressed (screen pixels), until it points anywhere else, by however
+    /// little: a click moves nothing (turning about a line, the grabbed point's nearest place to
+    /// the mouse is a hair off where it is).
+    pressed_at: Option<[f32; 2]>,
 }
 
 /// Which of the turns matching a snap's target the bricks take (see
@@ -577,6 +638,65 @@ struct Edited {
     rotation: Vector,
 }
 
+/// A face whose size can be typed (see [`typed_length`]): the one just dragged, or one hovered while
+/// fast editing when the box opened. A typed size resizes its brick again, as grabbed then (its
+/// mirror counterpart too).
+struct SizedFace {
+    editor: WeakObject,
+    resizing: Resizing,
+    /// Where the vehicle is: fast editing may be off meanwhile, nothing gathered.
+    vehicle: Frame,
+    /// The brick as it was left: if anything else changes it (an undo, a move), the face is
+    /// forgotten, as resizing it from how it was grabbed would undo that.
+    left: Left,
+    /// Since when it's ready (see [`FACE_LASTS`]).
+    since: Instant,
+    /// Whether its brick has been selected since: deselecting it then forgets the face.
+    selected: bool,
+}
+
+/// Where a brick is (location, rotation) and its size.
+type Left = (Vector, Vector, Vector);
+
+/// A turn about the line whose angle can be typed (see [`typed_length`]): the last drag's, while
+/// moving with the mouse free. A typed angle turns the moved bricks again from where that drag
+/// started, the way it was dragged (the move goes on: the game ends it).
+struct TurnedHinge {
+    /// The move mode it turned in.
+    mode: WeakObject,
+    /// The turn (its line, the grabbed point, how far turned and slid), and where the move put its
+    /// reference brick when the drag started.
+    hinge: Hinge,
+    start: Place,
+    /// Which way it was dragged (see [`Hinge::way`]): angles show and are typed that way.
+    way: f64,
+    /// Where the vehicle is: fast editing may be off meanwhile, nothing gathered.
+    vehicle: Frame,
+    /// The move as it was left (see [`MoveKey`]), taken the first frame after: if anything else
+    /// changes it (the gizmo, another drag), the turn is forgotten, as turning it from where the
+    /// drag started would undo that.
+    left: Option<MoveKey>,
+    /// Since when it's ready (see [`TURN_LASTS`]).
+    since: Instant,
+}
+
+/// What tells that a move changed: its own place and rotation, and the mouse's drag and turn on
+/// top (see [`Move`]).
+type MoveKey = (Vector, Vector, Vector, Vector);
+
+fn move_key(now: &Move) -> MoveKey {
+    (now.location, now.rotation, now.drag, now.turn)
+}
+
+/// A press of the type key that couldn't type a length, told for [`REFUSAL_SHOWS`].
+#[derive(Clone, Copy)]
+struct Refusal {
+    since: Instant,
+    /// Where: on the line's label, or at a point of a brick (in the vehicle).
+    at: Option<Vec3>,
+    text: &'static str,
+}
+
 /// What the scene was gathered for: the editor in its default mode (for resizing), or a move with
 /// the mouse free (for moving), as it was then.
 #[derive(PartialEq)]
@@ -601,6 +721,21 @@ struct State {
     spinner_models: Option<SpinnerModels>,
     /// The line moved bricks turn about or slide along, and placing it.
     line_tool: LineTool,
+    /// The lengths of the line and of the dashed one to a second point (see [`line_label`]).
+    line_labels: LineLabels,
+    /// The last press of the type key that couldn't type a length (see [`typed_length`]).
+    refused: Option<Refusal>,
+    /// The face whose size can be typed, and whether it was chosen for the box open (once open,
+    /// the face hovered doesn't take its place).
+    face: Option<SizedFace>,
+    face_open: bool,
+    /// Whether the last frame typed in a move (the line's length) or not (a face's size): when
+    /// that changes, the box closes rather than type for something else.
+    typing_moves: Option<bool>,
+    /// The last turn about the line, whose angle can be typed, and whether the type key is for it
+    /// (else for the line's length): when that changes, the box closes too.
+    turn: Option<TurnedHinge>,
+    typing_turn: bool,
     /// Whether the editor is in a move with the mouse free, where the line shows.
     line_shows: bool,
     /// The moved brick hovered when the line key went down with a line placed: a drag of the key
@@ -658,6 +793,13 @@ impl State {
             models: None,
             spinner_models: None,
             line_tool: LineTool::new(),
+            line_labels: LineLabels::new(),
+            refused: None,
+            face: None,
+            face_open: false,
+            typing_moves: None,
+            turn: None,
+            typing_turn: false,
             line_shows: false,
             slide_from: None,
             pivot_taken: false,
@@ -674,13 +816,15 @@ impl State {
     /// # Safety
     /// `editor` must be the live editor ticking. Game thread only.
     unsafe fn tick(&mut self, game: &Game, editor: *mut UObjectBase) {
-        key_mode::update();
+        let key_pressed = key_mode::update();
         let held = is_fast_editing();
         if !held
             && self.drag.is_none()
             && self.scene.is_none()
             && !self.drawn
             && self.line_tool.is_idle()
+            && self.face.is_none()
+            && self.turn.is_none()
         {
             return;
         }
@@ -729,10 +873,16 @@ impl State {
             let show_line = game.modes.moving(editor) == Some(editor_mode::Moving::Precisely);
             self.line_shows = show_line;
             let controller = game.editor.player_controller(editor);
+            if key_pressed {
+                // A game button hovered before keeps the keyboard: Enter would press it.
+                self.line_labels.give_keyboard_to_view(controller);
+            }
             // Where the vehicle is: from its bricks, else from when the line was placed.
             let vehicle = match &self.scene {
                 Some(scene) => Some(scene.vehicle),
-                None => self.line_tool.vehicle(),
+                None => (self.line_tool.vehicle())
+                    .or_else(|| self.face.as_ref().map(|face| face.vehicle))
+                    .or_else(|| self.turn.as_ref().map(|turn| turn.vehicle)),
             };
             let view = match vehicle {
                 Some(vehicle) if !controller.is_null() => {
@@ -770,6 +920,13 @@ impl State {
                 self.cycle_cross_section(game, editor, step);
             }
             self.place_line(game, view.as_ref(), held);
+            self.type_value(game, editor);
+            self.label(
+                game,
+                controller,
+                vehicle.as_ref(),
+                show_line && view.is_some(),
+            );
             self.draw(game, view.as_ref(), show_line);
         }
     }
@@ -854,6 +1011,444 @@ impl State {
                 self.line_tool.preview(scene, view, self.on_models)
             }
             _ => self.line_tool.stop_preview(),
+        }
+    }
+
+    /// Typing an exact length (see [`typed_length`]): what the type key does in the editor's mode
+    /// now, and applying a length committed. From the editor rather than from the gathered bricks:
+    /// the resize key is let go meanwhile (Alt + Enter is the engine's full screen key), and with
+    /// it held only is anything gathered.
+    ///
+    /// # Safety
+    /// `editor` must be the live editor. Game thread only.
+    unsafe fn type_value(&mut self, game: &Game, editor: *mut UObjectBase) {
+        // SAFETY: per the contract.
+        let wanted = unsafe { wanted(game, editor) };
+        let moves = wanted
+            .as_ref()
+            .map(|wanted| matches!(wanted, Gathered::Moving { .. }));
+        if moves != self.typing_moves {
+            typed_length::set_ready(Ready::No);
+            typed_length::take_committed();
+            self.typing_moves = moves;
+        }
+        // SAFETY: per the contract.
+        unsafe {
+            match wanted {
+                Some(Gathered::Moving { mode, now }) => {
+                    self.face = None;
+                    self.type_length(game, editor, mode, &now);
+                }
+                Some(Gathered::Editing) => {
+                    self.forget_turn();
+                    self.type_size(game, editor);
+                }
+                None => {
+                    self.face = None;
+                    self.forget_turn();
+                    typed_length::set_ready(Ready::No);
+                }
+            }
+        }
+        if !matches!(self.refused, Some(refusal) if refusal.since.elapsed() < REFUSAL_SHOWS) {
+            self.refused = None;
+        }
+    }
+
+    /// Tells that a press of the type key couldn't type a length (see [`Refusal`]).
+    fn refuse(&mut self, at: Option<Vec3>, text: &'static str) {
+        self.refused = Some(Refusal {
+            since: Instant::now(),
+            at,
+            text,
+        });
+        LOG_REFUSED.call_once(|| log!("a length can't be typed there: {text}"));
+    }
+
+    /// Typing the line's length while moving with the mouse free (the move mode `mode`, as it is
+    /// `now`): only with one of its points on the moved bricks. A length committed slides the moved
+    /// bricks along the line until the point on them is that far from the other.
+    ///
+    /// # Safety
+    /// `editor` must be the live editor, `mode` its move mode. Game thread only.
+    unsafe fn type_length(
+        &mut self,
+        game: &Game,
+        editor: *mut UObjectBase,
+        mode: *mut UObjectBase,
+        now: &Move,
+    ) {
+        // SAFETY: per the contract.
+        if unsafe { self.type_turn(game, editor, mode, now) } {
+            return;
+        }
+        let line = self.line_shows && self.drag.is_none() && self.line_tool.line().is_some();
+        // The moved bricks are the selected ones.
+        let moved_end = line
+            .then(|| {
+                self.line_tool
+                    // SAFETY: per the contract.
+                    .moved_end(|object| unsafe { is_selected_object(game, object) })
+            })
+            .flatten();
+        typed_length::set_ready(match (line, moved_end) {
+            (false, _) => Ready::No,
+            (true, None) => Ready::Refused,
+            (true, Some(_)) => Ready::Yes,
+        });
+        if typed_length::take_refused() {
+            self.refuse(None, LINE_REFUSAL);
+        }
+        typed_length::take_cancelled();
+        let (Some(index), Some(text)) = (moved_end, typed_length::take_committed()) else {
+            return;
+        };
+        let (Some(ends), Some(moves)) = (self.line_tool.ends(), game.moves) else {
+            return;
+        };
+        let (moved, other) = (ends[index], ends[1 - index]);
+        let away = geometry::sub(moved, other);
+        let now_length = geometry::length(away);
+        // SAFETY: per the contract.
+        let Some(length) = (unsafe { line_label::typed_length(&text, now_length) }) else {
+            log!("typed line length '{text}' isn't a length");
+            return;
+        };
+        // The moved point goes that far from the other one, along the line.
+        let direction = geometry::scale(away, 1.0 / now_length);
+        let to = geometry::add(other, geometry::scale(direction, length));
+        let shift = geometry::sub(to, moved);
+        let start = precise_moves::effective(mode, now);
+        let place = Place {
+            location: geometry::add(start.location, shift),
+            rotation: start.rotation,
+        };
+        // SAFETY: per the contract; the move mode is the editor's current one (just gathered).
+        unsafe {
+            if let Err(reason) = moves.keep_snapping_off(editor) {
+                LOG_SNAPPING_ON.call_once(|| {
+                    log!(
+                        "moved bricks may shift to connectors while the game's snapping is on: {reason}"
+                    )
+                });
+            }
+            precise_moves::place_move(moves, mode, place);
+        }
+        self.line_tool.move_end(index, to);
+        LOG_TYPED.call_once(|| log!("line length typed: {length:.3} cm, the moved bricks slid"));
+    }
+
+    /// Forgets the turn whose angle could be typed (out of the move it was in).
+    fn forget_turn(&mut self) {
+        self.turn = None;
+        self.typing_turn = false;
+    }
+
+    /// Typing the angle of the last turn about the line (see [`TurnedHinge`]) while moving with the
+    /// mouse free (the move mode `mode`, as it is `now`): while it's kept, it comes before the
+    /// line's length. Whether the type key is for it this frame (else the line's length).
+    ///
+    /// # Safety
+    /// `editor` must be the live editor, `mode` its move mode. Game thread only.
+    unsafe fn type_turn(
+        &mut self,
+        game: &Game,
+        editor: *mut UObjectBase,
+        mode: *mut UObjectBase,
+        now: &Move,
+    ) -> bool {
+        let open = typed_length::is_open();
+        // An angle typed just before (a click elsewhere commits the box) still applies.
+        let in_use = open || typed_length::has_committed();
+        if let Some(turn) = &mut self.turn {
+            let key = move_key(now);
+            let left = *turn.left.get_or_insert(key);
+            let there = turn.mode.is(mode) && left == key;
+            if !there {
+                LOG_TURN_CHANGED.call_once(|| {
+                    log!("a turn's angle can't be typed any more: the move changed otherwise")
+                });
+            }
+            if !there || !(in_use || turn.since.elapsed() < TURN_LASTS) {
+                self.turn = None;
+            }
+        }
+        let for_turn = self.turn.is_some() && self.drag.is_none() && self.line_shows;
+        if for_turn != self.typing_turn {
+            self.typing_turn = for_turn;
+            if open {
+                // The box was open for the line's length, or the turn is gone: it closes rather
+                // than type for the other.
+                typed_length::set_ready(Ready::No);
+                typed_length::take_committed();
+                return true;
+            }
+        }
+        if !for_turn {
+            return false;
+        }
+        typed_length::set_ready(Ready::Yes);
+        typed_length::take_refused();
+        if typed_length::take_cancelled() {
+            self.turn = None;
+            return true;
+        }
+        if let Some(text) = typed_length::take_committed() {
+            // SAFETY: per the contract.
+            unsafe { self.turn_to(game, editor, mode, &text) };
+        }
+        true
+    }
+
+    /// Turns the moved bricks about the kept turn's line to the angle `text` asks for (see
+    /// [`TurnedHinge`]), from where its drag started: the move's new place.
+    ///
+    /// # Safety
+    /// `editor` must be the live editor, `mode` its move mode. Game thread only.
+    unsafe fn turn_to(
+        &mut self,
+        game: &Game,
+        editor: *mut UObjectBase,
+        mode: *mut UObjectBase,
+        text: &str,
+    ) {
+        let (Some(turn), Some(moves)) = (&mut self.turn, game.moves) else {
+            return;
+        };
+        let shown = turn.hinge.turned * turn.way;
+        let Some(angle) = typed_formula::typed_angle(text, shown) else {
+            log!("typed angle '{text}' isn't an angle");
+            return;
+        };
+        turn.hinge.turned = angle * turn.way;
+        let motion = turn.hinge.motion();
+        let place = Place {
+            location: motion.point(turn.start.location),
+            rotation: motion.rotation * turn.start.rotation,
+        };
+        // SAFETY: per the contract; the move mode is the editor's current one (just gathered).
+        unsafe {
+            if let Err(reason) = moves.keep_snapping_off(editor) {
+                LOG_SNAPPING_ON.call_once(|| {
+                    log!(
+                        "moved bricks may shift to connectors while the game's snapping is on: {reason}"
+                    )
+                });
+            }
+            precise_moves::place_move(moves, mode, place);
+        }
+        // The move changed: it's taken as left again next frame.
+        turn.left = None;
+        turn.since = Instant::now();
+        LOG_TURN_TYPED
+            .call_once(|| log!("turn angle typed: {angle:.3} degrees, the bricks turned"));
+    }
+
+    /// Typing a face's size in the default mode (see [`SizedFace`]): the face hovered while fast
+    /// editing when the box opens, else the one kept (just dragged). A size committed resizes its
+    /// brick again.
+    ///
+    /// # Safety
+    /// `editor` must be the live editor. Game thread only.
+    unsafe fn type_size(&mut self, game: &Game, editor: *mut UObjectBase) {
+        let open = typed_length::is_open();
+        // Taken first: the face it's for stays while it's applied, however long typing took.
+        let committed = typed_length::take_committed();
+        if typed_length::take_cancelled() {
+            self.face = None;
+        }
+        if let Some(face) = &self.face {
+            // SAFETY: per the contract.
+            let there = unsafe { face.is_as_left(game, editor) };
+            if !there {
+                LOG_FACE_CHANGED.call_once(|| {
+                    log!("a face's size can't be typed any more: its brick changed (undone, moved)")
+                });
+            }
+            // SAFETY: on the game thread.
+            let selected = unsafe { is_selected_object(game, &face.resizing.brick.object) };
+            // A size typed just before (a click elsewhere commits the box) still applies.
+            let deselected = face.selected && !selected && committed.is_none();
+            let in_use = open || committed.is_some();
+            if !there || deselected || !(in_use || face.since.elapsed() < FACE_LASTS) {
+                self.face = None;
+            } else if let Some(face) = &mut self.face {
+                face.selected |= selected;
+            }
+        }
+        // What fast editing points at, unless something is dragged.
+        let hovered = self
+            .hover
+            .filter(|hover| self.drag.is_none() && hover.grip.is_some());
+        let hovered_face = hovered.filter(|hover| {
+            hover
+                .grip
+                .is_some_and(|grip| grip.part.dimensions_fixed() == 1)
+        });
+        if open
+            && !self.face_open
+            && let (Some(hover), Some(scene)) = (hovered_face, &self.scene)
+        {
+            // The box just opened over a face.
+            // SAFETY: per the contract.
+            if let Some(face) = unsafe { SizedFace::of_hover(game, scene, &hover) } {
+                self.face = Some(face);
+            }
+        }
+        self.face_open = open;
+        let ready = if self.drag.is_some() {
+            Ready::No
+        } else if self.face.is_some() || (!open && hovered_face.is_some()) {
+            Ready::Yes
+        } else if hovered.is_some() && !open {
+            // An edge or a corner.
+            Ready::Refused
+        } else {
+            Ready::No
+        };
+        typed_length::set_ready(ready);
+        if typed_length::take_refused() {
+            self.refuse(hovered.map(|hover| hover.point), FACE_REFUSAL);
+        }
+        if let Some(text) = committed {
+            // SAFETY: per the contract.
+            unsafe { self.size_face(game, &text) };
+        }
+    }
+
+    /// Gives the face kept the size `text` asks for (see [`SizedFace`]), as one editor operation
+    /// (one undo step).
+    ///
+    /// # Safety
+    /// Game thread only.
+    unsafe fn size_face(&mut self, game: &Game, text: &str) {
+        let Some(face) = &mut self.face else {
+            return;
+        };
+        let now = face.extent();
+        // SAFETY: per the contract.
+        let typed = unsafe { line_label::typed_length(text, now) };
+        let Some(extent) = typed.filter(|&extent| extent > 0.0) else {
+            log!("typed size '{text}' isn't a size");
+            return;
+        };
+        let (Some(size), Some(editor)) = (
+            face.resizing.resize.size_with_extent(extent),
+            face.editor.get(),
+        ) else {
+            return;
+        };
+        let size = math::narrow(size);
+        let resizing = &mut face.resizing;
+        // SAFETY: per the contract; the editor is live, the brick checked this frame.
+        unsafe {
+            game.editor.operation(editor, CHANGED, || {
+                apply(game, resizing, size, false);
+            });
+        }
+        resizing.asked = size;
+        let objects = resizing.objects();
+        // SAFETY: per the contract; `objects` are live.
+        if let Some(left) = objects
+            .first()
+            .and_then(|&object| unsafe { left(game, object) })
+        {
+            face.left = left;
+        }
+        face.since = Instant::now();
+        let kept = face.extent();
+        LOG_FACE_TYPED.call_once(|| {
+            log!("face size typed: {extent:.3} cm asked, {kept:.3} cm kept by the brick")
+        });
+        // SAFETY: per the contract.
+        unsafe { self.update_scene(game, &objects) };
+    }
+
+    /// Writes lengths over the view of `controller` (see [`line_label`]), with the vehicle at
+    /// `vehicle`: the line's and the dashed one's to a second point if they show (`show_line`), and
+    /// the size of a face dragged or kept (see [`SizedFace`]); hides them otherwise. While a length
+    /// is typed, a text box shows instead of its label (and how it closes goes to
+    /// [`typed_length`]); a moment after a refusal, why.
+    ///
+    /// # Safety
+    /// `controller` must be a live player controller or null. Game thread only.
+    unsafe fn label(
+        &mut self,
+        game: &Game,
+        controller: *mut UObjectBase,
+        vehicle: Option<&Frame>,
+        show_line: bool,
+    ) {
+        let open = typed_length::is_open();
+        // What the text box opens with, for a length typed.
+        let edit = |ends: [Vec3; 2]| {
+            let now = geometry::length(geometry::sub(ends[1], ends[0]));
+            // SAFETY: on the game thread.
+            open.then(|| unsafe { line_label::edit_text(now) })
+        };
+        let mut measured = Vec::new();
+        if show_line {
+            if let Some(ends) = self.line_tool.ends() {
+                let refusal = self.refused.filter(|refusal| refusal.at.is_none());
+                let text = refusal.map(|refusal| refusal.text.to_owned());
+                let mut line = Segment::line(ends, text);
+                if !self.typing_turn {
+                    line.edit = edit(ends);
+                }
+                measured.push(line);
+            }
+            if let Some(ends) = self.line_tool.dashed() {
+                measured.push(Segment::line(ends, None));
+            }
+            // The angle of a turn about the line: while dragging it, then while it can be typed.
+            let turned = match &self.drag {
+                Some(Drag {
+                    action: Action::Move(moving),
+                    ..
+                }) if !moving.slides() => moving.hinge.map(|hinge| (hinge, hinge.way())),
+                Some(_) => None,
+                None => self.turn.as_ref().map(|turn| (turn.hinge, turn.way)),
+            };
+            if let Some((hinge, way)) = turned {
+                let text = typed_formula::angle_text(hinge.turned * way);
+                let typing = open && self.typing_turn && self.drag.is_none();
+                let edit = typing.then(|| text.clone());
+                measured.push(Segment::angle(hinge.angle_ends(), text, edit));
+            }
+        }
+        let dragged = match &self.drag {
+            Some(Drag {
+                action: Action::Resize(resizing),
+                ..
+            }) => size_line(resizing),
+            _ => None,
+        };
+        if let Some(ends) = dragged {
+            measured.push(Segment::face(ends, None));
+        } else if let Some(ends) = self
+            .face
+            .as_ref()
+            .and_then(|face| size_line(&face.resizing))
+        {
+            measured.push(Segment::face(ends, edit(ends)));
+        }
+        if let Some(Refusal {
+            at: Some(at), text, ..
+        }) = self.refused
+        {
+            let mut refusal = Segment::face([at, at], None);
+            refusal.text = Some(text.to_owned());
+            refusal.spot = line_label::Spot::Beside;
+            measured.push(refusal);
+        }
+        let escape = typed_length::take_escaped() || keyboard::is_escape_down();
+        // SAFETY: per the contract.
+        let closed = unsafe {
+            self.line_labels
+                .show(&game.viewport, controller, &measured, vehicle, escape)
+        };
+        if let Some(closed) = closed {
+            typed_length::close(closed);
         }
     }
 
@@ -1001,6 +1596,7 @@ impl State {
         };
         if pressed {
             self.line_tool.cancel_press();
+            self.face = None;
         }
         pressed
     }
@@ -1021,65 +1617,27 @@ impl State {
             // SAFETY: per the contract.
             return grip.is_some_and(|grip| unsafe { self.press_spinner(game, grip) });
         }
-        let Some(grip) = hover.grip else {
+        // SAFETY: per the contract.
+        let Some((editor, resizing)) = (unsafe { resizing_of(game, scene, hover) }) else {
             return false;
         };
-        let placed = scene.get(hover.index);
-        let Some(object) = placed.object.get() else {
-            return false;
-        };
-        if !game.spawn.known() {
-            LOG_NO_PLACES
-                .call_once(|| log!("can't resize: where bricks keep their place wasn't found"));
-            return false;
-        }
-        // SAFETY: per the contract; `object` is a live scalable brick in the editor.
-        unsafe {
-            let editor = game.bricks.editor_of(object);
-            let Some(brick) = edited(game, object) else {
-                return false;
-            };
-            if editor.is_null() {
-                return false;
-            }
-            let counterpart = game.mirror.as_ref().and_then(|mirror| {
-                let axis = mirror.axis()?;
-                let other = game.code.mirrored_object(object)?;
-                (game.sizes.is_scalable(other)).then_some(())?;
-                Some((edited(game, other)?, axis))
-            });
-            let size = game.sizes.size(object);
-            LOG_RESIZED.call_once(|| {
-                log!(
-                    "resizing a brick by {} (size {size:?}, box {:?})",
-                    describe(hover.piece),
-                    placed.bounds
-                )
-            });
-            self.drag = Some(Drag {
-                editor: WeakObject::new(editor),
-                pointer: Pointer::new(hover.view.mouse),
-                snapper: Snapper::default(),
-                snap_key: SnapKey::default(),
-                held_by: HeldBy::Select,
-                action: Action::Resize(Resizing {
-                    brick,
-                    counterpart,
-                    resize: Resize {
-                        grip,
-                        frame: placed.frame,
-                        bounds: placed.bounds,
-                        size: math::widen(size),
-                        grab: placed.frame.local(hover.point),
-                    },
-                    piece: hover.piece,
-                    model: placed.model.clone(),
-                    asked: size,
-                    kept: math::widen(size),
-                    bounds: placed.bounds,
-                }),
-            });
-        }
+        LOG_RESIZED.call_once(|| {
+            log!(
+                "resizing a brick by {} (size {:?}, box {:?})",
+                describe(hover.piece),
+                resizing.asked,
+                resizing.bounds
+            )
+        });
+        self.drag = Some(Drag {
+            // SAFETY: a live editor (just found).
+            editor: unsafe { WeakObject::new(editor) },
+            pointer: Pointer::new(hover.view.mouse),
+            snapper: Snapper::default(),
+            snap_key: SnapKey::default(),
+            held_by: HeldBy::Select,
+            action: Action::Resize(resizing),
+        });
         true
     }
 
@@ -1264,6 +1822,8 @@ impl State {
             turn: TurnChoice::default(),
             // SAFETY: per the contract.
             mirror: unsafe { mirror_axis(game) },
+            // Where the drag's pointer starts.
+            pressed_at: Some(hover.view.mouse),
         };
         self.drag = Some(Drag {
             // SAFETY: the editor is live.
@@ -1349,11 +1909,12 @@ impl State {
             drag.snapper.stop();
         }
         let snapper = snapping.then_some(&mut drag.snapper);
+        let still = is_still(drag.pointer.start(), view.mouse);
         // SAFETY: per the contract.
         let going = unsafe {
             match &mut drag.action {
                 Action::Resize(resizing) => {
-                    follow_resize(game, scene, resizing, snapper, view, models)
+                    follow_resize(game, scene, resizing, snapper, view, models, still)
                 }
                 Action::Move(moving) => {
                     follow_move(game, editor, scene, moving, snapper, view, models)
@@ -1387,13 +1948,34 @@ impl State {
             Action::Curve(editing) => editing.changed(),
         };
         if !changed {
-            // A click without a drag.
+            // A click without a drag: a face clicked can have its size typed next.
+            if let (Action::Resize(resizing), Some(editor), Some(scene)) =
+                (drag.action, drag.editor.get(), &self.scene)
+            {
+                let vehicle = scene.vehicle;
+                // SAFETY: per the contract; the editor is live.
+                self.face = unsafe { SizedFace::new(game, editor, resizing, vehicle) };
+            }
             return;
         }
         if let Action::Move(moving) = &drag.action
-            && moving.hinge.is_some()
+            && let Some(hinge) = moving.hinge
         {
             self.line_tool.drag_done();
+            // A turn's angle can be typed next (not a slide's).
+            let vehicle = self.scene.as_ref().map(|scene| scene.vehicle);
+            self.turn = match vehicle {
+                Some(vehicle) if hinge.turned != 0.0 => Some(TurnedHinge {
+                    mode: moving.mode,
+                    hinge,
+                    start: moving.start,
+                    way: hinge.way(),
+                    vehicle,
+                    left: None,
+                    since: Instant::now(),
+                }),
+                _ => None,
+            };
         }
         LOG_CURSOR.call_once(|| {
             log!(
@@ -1532,16 +2114,10 @@ impl State {
             game.editor.operation(editor, CHANGED, || {
                 apply(game, &mut resizing, size, false);
             });
-            let counterpart = resizing
-                .counterpart
-                .as_ref()
-                .map(|(other, _)| &other.object);
-            let objects: Vec<*mut UObjectBase> = [Some(&resizing.brick.object), counterpart]
-                .into_iter()
-                .flatten()
-                .filter_map(WeakObject::get)
-                .collect();
-            self.update_scene(game, &objects);
+            self.update_scene(game, &resizing.objects());
+            // Its size can be typed next, if it's a face's.
+            let vehicle = self.scene.as_ref().map(|scene| scene.vehicle);
+            self.face = vehicle.and_then(|vehicle| SizedFace::new(game, editor, resizing, vehicle));
         }
     }
 
@@ -1573,7 +2149,8 @@ impl State {
     /// What shows with the mouse at `view`: the line (if `show_line`), and what's pointed at or
     /// dragged.
     fn lines(&self, view: &View, show_line: bool) -> Vec<line_batcher::Line> {
-        let vehicle = match (&self.scene, self.line_tool.vehicle()) {
+        let face_vehicle = self.face.as_ref().map(|face| face.vehicle);
+        let vehicle = match (&self.scene, self.line_tool.vehicle().or(face_vehicle)) {
             (Some(scene), _) => scene.vehicle,
             (None, Some(vehicle)) => vehicle,
             (None, None) => return Vec::new(),
@@ -1581,6 +2158,12 @@ impl State {
         let mut drawing = Drawing::new(view.pixels, vehicle);
         if show_line {
             self.line_tool.draw(&mut drawing);
+        }
+        // The face whose size is typed.
+        if let Some(face) = &self.face
+            && typed_length::is_open()
+        {
+            draw_resizing(&mut drawing, &face.resizing);
         }
         let Some(scene) = &self.scene else {
             return drawing.into_lines();
@@ -1721,8 +2304,159 @@ unsafe fn wanted(game: &Game, editor: *mut UObjectBase) -> Option<Gathered> {
     }
 }
 
+impl Resizing {
+    /// The live bricks resized: the brick, and its counterpart.
+    fn objects(&self) -> Vec<*mut UObjectBase> {
+        let counterpart = self.counterpart.as_ref().map(|(other, _)| &other.object);
+        [Some(&self.brick.object), counterpart]
+            .into_iter()
+            .flatten()
+            .filter_map(WeakObject::get)
+            .collect()
+    }
+}
+
+impl SizedFace {
+    /// The face `hover` is on (in the scene), its brick as it is now; `None` if it can't be resized,
+    /// or it's not a face.
+    ///
+    /// # Safety
+    /// Game thread only.
+    unsafe fn of_hover(game: &Game, scene: &Scene, hover: &Hover) -> Option<Self> {
+        // SAFETY: per the contract.
+        unsafe {
+            let (editor, resizing) = resizing_of(game, scene, hover)?;
+            Self::new(game, editor, resizing, scene.vehicle)
+        }
+    }
+
+    /// The face `resizing` grabbed, in `editor`, the vehicle at `vehicle`; `None` if it's not a
+    /// face, or its brick is gone.
+    ///
+    /// # Safety
+    /// `editor` must be a live editor. Game thread only.
+    unsafe fn new(
+        game: &Game,
+        editor: *mut UObjectBase,
+        resizing: Resizing,
+        vehicle: Frame,
+    ) -> Option<Self> {
+        resizing.resize.axis()?;
+        let object = resizing.brick.object.get()?;
+        // SAFETY: per the contract; the brick is live.
+        unsafe {
+            Some(Self {
+                editor: WeakObject::new(editor),
+                left: left(game, object)?,
+                selected: is_selected_object(game, &resizing.brick.object),
+                resizing,
+                vehicle,
+                since: Instant::now(),
+            })
+        }
+    }
+
+    /// Whether its brick is still in `editor`, as it was left.
+    ///
+    /// # Safety
+    /// Game thread only.
+    unsafe fn is_as_left(&self, game: &Game, editor: *mut UObjectBase) -> bool {
+        let Some(object) = self.resizing.brick.object.get() else {
+            return false;
+        };
+        // SAFETY: per the contract; the brick is live.
+        self.editor.is(editor) && unsafe { left(game, object) } == Some(self.left)
+    }
+
+    /// Its size now (cm): the box's along its axis.
+    fn extent(&self) -> f64 {
+        let axis = self.resizing.resize.axis();
+        axis.map_or(0.0, |axis| self.resizing.bounds.extent(axis))
+    }
+}
+
+/// Where `object` is and its size (see [`SizedFace::left`]).
+///
+/// # Safety
+/// `object` must be a live scalable brick. Game thread only.
+unsafe fn left(game: &Game, object: *mut UObjectBase) -> Option<Left> {
+    // SAFETY: per the contract.
+    unsafe {
+        let place = game.spawn.of(object)?;
+        Some((place.location, place.rotation, game.sizes.size(object)))
+    }
+}
+
+/// The line showing a resized face's size (in the vehicle): through the box's middle, from the
+/// opposite side to the face's. `None` if it's not a face (see [`Resize::axis`]).
+fn size_line(resizing: &Resizing) -> Option<[Vec3; 2]> {
+    let resize = &resizing.resize;
+    let axis = resize.axis()?;
+    let side = resize.grip.part.sides[axis];
+    let ends = [-side, side].map(|side| {
+        let mut sides = [0; 3];
+        sides[axis] = side;
+        resize.frame.point(resizing.bounds.point(sides))
+    });
+    Some(ends)
+}
+
+/// Resizing the brick `hover` is on (in the scene) by its grip, from how it is now, and the editor
+/// it's in: what a press starts, or a typed size changes. `None` if it can't be resized.
+///
+/// # Safety
+/// Game thread only.
+unsafe fn resizing_of(
+    game: &Game,
+    scene: &Scene,
+    hover: &Hover,
+) -> Option<(*mut UObjectBase, Resizing)> {
+    let grip = hover.grip?;
+    let placed = scene.get(hover.index);
+    let object = placed.object.get()?;
+    if !game.spawn.known() {
+        LOG_NO_PLACES
+            .call_once(|| log!("can't resize: where bricks keep their place wasn't found"));
+        return None;
+    }
+    // SAFETY: per the contract; `object` is a live scalable brick in the editor.
+    unsafe {
+        let editor = game.bricks.editor_of(object);
+        let brick = edited(game, object)?;
+        if editor.is_null() {
+            return None;
+        }
+        let counterpart = game.mirror.as_ref().and_then(|mirror| {
+            let axis = mirror.axis()?;
+            let other = game.code.mirrored_object(object)?;
+            (game.sizes.is_scalable(other)).then_some(())?;
+            Some((edited(game, other)?, axis))
+        });
+        let size = game.sizes.size(object);
+        let resizing = Resizing {
+            brick,
+            counterpart,
+            resize: Resize {
+                grip,
+                frame: placed.frame,
+                bounds: placed.bounds,
+                size: math::widen(size),
+                grab: placed.frame.local(hover.point),
+            },
+            piece: hover.piece,
+            model: placed.model.clone(),
+            asked: size,
+            kept: math::widen(size),
+            bounds: placed.bounds,
+        };
+        Some((editor, resizing))
+    }
+}
+
 /// Resizes the brick for the mouse, snapped with a `snapper` (while snapping, see [`SnapKey`]);
-/// false once it can't be.
+/// false once it can't be. With the mouse `still` where it was pressed (see [`is_still`]), the
+/// brick has its size as grabbed, exactly: the ray found again through the grabbed point lands a
+/// float's rounding away from it, which would change the size by as much.
 ///
 /// # Safety
 /// Game thread only.
@@ -1733,7 +2467,17 @@ unsafe fn follow_resize(
     snapper: Option<&mut Snapper>,
     view: &View,
     models: bool,
+    still: bool,
 ) -> bool {
+    if still {
+        let grabbed = math::narrow(resizing.resize.size);
+        if grabbed == resizing.asked {
+            return true;
+        }
+        resizing.asked = grabbed;
+        // SAFETY: per the contract.
+        return unsafe { apply(game, resizing, grabbed, true) };
+    }
     let sides = if let Some(snapper) = snapper {
         // The resized bricks are left out: they move.
         let counterpart = resizing
@@ -1766,6 +2510,13 @@ unsafe fn follow_resize(
     resizing.asked = size;
     // SAFETY: per the contract.
     unsafe { apply(game, resizing, size, true) }
+}
+
+/// Whether a drag pressed at `start` points at `now` (screen pixels) still: within the pixel it was
+/// pressed in, not moved by a whole one either way. A mouse's smallest step can be less than a
+/// pixel.
+fn is_still(start: [f32; 2], now: [f32; 2]) -> bool {
+    (now[0] - start[0]).abs() < 0.5 && (now[1] - start[1]).abs() < 0.5
 }
 
 /// Changes the spinner for the mouse, snapped with a `snapper` (while snapping, see [`SnapKey`]);
@@ -1902,6 +2653,12 @@ unsafe fn follow_move(
     };
     if !still {
         return false;
+    }
+    if let Some(pressed_at) = moving.pressed_at {
+        if view.mouse == pressed_at {
+            return true;
+        }
+        moving.pressed_at = None;
     }
     let pressed = moving.turn.pressed(keybinds::NEXT_ORIENTATION.is_held());
     let motion = if moving.hinge.is_some() {
@@ -2235,7 +2992,16 @@ unsafe fn project(
 /// # Safety
 /// Game thread only.
 unsafe fn is_selected(game: &Game, placed: &Placed) -> bool {
-    let (Some(selection), Some(object)) = (&game.selection, placed.object.get()) else {
+    // SAFETY: per the contract.
+    unsafe { is_selected_object(game, &placed.object) }
+}
+
+/// Whether `object` is still there and selected in the editor (false if that can't be told).
+///
+/// # Safety
+/// Game thread only.
+unsafe fn is_selected_object(game: &Game, object: &WeakObject) -> bool {
+    let (Some(selection), Some(object)) = (&game.selection, object.get()) else {
         return false;
     };
     // SAFETY: per the contract; the weak pointer resolved to a live editor object.

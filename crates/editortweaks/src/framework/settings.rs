@@ -3,13 +3,15 @@
 //! the game's own config files.
 //!
 //! A feature declares each setting as a `static` next to the code it changes ([`Toggle`],
-//! [`Choice`], [`Count`]) and reads it where it uses it, so a change applies at once. Which settings the menu
+//! [`Choice`], [`Count`], or [`Note`] for something the mod remembers rather than a choice) and
+//! reads it where it uses it, so a change applies at once. Which settings the menu
 //! shows, and in what order, is listed in `features::SETTINGS`.
 
 use std::borrow::Cow;
 use std::fs;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, Ordering};
+use std::sync::{Mutex, PoisonError};
 
 /// A setting that is on or off.
 pub struct Toggle {
@@ -140,12 +142,48 @@ impl Count {
     }
 }
 
+/// A short line of text the mod remembers (e.g. the update not to remind about again), kept in
+/// `EditorTweaks.ini` only: never in the menu's `settings`, only a section's `unlisted`.
+pub struct Note {
+    /// Its key in `EditorTweaks.ini`: never rename it, or players lose what it remembered.
+    pub key: &'static str,
+    /// What it is, for whoever reads the code (the menu never shows it).
+    pub description: &'static str,
+    value: Mutex<String>,
+}
+
+impl Note {
+    /// Starts empty.
+    pub const fn new(key: &'static str, description: &'static str) -> Self {
+        Self {
+            key,
+            description,
+            value: Mutex::new(String::new()),
+        }
+    }
+
+    pub fn get(&self) -> String {
+        self.value
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+
+    /// Remembers `value`, made one line (`EditorTweaks.ini` holds one value per line).
+    pub fn set(&self, value: &str) {
+        let line = value.lines().next().unwrap_or_default().trim();
+        *self.value.lock().unwrap_or_else(PoisonError::into_inner) = line.to_owned();
+    }
+}
+
 /// A setting of any kind.
 #[derive(Clone, Copy)]
 pub enum Setting {
     Toggle(&'static Toggle),
     Choice(&'static Choice),
     Count(&'static Count),
+    /// Only in a section's `unlisted`: the menu can't show it.
+    Note(&'static Note),
 }
 
 impl Setting {
@@ -154,6 +192,7 @@ impl Setting {
             Setting::Toggle(toggle) => toggle.key,
             Setting::Choice(choice) => choice.key,
             Setting::Count(count) => count.key,
+            Setting::Note(note) => note.key,
         }
     }
 
@@ -162,6 +201,7 @@ impl Setting {
             Setting::Toggle(toggle) => toggle.name,
             Setting::Choice(choice) => choice.name,
             Setting::Count(count) => count.name,
+            Setting::Note(note) => note.key,
         }
     }
 
@@ -170,6 +210,7 @@ impl Setting {
             Setting::Toggle(toggle) => toggle.description,
             Setting::Choice(choice) => choice.description,
             Setting::Count(count) => count.description,
+            Setting::Note(note) => note.description,
         }
     }
 
@@ -180,6 +221,7 @@ impl Setting {
             Setting::Toggle(_) => "False".into(),
             Setting::Choice(choice) => choice.options[usize::from(choice.get())].key.into(),
             Setting::Count(count) => count.get().to_string().into(),
+            Setting::Note(note) => note.get().into(),
         }
     }
 
@@ -213,6 +255,10 @@ impl Setting {
                 }
                 Err(_) => false,
             },
+            Setting::Note(note) => {
+                note.set(saved);
+                true
+            }
         }
     }
 }

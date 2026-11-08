@@ -6,7 +6,10 @@
 //! slide to where the grabbed point is level with it ([`Hinge::slide_to`]).
 //!
 //! Turning about a line and sliding along it leave the line where it is, and one doesn't change the
-//! other: the bricks' motion is both ([`Hinge::motion`]), each as it was last set.
+//! other: the bricks' motion is both ([`Hinge::motion`]), each as it was last set. The turn's angle
+//! shows past the grabbed point ([`Hinge::angle_ends`]), and can be typed after the drag (see
+//! `brick_resize`'s `TurnedHinge`): the same turn again, to that angle, the way it was dragged
+//! ([`Hinge::way`]).
 
 use core::f64::consts::PI;
 
@@ -119,6 +122,23 @@ impl Hinge {
         }
         .motion()
         .point(self.point)
+    }
+
+    /// Where the turn's angle shows (see `super::line_label`): from the middle of the circle the
+    /// grabbed point goes round on to the grabbed point now (turned and slid), the label past it.
+    pub fn angle_ends(&self) -> [Vec3; 2] {
+        let point = self.around(self.turned);
+        let line = &self.line;
+        let along = geometry::dot(geometry::sub(point, line.point), line.direction);
+        let middle = geometry::add(line.point, geometry::scale(line.direction, along));
+        [middle, point]
+    }
+
+    /// Which way it's turned: 1 right-handed about the line's direction (or not turned), -1 the
+    /// other way. Angles show multiplied by it, as how far it turned whichever way: the line's
+    /// direction is only which of its points was placed first.
+    pub fn way(&self) -> f64 {
+        if self.turned < 0.0 { -1.0 } else { 1.0 }
     }
 
     /// The turn (degrees) taking the grabbed point round the line to where it shows nearest the

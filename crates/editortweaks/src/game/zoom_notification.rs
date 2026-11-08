@@ -22,6 +22,7 @@ use crate::framework::sig::FunctionSig;
 use crate::game::kismet::{self, Names, Texts};
 use crate::game::reflection::{self, Function, Parameters};
 use crate::game::text::Text;
+use crate::game::ui_library::{self, NumberText};
 use crate::game::world;
 
 /// `void UGameOverlayWidget::OnCameraZoomRatioChanged(float NewZoomRatio)` (BRMK 0x338F00, game RVA
@@ -128,7 +129,12 @@ pub struct ZoomNotification {
     /// `UTextBlock::SetText(FText InText)`, and where `InText` goes.
     set_text: Function,
     set_text_value: usize,
-    numbers: NumberToText,
+    /// `UUIFunctionLibrary::NumberToText` (reflected; see `game::ui_library`), and the value
+    /// types used with it here: `ENumericValueType::Percent` and `ENumericValueType::DistanceAuto`
+    /// (metric or imperial, as the player chose).
+    numbers: NumberText,
+    percent: u8,
+    distance: u8,
     texts: Texts,
 }
 
@@ -136,22 +142,6 @@ pub struct ZoomNotification {
 // thread.
 unsafe impl Send for ZoomNotification {}
 unsafe impl Sync for ZoomNotification {}
-
-/// `UUIFunctionLibrary::NumberToText` (reflected; see `game::ui_library`), as the notification
-/// uses it, and the value types it's used with here.
-struct NumberToText {
-    library: *mut UObjectBase,
-    function: Function,
-    value: usize,
-    value_type: usize,
-    decimals: usize,
-    units: usize,
-    result: usize,
-    /// `ENumericValueType::Percent` and `ENumericValueType::DistanceAuto` (metric or imperial,
-    /// as the player chose).
-    percent: u8,
-    distance: u8,
-}
 
 /// Finds the notification's parts. After engine init.
 pub fn find(code: ZoomCode) -> Result<ZoomNotification, String> {
@@ -178,33 +168,10 @@ pub fn find(code: ZoomCode) -> Result<ZoomNotification, String> {
         text_block: object(class("HUDNotificationWidget")?, "TextBlock")?,
         set_text_value: set_text.parameter("InText", "TextProperty", text)?,
         set_text,
-        numbers: number_to_text()?,
+        numbers: ui_library::number_text()?,
+        percent: ui_library::value_type("Percent")?,
+        distance: ui_library::value_type("DistanceAuto")?,
         texts: kismet::texts()?,
-    })
-}
-
-fn number_to_text() -> Result<NumberToText, String> {
-    let class =
-        reflection::find_class("UIFunctionLibrary").ok_or("class UIFunctionLibrary not found")?;
-    // SAFETY: a live class.
-    let library = unsafe { reflection::default_object(class) }
-        .ok_or("UIFunctionLibrary has no default object")?;
-    let function = Function::find(class, "NumberToText")?;
-    let value_type = |entry: &str| {
-        let value =
-            reflection::enum_value("ENumericValueType", &format!("ENumericValueType::{entry}"))?;
-        u8::try_from(value).map_err(|_| format!("ENumericValueType::{entry} is {value}"))
-    };
-    Ok(NumberToText {
-        library,
-        value: function.parameter("Value", "FloatProperty", 4)?,
-        value_type: function.parameter("ValueType", "EnumProperty", 1)?,
-        decimals: function.parameter("MaxFractionalDigits", "IntProperty", 4)?,
-        units: function.parameter("bIncludeUnits", "BoolProperty", 1)?,
-        result: function.parameter("ReturnValue", "TextProperty", size_of::<Text>() as i32)?,
-        function,
-        percent: value_type("Percent")?,
-        distance: value_type("DistanceAuto")?,
     })
 }
 
@@ -312,7 +279,7 @@ impl ZoomNotification {
     /// Game thread only.
     pub unsafe fn ratio_text(&self, ratio: f32) -> String {
         // SAFETY: per the contract.
-        unsafe { self.number(ratio, self.numbers.percent, 0, false) }
+        unsafe { self.numbers.text(ratio, self.percent, 0, false) }
     }
 
     /// A distance of `cm` in the player's units (metric or imperial), with the unit and at most
@@ -322,27 +289,7 @@ impl ZoomNotification {
     /// Game thread only.
     pub unsafe fn distance_text(&self, cm: f32, decimals: i32) -> String {
         // SAFETY: per the contract.
-        unsafe { self.number(cm, self.numbers.distance, decimals, true) }
-    }
-
-    /// `NumberToText(value, value_type, decimals, units)`.
-    ///
-    /// # Safety
-    /// Game thread only.
-    unsafe fn number(&self, value: f32, value_type: u8, decimals: i32, units: bool) -> String {
-        let numbers = &self.numbers;
-        let mut parameters = Parameters::new();
-        // SAFETY: on the game thread; each value goes to its parameter's reflected offset, the
-        // others stay zero (false). The result is a new text, ours to release.
-        unsafe {
-            reflection::put(&mut parameters, numbers.value, value);
-            reflection::put(&mut parameters, numbers.value_type, value_type);
-            reflection::put(&mut parameters, numbers.decimals, decimals);
-            reflection::put(&mut parameters, numbers.units, units);
-            numbers.function.call(numbers.library, &mut parameters);
-            self.texts
-                .string(reflection::take::<Text>(&parameters, numbers.result))
-        }
+        unsafe { self.numbers.text(cm, self.distance, decimals, true) }
     }
 }
 

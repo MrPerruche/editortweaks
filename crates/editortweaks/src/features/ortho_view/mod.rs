@@ -25,7 +25,10 @@
 //! - Temporal AA's jitter stops while the view is orthographic: it moves a perspective view by less
 //!   than a pixel, but an orthographic one by its depth in cm times that, so with the game's TAA
 //!   setting the view would seem to jump around every frame (`docs/re/editor-camera.md`,
-//!   "Temporal AA"). Edges aren't smoothed by TAA meanwhile.
+//!   "Temporal AA"). Edges aren't smoothed by TAA meanwhile. Temporal upsampling (TAA's, DLSS, FSR)
+//!   jitters whatever the samples, by its first place, which leant everything by its depth while
+//!   the selection outline (drawn unjittered, the game's `r.CustomDepthTemporalAAJitter=False`)
+//!   stayed: the renderer's orthographic views (`game::scene_view`) aren't let jitter either.
 //! - The game's zoom notification says which view it is: "Perspective" and the zoom (0 to 100), or
 //!   "Orthographic" and the view's width, at each zoom step and each switch (`Label`).
 //! - Leaving the editor switches back to perspective at once: the game's view of the vehicle or
@@ -41,7 +44,8 @@
 //! after the view target made its view, the editor's view becomes what it should be (the camera
 //! moved around what it turns around), the gizmo is sized for it (the game sizes it by the last
 //! frame's view), and the sky is shrunk or put back (whatever the view target: it's back as soon as
-//! the editor isn't viewed). The zoom steps are the editor input's reflected
+//! the editor isn't viewed). The renderer's views' constructor (`FSceneView::FSceneView`) is hooked
+//! to clear their jitter flag. The zoom steps are the editor input's reflected
 //! `Action_ZoomInStep`/`Action_ZoomOutStep`, their thunks hooked. The overlay's
 //! `OnCameraZoomRatioChanged` is hooked to label the game's zoom notification while the editor is
 //! viewed (`game::zoom_notification`); the orthographic zoom steps and the switches show it
@@ -52,6 +56,7 @@ mod blend;
 mod probe;
 
 use core::ffi::c_void;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock, PoisonError, TryLockError};
 use std::time::{Duration, Instant};
 
@@ -69,6 +74,7 @@ use crate::game::editor_object::Vector;
 use crate::game::line_trace::{self, LineTrace};
 use crate::game::reflection::NativeThunk;
 use crate::game::scene_component::{self, SceneComponent};
+use crate::game::scene_view::{self, ConstructorFn, SceneViewCode};
 use crate::game::viewport::{self, Viewport};
 use crate::game::weak_object::WeakObject;
 use crate::game::world_sky::{self, WorldSky};
@@ -113,7 +119,15 @@ static ORIGINAL: OnceLock<ApplyCameraModifiersFn> = OnceLock::new();
 static ORIGINAL_ZOOM_IN: OnceLock<NativeThunk> = OnceLock::new();
 static ORIGINAL_ZOOM_OUT: OnceLock<NativeThunk> = OnceLock::new();
 static ORIGINAL_ZOOM_CHANGED: OnceLock<ZoomChangedFn> = OnceLock::new();
+static ORIGINAL_SCENE_VIEW: OnceLock<ConstructorFn> = OnceLock::new();
+/// What the renderer's views' constructor tells, found at load.
+static SCENE_VIEW: OnceLock<SceneViewCode> = OnceLock::new();
+/// The editor's view is orthographic (at its last frame): the renderer's orthographic views get no
+/// temporal AA jitter ([`scene_view_made`]).
+static ORTHOGRAPHIC: AtomicBool = AtomicBool::new(false);
 static ZOOM_LISTENERS: Mutex<Vec<ZoomListener>> = Mutex::new(Vec::new());
+/// The editor's camera was put somewhere else since the last frame ([`camera_placed`]).
+static PLACED: AtomicBool = AtomicBool::new(false);
 /// What the editor's code tells, found at load.
 static CODE: OnceLock<EditorCode> = OnceLock::new();
 /// Set once reflection is available; until then (or if it fails) the view stays the game's.
@@ -244,8 +258,13 @@ impl Feature for OrthoView {
                 target,
                 apply_camera_modifiers as ApplyCameraModifiersFn,
                 &ORIGINAL,
-            )
+            )?;
         }
+        optional(
+            hook_scene_views(),
+            "with temporal upsampling (TAA's, DLSS, FSR) the orthographic view leans by depth",
+        );
+        Ok(())
     }
 
     fn on_engine_init(&self) {
@@ -271,6 +290,13 @@ pub fn listen_zoom_steps(listener: ZoomListener) {
         .lock()
         .unwrap_or_else(PoisonError::into_inner)
         .push(listener);
+}
+
+/// Tells the orthographic view that the editor's camera was just put somewhere else (place and
+/// angle, e.g. a camera brick's view): its next frame takes it as a new start, not as a turn, which
+/// would swing the camera around what the view turned around before.
+pub fn camera_placed() {
+    PLACED.store(true, Ordering::Relaxed);
 }
 
 /// Finds the parts and hooks the zoom steps and the zoom notification.
@@ -348,6 +374,41 @@ fn engine_init() -> Result<(), String> {
         );
     }
     Ok(())
+}
+
+/// Hooks the constructor of the renderer's views, for [`scene_view_made`].
+fn hook_scene_views() -> Result<(), String> {
+    let code = scene_view::code()?;
+    let _ = SCENE_VIEW.set(code);
+    // SAFETY: the target is FSceneView's constructor's start, and the detour has its signature.
+    unsafe {
+        hook::install_typed(
+            scene_view::CONSTRUCTOR.name,
+            code.constructor,
+            scene_view_made as ConstructorFn,
+            &ORIGINAL_SCENE_VIEW,
+        )
+    }
+}
+
+/// Each view made for the renderer (the player's, scene captures', ...): while the editor's view is
+/// orthographic, an orthographic one isn't jittered by temporal AA (see the module's
+/// documentation). May run on any thread: it only reads an atomic and the view being made.
+unsafe extern "C" fn scene_view_made(view: *mut u8, options: *const u8) -> *mut u8 {
+    let _span = timings::span("ortho_view::scene_view_made");
+    let original = *ORIGINAL_SCENE_VIEW.get().expect("hook recorded before use");
+    // SAFETY: the game's own arguments: the view being made and the options it's made from. It
+    // isn't given to the renderer before the constructor returns.
+    unsafe {
+        let made = timings::game(scene_view::CONSTRUCTOR.name, || original(view, options));
+        if ORTHOGRAPHIC.load(Ordering::Relaxed)
+            && let Some(code) = SCENE_VIEW.get()
+            && scene_view::is_orthographic(options)
+        {
+            code.stop_jitter(view);
+        }
+        made
+    }
 }
 
 /// `found`, or `None` after logging why it's missing and what that means.
@@ -552,6 +613,7 @@ impl Parts {
                 .of(manager, view)
                 .filter(|&target| self.editor.is_editor(target));
             let Some(editor) = editor else {
+                ORTHOGRAPHIC.store(false, Ordering::Relaxed);
                 state.editor_viewed = false;
                 state.last = None;
                 state.pan = [0.0; 2];
@@ -580,6 +642,9 @@ impl Parts {
                     .and_then(|controller| self.viewport.size(controller))
                     .map(|[width, height]| [width as f32, height as f32]),
             };
+            if PLACED.swap(false, Ordering::Relaxed) {
+                self.placed(state, &frame);
+            }
             let held = keybinds::ORTHO_VIEW.is_held();
             if held && !state.key_held {
                 self.switch(state, &mut frame);
@@ -626,7 +691,9 @@ impl Parts {
                     }
                 }
             }
-            if matches!(state.mode, Mode::Orthographic) {
+            let orthographic = matches!(state.mode, Mode::Orthographic);
+            ORTHOGRAPHIC.store(orthographic, Ordering::Relaxed);
+            if orthographic {
                 self.stop_jitter(state, frame.editor);
             } else {
                 state.last = None;
@@ -656,10 +723,11 @@ impl Parts {
             let variable = |name| jitter.variables.float(name);
             log!(
                 "temporal AA's jitter stopped ({samples} samples before; AA method {:?}, \
-                 upsampling {:?}, screen percentage {:?})",
+                 upsampling {:?}, screen percentage {:?}; the views themselves unjittered: {})",
                 variable("r.DefaultFeature.AntiAliasing"),
                 variable("r.TemporalAA.Upsampling"),
                 variable("r.ScreenPercentage"),
+                ORIGINAL_SCENE_VIEW.get().is_some(),
             );
         }
     }
@@ -822,6 +890,22 @@ impl Parts {
         // SAFETY: per the contract; the editor is a live actor in the world.
         let hit = unsafe { trace.first_hit(frame.editor, narrow(frame.location), narrow(end)) }?;
         hit.is_brick().then_some(hit.distance)
+    }
+
+    /// Starts anew from the camera's new place ([`camera_placed`]): no turn from the last frame's
+    /// camera, and what the view turns around is the brick now in its middle, else as deep as a
+    /// switch with nothing in view takes.
+    ///
+    /// # Safety
+    /// As for [`Self::follow`].
+    unsafe fn placed(&self, state: &mut State, frame: &Frame) {
+        state.last = None;
+        state.pan = [0.0; 2];
+        if matches!(state.mode, Mode::Orthographic) {
+            // SAFETY: per the contract.
+            state.pivot =
+                unsafe { self.middle_brick(frame, frame.axes[0]) }.unwrap_or(NOTHING_DEPTH);
+        }
     }
 
     /// Turns the orthographic view around what's in its middle as the camera turns (see the

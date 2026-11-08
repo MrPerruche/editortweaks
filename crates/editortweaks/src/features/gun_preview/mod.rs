@@ -22,10 +22,16 @@
 //! spawned at that garage. The game's projectiles leave their own vehicle out
 //! (`UGunBrick::GetIgnoredActors`), so the bricks are hit as a shot from another vehicle would hit
 //! them: to see what it goes through and which bricks it breaks off (magenta markers: the damage
-//! dealt there is at least what breaks them off, as the Strength view mode tells it). Each brick is
-//! traced alone against its simple collision, as the projectile sweeps it, hidden ones left
-//! out, and the guns firing and the barrels they fire through too. Off the setting, or without
-//! the map, the path goes on through.
+//! dealt there is at least what breaks them off, as the Strength view mode tells it). The projectile
+//! is a ball (`game::guns`, its radius: 15 cm for a 2x2x2's), so each brick is swept with that ball
+//! alone, against its simple collision, as the projectile sweeps it; what it goes through is as
+//! thick as the game measures it with the ball (a thin plate hit edge-on is as thick as it's long).
+//! Hidden bricks are left out, and the guns firing and the barrels they fire through too, and the
+//! bricks the ball already overlaps as it leaves the muzzle (around its own barrel). Off the
+//! setting, or without the map, the path goes on through.
+//!
+//! Barrels: a gun's are the barrel bricks in line with its muzzle among the bricks connected to it
+//! ([`parts`]), as the game finds them; a gray line shows the stretch they move the muzzle out by.
 //!
 //! Stacked guns: guns of one kind with the same ammo whose muzzles coincide fire one projectile
 //! together, dealing their damage summed; selecting one of them shows the stack's shot. Read
@@ -41,6 +47,7 @@ mod ballistics;
 mod describe;
 mod hover;
 mod label;
+mod parts;
 mod projection;
 
 use std::collections::{HashMap, HashSet};
@@ -52,6 +59,7 @@ use brickrust::ue::coreuobject::UObjectBase;
 use brickrust::ue::uclass::UStruct;
 
 use self::ballistics::{Contact, Ending, Flight, Frame, Ricochet, Shot};
+use self::parts::Parts;
 use super::{drag_select, map_in_editor, view_modes};
 use crate::framework::settings::{Alternative, Choice, Toggle};
 use crate::game::brick_connections::{self, Connections};
@@ -59,17 +67,20 @@ use crate::game::brick_editor;
 use crate::game::collision::Collision;
 use crate::game::component_bounds::{self, ComponentBounds};
 use crate::game::editor_mode::{self, EditorModes};
-use crate::game::editor_object::{self, LocalBounds, Selection, Transform, WorldTransforms};
+use crate::game::editor_object::{
+    self, LocalBounds, Selection, Transform, Vector, WorldTransforms,
+};
 use crate::game::editor_view::{self, Bricks, EditorCode};
 use crate::game::gravity::{self, Gravity};
 use crate::game::guns::{
     self, Connector, FireRate, GunInfo, Guns, ProjectileInfo, ProjectileParams,
 };
 use crate::game::line_batcher::{self, Line, LineBatcher};
-use crate::game::line_trace::{self, ComponentTrace, ProfileTrace};
+use crate::game::line_trace;
 use crate::game::outline_cases::{self, CASES, Highlights, OutlineCases};
 use crate::game::penetration::{self, Densities};
 use crate::game::reflection;
+use crate::game::sphere_trace::{self, ComponentSweep, ProfileSweep};
 use crate::game::weak_object::WeakObject;
 use crate::math::{self, Quat, Vec3};
 use crate::prelude::*;
@@ -166,6 +177,11 @@ const BOX_MARGIN: f64 = 1.0;
 /// How many things a trace through the world looks past at most (things gone through, the
 /// editor's).
 const MAX_SKIPPED: usize = 16;
+/// How far from the muzzle a sweep may start and still be the projectile leaving it (cm): the first
+/// one starts a hundredth of a cm behind it (`ballistics::fly`).
+const LEAVING: f64 = 0.1;
+/// The barrels' stretch, from the gun's own muzzle to where its shots leave.
+const BARREL: [f32; 3] = [0.6, 0.6, 0.6];
 
 /// What the feature needs from the game (after engine init).
 struct Code {
@@ -182,6 +198,9 @@ struct Code {
     vehicle: Option<VehicleCode>,
     /// The editor's outline for the bricks hit; without it, they get boxes (logged).
     outline: Option<OutlineCode>,
+    /// What tells which bricks a gun's barrels may be (those of its part): the connection finder
+    /// and `VehicleEditor`, the editor it works in. Without it, every barrel in line counts (logged).
+    parts: Option<(&'static Connections, *const UStruct)>,
     /// `EAmmoType` values that explode on impact, and those that steer (shown unguided).
     explosive: Vec<u8>,
     homing: Vec<u8>,
@@ -191,8 +210,8 @@ struct Code {
 
 /// What tracing shots through the world needs.
 struct WorldCode {
-    trace: ProfileTrace,
-    component: ComponentTrace,
+    trace: ProfileSweep,
+    component: ComponentSweep,
     bounds: ComponentBounds,
     densities: Densities,
 }
@@ -200,7 +219,7 @@ struct WorldCode {
 /// What tracing shots through the vehicle's own bricks needs.
 struct VehicleCode {
     collision: Collision,
-    component: ComponentTrace,
+    component: ComponentSweep,
     bounds: ComponentBounds,
     connections: &'static Connections,
     densities: Densities,
@@ -230,6 +249,7 @@ static STATE: Mutex<State> = Mutex::new(State::new());
 static SKIPPED_GUN: AtomicBool = AtomicBool::new(false);
 static NO_PROFILE: AtomicBool = AtomicBool::new(false);
 static NO_STRENGTH: AtomicBool = AtomicBool::new(false);
+static NO_RADIUS: AtomicBool = AtomicBool::new(false);
 
 /// The preview between frames.
 struct State {
@@ -316,8 +336,10 @@ pub struct Preview {
     pub projectile: ProjectileInfo,
     /// Guns stacked (one projectile each, merged).
     pub stack: usize,
-    /// The length of barrel in front of its muzzle (cm).
+    /// The length of barrel in front of its muzzle (cm), and the gun's own muzzle (where the barrels
+    /// start; the shot leaves from their end).
     pub barrel_length: f64,
+    pub own_muzzle: Vec3,
     pub spread_radius: f64,
     pub ammo: String,
     pub explosive: bool,
@@ -367,8 +389,8 @@ impl Feature for GunPreview {
 fn find() -> Result<Code, String> {
     let world = (|| {
         Ok::<_, String>(WorldCode {
-            trace: line_trace::profile_trace()?,
-            component: line_trace::component_trace()?,
+            trace: sphere_trace::profile_sweep()?,
+            component: sphere_trace::component_sweep()?,
             bounds: component_bounds::find()?,
             densities: penetration::find()?,
         })
@@ -378,7 +400,7 @@ fn find() -> Result<Code, String> {
     let vehicle = (|| {
         Ok::<_, String>(VehicleCode {
             collision: Collision::find()?,
-            component: line_trace::component_trace()?,
+            component: sphere_trace::component_sweep()?,
             bounds: component_bounds::find()?,
             connections: brick_connections::find()?,
             densities: penetration::find()?,
@@ -398,6 +420,16 @@ fn find() -> Result<Code, String> {
         })
     })()
     .map_err(|reason| log!("bricks hit get boxes, not the editor's outline: {reason}"))
+    .ok();
+    let parts = (|| {
+        Ok::<_, String>((
+            brick_connections::find()?,
+            reflection::find_class("VehicleEditor")
+                .ok_or("class VehicleEditor not found")?
+                .cast::<UStruct>(),
+        ))
+    })()
+    .map_err(|reason| log!("every barrel in line with a gun counts, connected or not: {reason}"))
     .ok();
     let ammo = |name: &str| {
         reflection::enum_value("EAmmoType", &format!("EAmmoType::{name}"))
@@ -427,6 +459,7 @@ fn find() -> Result<Code, String> {
         world,
         vehicle,
         outline,
+        parts,
         explosive: ["Incendiary", "HighExplosive", "TargetSeeking", "Guided"]
             .iter()
             .filter_map(|name| ammo(name))
@@ -734,7 +767,9 @@ fn key(found: &Found, wanted: &[usize], map: bool, hits_vehicle: bool, gravity: 
             kind.hash(&mut hasher);
         }
     }
-    hits_vehicle.then_some(found.vehicle).hash(&mut hasher);
+    // Also what the barrels' parts depend on: the vehicle's connections.
+    found.vehicle.hash(&mut hasher);
+    hits_vehicle.hash(&mut hasher);
     (map, gravity.to_bits(), SHOWS.get()).hash(&mut hasher);
     hasher.finish()
 }
@@ -816,6 +851,8 @@ unsafe fn work_out(
     gravity: f64,
 ) -> Vec<Preview> {
     let guns = &found.guns;
+    // SAFETY: per the contract.
+    let parts = unsafe { parts_of(code, editor, found) };
     let mut shown: HashSet<usize> = HashSet::new();
     let mut shots = Vec::new();
     for &index in wanted {
@@ -854,11 +891,19 @@ unsafe fn work_out(
                 barrel_kind == kind && ballistics::in_line(own_muzzle, frame).is_some()
             })
         };
+        // The game looks only at the barrels of the gun's part (see `parts`). Hidden ones (in no
+        // part: the connection finder leaves them out) cut off those beyond them wherever they are.
+        let of_part = |barrel: &BarrelBrick| {
+            barrel.hidden
+                || parts
+                    .as_ref()
+                    .is_none_or(|parts| parts.same(gun.object as usize, barrel.object as usize))
+        };
         let connectors = |hidden: bool| {
             found
                 .barrels
                 .iter()
-                .filter(move |barrel| barrel.hidden == hidden)
+                .filter(move |barrel| barrel.hidden == hidden && of_part(barrel))
                 .flat_map(|barrel| &barrel.connectors)
                 .filter(|(_, barrel_kind)| *barrel_kind == kind)
                 .map(|&(frame, _)| frame)
@@ -872,7 +917,7 @@ unsafe fn work_out(
         let barrels: Vec<usize> = found
             .barrels
             .iter()
-            .filter(|barrel| !barrel.hidden && in_line(barrel))
+            .filter(|barrel| !barrel.hidden && of_part(barrel) && in_line(barrel))
             .map(|barrel| barrel.object as usize)
             .collect();
         let firing: Vec<usize> = stack_guns.iter().chain(&barrels).copied().collect();
@@ -902,15 +947,38 @@ unsafe fn work_out(
             );
         }
         let world = code.world.as_ref().filter(|_| map).zip(profile);
+        let radius = projectile.radius.unwrap_or_else(|| {
+            if !NO_RADIUS.swap(true, Ordering::Relaxed) {
+                log!("a projectile's radius can't be read: its shots are traced as lines");
+            }
+            0.0
+        });
+        // The vehicle's bricks the projectile overlaps as it leaves the muzzle: left out like the
+        // guns firing (the game never hits the firing vehicle; these are around its own barrel).
+        let mut around_muzzle: Vec<usize> = Vec::new();
+        let muzzle_at = muzzle.frame.origin;
         let flight = ballistics::fly(&shot, step, |from, to, skip| {
+            let leaving = math::length(math::sub(from, muzzle_at)) <= LEAVING;
+            let sweep = Sweep {
+                from,
+                to,
+                radius,
+                skip,
+            };
             // SAFETY: per the contract; the vehicle was measured for the editor as it is.
             let own = vehicle.and_then(|(vehicle_code, vehicle)| unsafe {
-                vehicle_contact(vehicle_code, vehicle, from, to, skip, &firing)
+                vehicle_contact(
+                    vehicle_code,
+                    vehicle,
+                    &sweep,
+                    &firing,
+                    &mut around_muzzle,
+                    leaving,
+                )
             });
             // SAFETY: per the contract; the editor is a live actor in the world traced.
-            let around = world.and_then(|(world, profile)| unsafe {
-                contact(world, editor, from, to, profile, skip)
-            });
+            let around = world
+                .and_then(|(world, profile)| unsafe { contact(world, editor, &sweep, profile) });
             match (own, around) {
                 (Some(own), Some(around)) if around.distance < own.distance => Some(around),
                 (own, around) => own.or(around),
@@ -933,6 +1001,7 @@ unsafe fn work_out(
             projectile,
             stack: stack.len().max(1),
             barrel_length: muzzle.barrel_length,
+            own_muzzle: own_muzzle.origin,
             spread_radius,
             ammo: code
                 .ammo_names
@@ -950,60 +1019,125 @@ unsafe fn work_out(
     shots
 }
 
-/// What the line from `from` to `to` first meets of the vehicle's bricks, leaving out those gone
-/// through (`skip`, by component) and those `firing` (by address); and how thick it is along the
-/// line. Each brick whose box the line meets is traced alone: where the line enters it, and back
-/// from beyond it for where it last leaves it (none found: too thick, as the game takes it). Against its simple collision, as the game's
-/// projectile sweeps it and measures it (not the mesh the editor's clicks and the view modes'
-/// tooltip trace: its bevelled edges and rounded faces turn the surface's normal, so ricochets).
+/// One sweep of the projectile: its sphere's middle from `from` to `to`, its `radius` (cm), and
+/// what it went through and leaves out (`skip`, by component).
+struct Sweep<'a> {
+    from: Vec3,
+    to: Vec3,
+    radius: f64,
+    skip: &'a [usize],
+}
+
+impl Sweep<'_> {
+    /// Its way (length 1) and length, if it moves.
+    fn line(&self) -> Option<(Vec3, f64)> {
+        let delta = math::sub(self.to, self.from);
+        Some((math::normalized(delta)?, math::length(delta)))
+    }
+}
+
+/// The bricks of the editor's vehicle by part, for the barrels a gun may have (see [`parts`]); `None`
+/// where that can't be told (not a vehicle editor, or no connection finder): every barrel counts.
+///
+/// # Safety
+/// `editor` must be the live editor, `found` what this frame found in it. Game thread only.
+unsafe fn parts_of(code: &Code, editor: *mut UObjectBase, found: &Found) -> Option<Parts> {
+    let (connections, vehicle_editor) = code.parts?;
+    // Only worth finding if a gun could have a barrel.
+    if found.barrels.iter().all(|barrel| barrel.hidden) {
+        return None;
+    }
+    // SAFETY: per the contract: the live editor, checked to be a vehicle editor; its shown bricks
+    // live.
+    unsafe {
+        if !reflection::is_a(editor, vehicle_editor) {
+            return None;
+        }
+        let pairs: Vec<(usize, usize)> = connections
+            .find_all(editor)
+            .iter()
+            .map(|connection| (connection.brick as usize, connection.other as usize))
+            .collect();
+        let welds: Vec<(usize, u16)> = found
+            .bricks
+            .iter()
+            .map(|&brick| (brick as usize, connections.weld_group(brick)))
+            .collect();
+        Some(Parts::new(pairs, welds))
+    }
+}
+
+/// What the projectile `sweep` first touches of the vehicle's bricks, leaving out those gone through
+/// (`sweep.skip`, by component) and those `firing` (by address); and how thick it is along its way.
+/// Each brick whose box (grown by the radius) the sweep meets is swept alone against its simple
+/// collision, as the game's projectile sweeps it: where it first touches, and back from beyond it
+/// for where it last touches, measured as the game measures it (see [`thickness`]). The bricks in
+/// `around_muzzle` are left out too: while the projectile is `leaving` the muzzle, those it already
+/// overlaps are added to it, as bricks around its own barrel.
 ///
 /// # Safety
 /// `vehicle` must have been measured for the editor as it is. Game thread only.
 unsafe fn vehicle_contact(
     code: &VehicleCode,
     vehicle: &Vehicle,
-    from: Vec3,
-    to: Vec3,
-    skip: &[usize],
+    sweep: &Sweep,
     firing: &[usize],
+    around_muzzle: &mut Vec<usize>,
+    leaving: bool,
 ) -> Option<Contact> {
-    if !vehicle.bounds.is_some_and(|bounds| meets(from, to, bounds)) {
+    let (from, to, radius) = (sweep.from, sweep.to, sweep.radius);
+    if !vehicle
+        .bounds
+        .is_some_and(|bounds| meets(from, to, bounds, radius))
+    {
         return None;
     }
-    let length = math::length(math::sub(to, from));
-    let direction = math::normalized(math::sub(to, from))?;
+    let (direction, length) = sweep.line()?;
     let mut nearest: Option<(f64, &Target, *mut UObjectBase, Vec3)> = None;
     for target in &vehicle.targets {
-        if firing.contains(&target.brick) || !meets(from, to, target.bounds) {
+        if around_muzzle.contains(&target.brick)
+            || firing.contains(&target.brick)
+            || !meets(from, to, target.bounds, radius)
+        {
             continue;
         }
         let Some(component) = target.component.get_live() else {
             continue;
         };
-        if skip.contains(&(component as usize)) {
+        if sweep.skip.contains(&(component as usize)) {
             continue;
         }
         // SAFETY: a live component (just checked).
         let entry = unsafe {
-            code.component
-                .surface_hit(component, math::narrow(from), math::narrow(to), false)
+            code.component.first_hit(
+                component,
+                math::narrow(from),
+                math::narrow(to),
+                radius as f32,
+            )
         };
         let Some(entry) = entry else { continue };
-        let distance =
-            math::dot(math::sub(math::widen(entry.location), from), direction).clamp(0.0, length);
+        if entry.start_penetrating && leaving {
+            around_muzzle.push(target.brick);
+            continue;
+        }
+        let distance = along(from, direction, entry.location, length);
         if nearest.is_none_or(|(best, ..)| distance < best) {
             nearest = Some((distance, target, component, math::widen(entry.normal)));
         }
     }
     let (distance, target, component, normal) = nearest?;
     let entry = math::add(from, math::scale(direction, distance));
-    let [low, high] = target.bounds;
-    let across = math::length(math::sub(high, low));
-    let beyond = math::add(entry, math::scale(direction, across + 1.0));
     // SAFETY: a live component (checked above, nothing ran since).
-    let exit = unsafe {
-        code.component
-            .first_hit_with(component, math::narrow(beyond), math::narrow(entry), false)
+    let thickness = unsafe {
+        thickness(
+            &code.component,
+            component,
+            entry,
+            direction,
+            target.bounds,
+            radius,
+        )
     };
     Some(Contact {
         distance,
@@ -1011,17 +1145,61 @@ unsafe fn vehicle_contact(
         what: component as usize,
         brick: Some(target.brick),
         density: target.density,
-        thickness: exit.map_or(f64::INFINITY, |exit| {
-            math::dot(math::sub(math::widen(exit), entry), direction).max(0.0)
-        }),
+        thickness,
     })
 }
 
-/// Whether the segment from `from` to `to` meets the box `[low, high]`, grown by [`BOX_MARGIN`].
-fn meets(from: Vec3, to: Vec3, [low, high]: [Vec3; 2]) -> bool {
+/// How far along a sweep from `from` going `direction` the sphere's middle is at `location`, kept
+/// within the sweep's `length`.
+fn along(from: Vec3, direction: Vec3, location: Vector, length: f64) -> f64 {
+    math::dot(math::sub(math::widen(location), from), direction).clamp(0.0, length)
+}
+
+/// How thick `component` (its box `[low, high]` in the world) is along `direction` for a projectile
+/// of `radius` that touched it with its middle at `entry`, as `UBrickProjectileMovementComponent::
+/// HandleBlockingHit` (BRMK 0x32D420) measures it: its sphere swept against that body alone, back
+/// from far enough beyond it to `entry`; the length swept back from, less the distance swept and the
+/// sphere's diameter, at least 0. So it's how far the sphere's middle moves from first touching it to
+/// last touching it, less its diameter: a thin plate hit edge-on is as thick as it's long, and a
+/// plate hit at an angle is thicker than a line through it tells. Infinite if the sweep back
+/// meets nothing (the game's FLT_MAX: too thick).
+///
+/// # Safety
+/// `component` must be a live primitive component. Game thread only.
+unsafe fn thickness(
+    sweep: &ComponentSweep,
+    component: *mut UObjectBase,
+    entry: Vec3,
+    direction: Vec3,
+    [low, high]: [Vec3; 2],
+    radius: f64,
+) -> f64 {
+    // The game goes back from twice its bounds' sphere radius + the diameter + 1 cm beyond; the box's
+    // diagonal is as long, give or take, and beyond it all the same.
+    let back = math::length(math::sub(high, low)) + 2.0 * radius + 1.0;
+    let beyond = math::add(entry, math::scale(direction, back));
+    // SAFETY: per the contract.
+    let exit = unsafe {
+        sweep.first_hit(
+            component,
+            math::narrow(beyond),
+            math::narrow(entry),
+            radius as f32,
+        )
+    };
+    exit.map_or(f64::INFINITY, |exit| {
+        let swept = math::dot(math::sub(beyond, math::widen(exit.location)), direction);
+        (back - swept - 2.0 * radius).max(0.0)
+    })
+}
+
+/// Whether the segment from `from` to `to` meets the box `[low, high]`, grown by `radius` (a
+/// sphere's moving along it) and [`BOX_MARGIN`].
+fn meets(from: Vec3, to: Vec3, [low, high]: [Vec3; 2], radius: f64) -> bool {
+    let margin = BOX_MARGIN + radius;
     let (mut near, mut far) = (0.0_f64, 1.0_f64);
     for axis in 0..3 {
-        let (low, high) = (low[axis] - BOX_MARGIN, high[axis] + BOX_MARGIN);
+        let (low, high) = (low[axis] - margin, high[axis] + margin);
         let (origin, direction) = (from[axis], to[axis] - from[axis]);
         if direction.abs() < 1e-9 {
             if origin < low || origin > high {
@@ -1039,58 +1217,75 @@ fn meets(from: Vec3, to: Vec3, [low, high]: [Vec3; 2]) -> bool {
     true
 }
 
-/// What the line from `from` to `to` first meets in the world, as a projectile with the collision
+/// What the projectile `sweep` first touches in the world, as a projectile with the collision
 /// profile `profile` meets it (the editor and its bricks left out, and what was gone through:
-/// `skip`, by component), and how thick it is along the line: traced back against it alone from
-/// beyond it, as the game measures it (no far side found: too thick, as the game takes it; a
-/// landscape has none). What has no component is passed through, as the game passes through what
-/// has no body.
+/// `sweep.skip`, by component), and how thick it is along its way, measured as the game measures it
+/// (see [`thickness`]; no far side found: too thick, as the game takes it; a landscape has none).
+/// What has no component is passed through, as the game passes through what has no body.
 ///
 /// # Safety
 /// `editor` must be the live editor. Game thread only.
 unsafe fn contact(
     world: &WorldCode,
     editor: *mut UObjectBase,
-    from: Vec3,
-    to: Vec3,
+    sweep: &Sweep,
     profile: [u8; 8],
-    skip: &[usize],
 ) -> Option<Contact> {
-    let direction = math::normalized(math::sub(to, from))?;
-    let length = math::length(math::sub(to, from));
+    let (from, to, radius) = (sweep.from, sweep.to, sweep.radius);
+    let (direction, length) = sweep.line()?;
     let mut start = 0.0;
     for _ in 0..MAX_SKIPPED {
         // SAFETY: per the contract; the component and material are live (just resolved).
         unsafe {
+            let swept_from = math::add(from, math::scale(direction, start));
             let hit = world.trace.first_hit(
                 editor,
-                math::narrow(math::add(from, math::scale(direction, start))),
+                math::narrow(swept_from),
                 math::narrow(to),
+                radius as f32,
                 profile,
             )?;
-            let distance = start + f64::from(hit.distance);
+            let distance = start + along(swept_from, direction, hit.location, length - start);
+            let entry = math::add(from, math::scale(direction, distance));
             let passed = hit.component.is_some_and(|component| {
-                skip.contains(&(component as usize)) || line_trace::is_editor_component(component)
+                sweep.skip.contains(&(component as usize))
+                    || line_trace::is_editor_component(component)
             });
             if passed {
-                // On past it (the trace starts outside it again soon enough: 1 cm on).
-                start = distance + 1.0;
+                // On past it: from where the sphere last touches it (1 cm on at least), so the
+                // next sweep doesn't start in it again.
+                let past = hit.component.map_or(0.0, |component| {
+                    let bounds = world.bounds.of(component).map(math::widen);
+                    let through = thickness(
+                        &world.component,
+                        component,
+                        entry,
+                        direction,
+                        bounds,
+                        radius,
+                    );
+                    if through.is_finite() {
+                        through + 2.0 * radius
+                    } else {
+                        0.0
+                    }
+                });
+                start = distance + past.max(1.0);
                 if start >= length {
                     return None;
                 }
                 continue;
             }
-            let entry = math::add(from, math::scale(direction, distance));
             let thickness = hit.component.map_or(0.0, |component| {
-                let [low, high] = world.bounds.of(component);
-                let across = math::length(math::sub(math::widen(high), math::widen(low)));
-                let beyond = math::add(entry, math::scale(direction, across + 1.0));
-                world
-                    .component
-                    .first_hit_with(component, math::narrow(beyond), math::narrow(entry), false)
-                    .map_or(f64::INFINITY, |exit| {
-                        math::dot(math::sub(math::widen(exit), entry), direction).max(0.0)
-                    })
+                let bounds = world.bounds.of(component).map(math::widen);
+                thickness(
+                    &world.component,
+                    component,
+                    entry,
+                    direction,
+                    bounds,
+                    radius,
+                )
             });
             return Some(Contact {
                 distance,
@@ -1225,6 +1420,12 @@ unsafe fn draw(
             };
             blend(FULL_DAMAGE, LEAST_DAMAGE, share as f32)
         };
+        if let Some(start) = shot.flight.points.first()
+            && shot.barrel_length > 0.0
+        {
+            // The shot leaves from the barrels' end: show where they take it from.
+            push_line(lines, shot.own_muzzle, start.at, BARREL, 0.0);
+        }
         for pair in shot.flight.points.windows(2) {
             push_line(lines, pair[0].at, pair[1].at, color(pair[1].range), 0.0);
         }

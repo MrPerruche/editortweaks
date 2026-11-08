@@ -8,6 +8,8 @@
 //!
 //! Member: the quality setting says the level. What arrives is checked by [`model_io::shared::check`]
 //! and written to the references' session folder; what's ready shows (`references::received::show`).
+//! The player's changes of them go to the subhost ([`EDIT_PACE`] at most), which makes them as its own
+//! (`references::received::apply_edits`): its next lists tell everyone.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -18,7 +20,8 @@ use std::time::{Duration, Instant};
 use ::coop::PeerId;
 use ::coop::Session;
 use ::coop::references::{
-    Entry, ImageLook, Kind, Level, Receiving, Sharing, Size, Skip, Status, Target, split,
+    Edit, Entry, ImageLook, Kind, Level, Receiving, Sharing, Size, Skip, Status, Target, coalesce,
+    split,
 };
 use model_io::image;
 use model_io::plane::ImagePivot;
@@ -62,6 +65,11 @@ pub static QUALITY: Choice = Choice::new(
 
 /// How often a subhost looks at its references again.
 const LOOK_EVERY: Duration = Duration::from_millis(500);
+/// How often a member sends its changes of the subhost's references, at most (a slider dragged
+/// changes them every frame; the subhost allows 50 messages a second).
+const EDIT_PACE: Duration = Duration::from_millis(100);
+/// Members' messages of changes a subhost keeps while it isn't in the session's vehicle, at most.
+const MAX_WAITING_EDITS: usize = 1000;
 /// How often a subhost logs how fast its data leaves, while any does.
 const LOG_EVERY: Duration = Duration::from_secs(30);
 /// A member writes its references along with the session's starting autosave once they've stopped
@@ -131,6 +139,17 @@ impl Share {
     pub fn data(&mut self, content: u64, offset: u32, data: &[u8], now: u64) {
         if let Self::Member(member) = self {
             member.data(content, offset, data, now);
+        }
+    }
+
+    /// Subhost: `peer` changed our references.
+    pub fn edited(&mut self, peer: PeerId, edits: Vec<Edit>) {
+        if let Self::Host(host) = self {
+            // Made at the next tick in the session's vehicle; while away, the oldest go past a cap.
+            if host.edits.len() >= MAX_WAITING_EDITS {
+                host.edits.remove(0);
+            }
+            host.edits.push((peer, edits));
         }
     }
 
@@ -231,6 +250,8 @@ pub struct HostShare {
     looked_at: Option<Instant>,
     logged_at: Instant,
     sent_at_log: HashMap<PeerId, u64>,
+    /// Members' changes of our references, oldest first, not made yet (the references were busy).
+    edits: Vec<(PeerId, Vec<Edit>)>,
 }
 
 impl HostShare {
@@ -262,11 +283,30 @@ impl HostShare {
             looked_at: None,
             logged_at: Instant::now(),
             sent_at_log: HashMap::new(),
+            edits: Vec::new(),
+        }
+    }
+
+    /// Makes the members' changes of our references waiting, unless the references are busy.
+    fn apply_edits(&mut self) {
+        while let Some((peer, edits)) = self.edits.first() {
+            let Some(made) = received::apply_edits(edits) else {
+                return;
+            };
+            coop_log!(
+                "references: {peer} changed {made} of them ({} asked)",
+                edits.len()
+            );
+            self.edits.remove(0);
         }
     }
 
     fn tick(&mut self, session: &mut Session, transport: &mut Wire, now: u64, editing: bool) {
         self.sharing.keep_members(&session.expected_peers());
+        // Changes of another vehicle's references would land on the wrong ones: they wait.
+        if editing {
+            self.apply_edits();
+        }
         while let Ok(done) = self.done.try_recv() {
             self.take(done);
         }
@@ -551,6 +591,9 @@ pub struct MemberShare {
     status: String,
     /// Since when `shown` holds, if it wasn't written along yet.
     changed_at: Option<Instant>,
+    /// The player's changes of the subhost's references, not sent yet, and when some last went.
+    edits: Vec<Edit>,
+    edits_sent_at: Option<Instant>,
 }
 
 impl MemberShare {
@@ -584,6 +627,8 @@ impl MemberShare {
             shown: None,
             status: String::new(),
             changed_at: None,
+            edits: Vec::new(),
+            edits_sent_at: None,
         }
     }
 
@@ -621,8 +666,26 @@ impl MemberShare {
         if let Some(content) = self.receiving.next_want(now) {
             session.want_reference(content);
         }
+        self.send_edits(session);
         self.show();
         self.prune();
+    }
+
+    /// Sends the player's changes of the subhost's references, the last of each reference only, at
+    /// most every [`EDIT_PACE`].
+    fn send_edits(&mut self, session: &mut Session) {
+        self.edits.extend(received::take_edits());
+        if self.edits.is_empty()
+            || self
+                .edits_sent_at
+                .is_some_and(|at| at.elapsed() < EDIT_PACE)
+        {
+            return;
+        }
+        let edits = coalesce(std::mem::take(&mut self.edits));
+        coop_log!("references: sending {} changes to the host", edits.len());
+        session.edit_references(edits);
+        self.edits_sent_at = Some(Instant::now());
     }
 
     fn data(&mut self, content: u64, offset: u32, data: &[u8], now: u64) {

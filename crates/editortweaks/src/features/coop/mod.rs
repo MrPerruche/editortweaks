@@ -84,6 +84,7 @@ use self::log::coop_log;
 use self::steam_link::{Closed, SteamTransport};
 use crate::features::editor_menu;
 use crate::features::keybinds::{COOP_MENU, Keybind};
+use crate::features::map_in_editor;
 use crate::features::settings_menu;
 use crate::framework::settings::{Count, Section, Setting, Toggle};
 use crate::framework::timings;
@@ -426,6 +427,8 @@ struct Link {
     drifted_here: bool,
     /// Others' selections, and sending ours.
     presence: presence::Shown,
+    /// Our selection as of the last tick, to undo selecting (`None`: not seen yet).
+    selected: Option<Vec<CoopId>>,
     /// Others' cameras, and sending ours.
     cameras: cameras::Cameras,
     /// Whether the editor holds the session's vehicle now.
@@ -1661,6 +1664,7 @@ fn start(game: &Game, editor: Object, opening: Opening) -> Option<Box<Link>> {
         workload: ::coop::limits::Workload::default(),
         drifted_here: false,
         presence: presence::Shown::new((role == Role::Host).then_some(::coop::ids::SUBHOST_SLOT)),
+        selected: None,
         cameras: cameras::Cameras::new((role == Role::Host).then_some(::coop::ids::SUBHOST_SLOT)),
         here: Here::Editing,
         missed: Vec::new(),
@@ -1687,6 +1691,7 @@ fn stop(link: &mut Link, why: &str) {
         // SAFETY: on the game thread (the editor's tick).
         unsafe { link.cameras.hide(kit) };
     }
+    map_in_editor::follow_host(None);
     link.session.leave();
     send(link);
     changes::unwatch();
@@ -1741,6 +1746,10 @@ fn step(game: &Game, link: &mut Link) -> bool {
         // SAFETY: the editor is live (it's ticking), on the game thread.
         unsafe { link.cameras.tick(kit, &mut link.session, link.editor, now) };
     }
+    // Where our map shows: members see theirs there (sent when it changes).
+    if link.role == Role::Host {
+        link.session.show_map_place(map_in_editor::shown_place());
+    }
     if !editing {
         send(link);
         return true;
@@ -1750,7 +1759,8 @@ fn step(game: &Game, link: &mut Link) -> bool {
         changes::take_edits();
         changes::forget_graves();
     } else {
-        send_edits(game, link);
+        let sent = send_edits(game, link);
+        record_selection(game, link, sent);
     }
     let target = Target {
         game,
@@ -1795,8 +1805,33 @@ fn step(game: &Game, link: &mut Link) -> bool {
             link.autosave.references_settled();
         }
     }
+    // What coop itself did to the selection (undo, others' deletes, a snapshot) isn't a step.
+    if let Ok(kit) = &game.presence {
+        link.selected = link.session.is_loaded().then(|| presence::selected(kit));
+    }
     send(link);
     alive
+}
+
+/// Records a change of the player's selection since the last tick as a step to undo, as the game's
+/// own undo has; with the edit sent this tick if there was one (`with_edit`), which then selects
+/// back what was selected before it.
+fn record_selection(game: &Game, link: &mut Link, with_edit: bool) {
+    let Ok(kit) = &game.presence else { return };
+    if !link.session.is_loaded() {
+        return;
+    }
+    let now = presence::selected(kit);
+    let Some(before) = link.selected.replace(now.clone()) else {
+        return;
+    };
+    if before == now {
+        return;
+    }
+    let selection = ::coop::Selection { before, after: now };
+    if let Err(error) = link.session.selection_changed(selection, with_edit) {
+        coop_log!("a selection can't be undone ({error:?})");
+    }
 }
 
 /// Subhost: an edit made other bricks in this editor than the session counts. The session takes the
@@ -1921,6 +1956,7 @@ fn go_away(game: &Game, link: &mut Link) {
     }
     link.session.select(Vec::new());
     link.session.show_view(None);
+    link.session.show_map_place(None);
     send(link);
     coop_log!("left the editor: the session goes on");
 }
@@ -2282,7 +2318,8 @@ fn send_orders(game: &Game, link: &mut Link, peers: Vec<PeerId>) {
 }
 
 /// Passes the finished local edits to the session, each change with what undoes it.
-fn send_edits(game: &Game, link: &mut Link) {
+fn send_edits(game: &Game, link: &mut Link) -> bool {
+    let mut sent = false;
     for edit in changes::take_edits() {
         let mut changes: Vec<Change> = Vec::new();
         // Deleted bricks come back as they were, with their ids, and where they were in the
@@ -2383,7 +2420,10 @@ fn send_edits(game: &Game, link: &mut Link) {
             }
         }
         match link.session.edit_undoable(changes) {
-            Ok(()) => coop_log!("sent an edit: {summary}"),
+            Ok(()) => {
+                sent = true;
+                coop_log!("sent an edit: {summary}")
+            }
             Err(SessionError::NotLoaded) => {
                 coop_log!("dropped an edit before the vehicle arrived: {summary}")
             }
@@ -2391,6 +2431,7 @@ fn send_edits(game: &Game, link: &mut Link) {
         }
     }
     changes::forget_graves();
+    sent
 }
 
 /// Undoes (or redoes) the player's newest step, here and in the session.
@@ -2410,10 +2451,18 @@ fn step_back(link: &mut Link, target: &Target, redo: bool) {
     if link.role == Role::Host {
         link.touched.extend(bricks_of(&back.ops));
     }
+    if let Some(selected) = &back.select {
+        target.set_selection(selected);
+    }
     coop_log!(
-        "{what}: {} ops, {} changes skipped (someone else changed them since)",
+        "{what}: {} ops, {} changes skipped (someone else changed them since){}",
         back.ops.len(),
-        back.skipped
+        back.skipped,
+        if back.select.is_some() {
+            ", selection given back"
+        } else {
+            ""
+        }
     );
     if outcome.refused > 0 {
         coop_log!("  {} ops refused as impossible here", outcome.refused);
@@ -2617,7 +2666,9 @@ fn handle_anywhere(link: &mut Link, event: Event) -> bool {
             link.share.level_asked(peer, level, now);
         }
         Event::ReferenceWanted { peer, content } => link.share.wanted(peer, content),
+        Event::ReferenceEdited { peer, edits } => link.share.edited(peer, edits),
         Event::ReferenceList(entries) => link.share.list(entries),
+        Event::MapPlace(place) => map_in_editor::follow_host(place),
         Event::ReferenceData {
             content,
             offset,

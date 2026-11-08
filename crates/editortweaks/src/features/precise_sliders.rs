@@ -3,7 +3,8 @@
 //! - Editing (typing in a slider's text box): the game shows the value with at most 3 decimals and
 //!   with digit grouping ("1,234.568"), which loses precision, and grouped text can't even be typed
 //!   back. This shows the shortest text that reads back as the stored value, ungrouped
-//!   (`game::slider_text::ExactText`).
+//!   (`game::slider_text::ExactText`), with at most [`EDIT_DECIMALS`] decimals: rounded past
+//!   that, so committing the text unchanged (a click then Enter) rounds the value, as in the game.
 //! - Otherwise the label keeps the game's decimals and rounding, but keeps trailing zeros when the
 //!   value has more digits than shown: 90.10004 with 3 decimals shows "90.100", 90.1 stays "90.1".
 //!
@@ -15,14 +16,32 @@ use core::ffi::c_void;
 use std::cell::Cell;
 use std::sync::OnceLock;
 
+use crate::framework::settings::Count;
 use crate::framework::{hook, timings};
 use crate::game::slider::{self, UpdateSliderValueFn, ValueFields};
-use crate::game::slider_text::ExactText;
+use crate::game::slider_text::{self, ExactText, MAX_EDIT_DIGITS};
 use crate::game::text::{self, AsNumberFn, NumberFormattingOptions};
 use crate::game::ui_library::{self, NumberToTextFn, UnitConversion};
 use crate::prelude::*;
 
 pub struct PreciseSliders;
+
+/// The most decimals a slider's text box shows while editing; the most there is (the default)
+/// shows every value exactly.
+pub static EDIT_DECIMALS: Count = Count::new(
+    "SliderEditDecimals",
+    "Maximum slider decimals when typing",
+    "The most decimals a slider's text box shows when you click into it: 17 shows the exact \
+     value, fewer round it. It is set to 3 in vanilla Brick Rigs.",
+    0,
+    MAX_EDIT_DIGITS as u32,
+    MAX_EDIT_DIGITS as u32,
+);
+
+/// The decimals [`EDIT_DECIMALS`] allows.
+fn edit_decimals() -> usize {
+    EDIT_DECIMALS.get() as usize
+}
 
 static UPDATE_SLIDER_VALUE: OnceLock<UpdateSliderValueFn> = OnceLock::new();
 static NUMBER_TO_TEXT: OnceLock<NumberToTextFn> = OnceLock::new();
@@ -203,13 +222,14 @@ unsafe extern "C" fn as_number_detour(
         adjusted.minimum_fractional_digits = adjusted.minimum_fractional_digits.max(decimals);
         call(value, &adjusted)
     } else {
-        // Typing the text back must give the same value: all digits needed, no grouping.
-        let Some(exact) = ExactText::find(stored, factor) else {
+        // Typing the text back must give the same value: all digits needed (up to the setting's
+        // limit), no grouping.
+        let Some(text) = slider_text::edit_text(stored, factor, edit_decimals()) else {
             return call(value, options);
         };
         adjusted.minimum_fractional_digits = 0;
-        adjusted.maximum_fractional_digits = exact.digits as i32;
+        adjusted.maximum_fractional_digits = text.digits as i32;
         adjusted.use_grouping = false;
-        call(exact.shown, &adjusted)
+        call(text.shown, &adjusted)
     }
 }

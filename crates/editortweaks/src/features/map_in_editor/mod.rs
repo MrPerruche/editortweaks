@@ -25,6 +25,14 @@
 //! follows the vehicle's bounding box a second later (the box changes as bricks are added or
 //! moved), which costs a reflected call per brick.
 //!
+//! An empty vehicle has an empty box at its origin, so the map shows before the first brick.
+//!
+//! In a coop session everyone builds the same bricks, so everyone must see the map at the same place
+//! around them: the subhost's map decides. Where its editor stands while its map shows goes to the
+//! members ([`shown_place`], `features/coop`), and a member asking for the map (any garage or the
+//! current location, the map key) sees it there instead ([`follow_host`]). Everyone is in the same
+//! match, so that's the same ground. While the subhost shows none, a member's own choice shows.
+//!
 //! Where it is documented: `docs/re/map-in-editor.md` (findings), `docs/city-cover-helper.md`
 //! (design and the risks to check in game).
 
@@ -38,6 +46,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, MutexGuard, OnceLock, PoisonError};
 use std::time::{Duration, Instant};
 
+use ::coop::presence::MapPlace;
 use brickrust::ue::coreuobject::{EObjectFlags, GObjects, UObjectBase};
 use brickrust::ue::uclass::UStruct;
 
@@ -82,6 +91,12 @@ pub struct MapInEditor;
 /// Set once everything is found; until then (or if that fails) nothing happens.
 static GAME: OnceLock<Game> = OnceLock::new();
 static STATE: Mutex<State> = Mutex::new(State::new());
+
+/// Coop: where our map shows, for members to see it there too (`None`: it doesn't, or we follow a
+/// subhost's).
+static SHOWN_PLACE: Mutex<Option<MapPlace>> = Mutex::new(None);
+/// Coop member: where the subhost's map shows (`None`: it doesn't, or we're no member).
+static HOST_PLACE: Mutex<Option<MapPlace>> = Mutex::new(None);
 
 static LOG_STARTED: std::sync::Once = std::sync::Once::new();
 
@@ -358,6 +373,8 @@ struct State {
     drawn: bool,
     /// Whether the pinned spawn point was asked for when the landing was worked out.
     pinned: bool,
+    /// Coop member: the subhost's map place the landing comes from, if it does.
+    following: Option<MapPlace>,
 }
 
 // SAFETY: weak object references, only used on the game thread (the mutex just satisfies
@@ -382,6 +399,7 @@ impl State {
             held: false,
             drawn: false,
             pinned: false,
+            following: None,
         }
     }
 }
@@ -390,6 +408,33 @@ impl State {
 /// look at the world around the vehicle, e.g. where its shots land.
 pub fn shows_map() -> bool {
     STATE.try_lock().is_ok_and(|state| state.shown)
+}
+
+/// Coop: where the map shows around the vehicle here, for members to see it at the same place; not
+/// while it follows a subhost's.
+pub fn shown_place() -> Option<MapPlace> {
+    *SHOWN_PLACE.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// Coop member: the subhost's map shows at `place` (`None`: it doesn't, or the session ended). A
+/// map asked for here shows there from the next tick.
+pub fn follow_host(place: Option<MapPlace>) {
+    let mut host = HOST_PLACE.lock().unwrap_or_else(PoisonError::into_inner);
+    if *host != place {
+        match place {
+            Some(place) => log!(
+                "coop: the host's map shows with the editor at {:.1?}, rotation {:.1?}: the map follows it",
+                place.location,
+                place.rotation
+            ),
+            None => log!("coop: the host's map doesn't show (any more): the map is this player's"),
+        }
+    }
+    *host = place;
+}
+
+fn host_place() -> Option<MapPlace> {
+    *HOST_PLACE.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
 fn state() -> MutexGuard<'static, State> {
@@ -437,6 +482,7 @@ unsafe fn leave(game: &Game, state: &mut State) {
         clear_lines(game, state);
     }
     *state = State::new();
+    *SHOWN_PLACE.lock().unwrap_or_else(PoisonError::into_inner) = None;
 }
 
 /// Hooks the editor's `PostModify` (the first time): every operation ends there, which may change
@@ -571,6 +617,18 @@ unsafe fn tick(game: &Game, state: &mut State, editor: *mut UObjectBase) -> bool
         }
     }
 
+    // A coop subhost's map decides where it shows (see the module's doc).
+    let following = host_place().filter(|_| want_map);
+    if let Some(place) = following {
+        let vehicle = state.vehicle_box.unwrap_or(VehicleBox::EMPTY);
+        state.landing = Some((vehicle, followed_landing(&place)));
+    } else if state.following.is_some() {
+        // Back to our own choice: worked out again.
+        // SAFETY: per the contract.
+        unsafe { work_out_own(game, state, editor, garage.as_ref(), controls.here) };
+    }
+    state.following = following;
+
     let mut show = want_map && state.landing.is_some();
     // Before the editor first moves into the map, and when its bricks may have changed.
     if show && (!state.shown || new_box) {
@@ -587,8 +645,19 @@ unsafe fn tick(game: &Game, state: &mut State, editor: *mut UObjectBase) -> bool
         place_editor(game, state, editor, controller, show);
         let hide = state.shown;
         hide_others(game, state, editor, controller, hide);
-        draw(game, state, editor, garage.as_ref(), controls.here);
+        let spawn_box = match &state.following {
+            Some(place) => place.spawn_box.map(math::widen),
+            None => garage.as_ref().map(|garage| math::widen(garage.extent)),
+        };
+        draw(
+            game,
+            state,
+            editor,
+            garage.is_some() || controls.here,
+            spawn_box,
+        );
     }
+    publish_place(state, garage.as_ref());
 
     *panel::controls() = controls;
     (controls.garage, controls.pinned, controls.here) != (asked.garage, asked.pinned, asked.here)
@@ -848,6 +917,56 @@ unsafe fn work_out_standing(game: &Game, state: &mut State, editor: *mut UObject
     true
 }
 
+/// Works out where the vehicle lands at what the player selected (`garage`, else the current
+/// location when `here`), after following a coop subhost's map. A current location that can't be
+/// found leaves no landing (the map doesn't show; the next choice works it out again).
+///
+/// # Safety
+/// `editor` must be the live editor. Game thread only.
+unsafe fn work_out_own(
+    game: &Game,
+    state: &mut State,
+    editor: *mut UObjectBase,
+    garage: Option<&Garage>,
+    here: bool,
+) {
+    state.landing = None;
+    // SAFETY: per the contract.
+    unsafe {
+        if let Some(garage) = garage {
+            work_out_landing(game, state, garage, false);
+        } else if here {
+            work_out_standing(game, state, editor);
+        }
+    }
+}
+
+/// Where the vehicle is in the world when the map shows at a coop subhost's `place`.
+fn followed_landing(place: &MapPlace) -> Landing {
+    Landing {
+        vehicle: Pose {
+            location: math::widen(place.location),
+            rotation: Quat::from_rotator(math::widen(place.rotation)),
+        },
+        spawn_point: math::widen(place.spawn_point),
+    }
+}
+
+/// Coop: keeps [`SHOWN_PLACE`] up to date: where the editor stands while the map shows by our own
+/// choice (at `garage`, or the current location), for members to see it there too.
+fn publish_place(state: &State, garage: Option<&Garage>) {
+    let place = match (state.shown, &state.following, state.placed, state.landing) {
+        (true, None, Some([location, rotation]), Some((_, landing))) => Some(MapPlace {
+            location,
+            rotation,
+            spawn_point: math::narrow(landing.spawn_point),
+            spawn_box: garage.map(|garage| garage.extent),
+        }),
+        _ => None,
+    };
+    *SHOWN_PLACE.lock().unwrap_or_else(PoisonError::into_inner) = place;
+}
+
 /// Where the game puts a vehicle spawned at `place` (`docs/re/map-in-editor.md`, "Current
 /// location"): on the ground under it, tilted like the ground, then where it finds room. If the
 /// queries weren't found, on the place itself, with no search for room.
@@ -861,7 +980,9 @@ unsafe fn spawned_at(
     vehicle: &VehicleBox,
 ) -> Landing {
     let forward = Quat::from_rotator(math::widen(place.rotation)).rotate([1.0, 0.0, 0.0]);
-    let Some(traces) = &game.spawn_trace else {
+    // An empty vehicle needs no room (its box would be tested with negative sizes).
+    let traces = game.spawn_trace.as_ref().filter(|_| !vehicle.is_empty());
+    let Some(traces) = traces else {
         let rotation = placement::on_surface([0.0, 0.0, 1.0], forward);
         return placement::fit_on_ground(
             math::widen(place.location),
@@ -937,7 +1058,8 @@ unsafe fn vehicle_box(game: &Game, editor: *mut UObjectBase) -> Option<VehicleBo
     // SAFETY: per the contract.
     let found =
         unsafe { vehicle_box::vehicle_box(&game.bricks, &game.places, &game.bounds, editor) };
-    found.map(|[min, max]| VehicleBox { min, max })
+    // No bricks (or none with a place and bounds): an empty box at the origin.
+    Some(found.map_or(VehicleBox::EMPTY, |[min, max]| VehicleBox { min, max }))
 }
 
 /// Moves the editor to where the vehicle lands (when `show`), or back where it was. The camera
@@ -1155,9 +1277,9 @@ unsafe fn show_hidden(game: &Game, state: &mut State) {
     }
 }
 
-/// Draws the selected `garage`'s spawn point (a cross), its spawn box and the vehicle's box, in the
-/// vehicle's space where the editor is now; at the player's current location (`here`), the cross
-/// and the vehicle's box; clears them if nothing is selected.
+/// Draws the spawn point (a cross), the garage's spawn box (`spawn_box`, its half size, centred on
+/// the spawn point) and the vehicle's box, in the vehicle's space where the editor is now, if a
+/// place is selected (`selected`: a garage or the player's current location); clears them if not.
 ///
 /// # Safety
 /// `editor` must be the live editor. Game thread only.
@@ -1165,13 +1287,13 @@ unsafe fn draw(
     game: &Game,
     state: &mut State,
     editor: *mut UObjectBase,
-    garage: Option<&Garage>,
-    here: bool,
+    selected: bool,
+    spawn_box: Option<Vec3>,
 ) {
     // SAFETY: per the contract.
     unsafe {
         let batcher = game.lines.batcher();
-        let landing = state.landing.filter(|_| garage.is_some() || here);
+        let landing = state.landing.filter(|_| selected);
         let (Some((vehicle, landing)), false) = (landing, batcher.is_null()) else {
             clear_lines(game, state);
             return;
@@ -1194,8 +1316,7 @@ unsafe fn draw(
                 true,
             ));
         }
-        if let Some(garage) = garage {
-            let half = math::widen(garage.extent);
+        if let Some(half) = spawn_box {
             boxed(
                 &mut lines,
                 &world,

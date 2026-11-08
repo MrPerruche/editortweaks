@@ -132,6 +132,14 @@ impl Target<'_> {
     /// Makes the bricks `ids` the selection, as a click would (those that are here). Nothing for no
     /// bricks, nor outside the default mode: coop only loads in it.
     pub fn select(&self, ids: &[CoopId]) {
+        if ids.iter().any(|&id| changes::object(id).is_some()) {
+            self.set_selection(ids);
+        }
+    }
+
+    /// Makes the bricks `ids` (those that are here) the selection, as a click would: none selects
+    /// nothing. Not outside the default mode (undo only runs in it).
+    pub fn set_selection(&self, ids: &[CoopId]) {
         let bricks: Vec<Object> = ids.iter().filter_map(|&id| changes::object(id)).collect();
         let Ok(selector) = &self.game.selector else {
             return;
@@ -140,10 +148,8 @@ impl Target<'_> {
         let Some(mode) = (unsafe { self.game.modes.default_mode(self.editor) }) else {
             return;
         };
-        if !bricks.is_empty() {
-            // SAFETY: the editor's default mode, and its live objects (they have coop ids).
-            unsafe { selector.select(mode, &bricks, false) };
-        }
+        // SAFETY: the editor's default mode, and its live objects (they have coop ids).
+        unsafe { selector.select(mode, &bricks, false) };
     }
 
     /// Finds the session's vehicle in this editor, new since the player left the last one (to

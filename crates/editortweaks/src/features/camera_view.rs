@@ -16,7 +16,7 @@ use std::sync::{Once, OnceLock};
 use brickrust::ue::coreuobject::UObjectBase;
 use brickrust::ue::uclass::UClass;
 
-use super::{editor_frame, editor_menu, keybinds};
+use super::{editor_frame, editor_menu, keybinds, ortho_view};
 use crate::game::actor::{self, Actors};
 use crate::game::brick_editor::{self, BrickEditor};
 use crate::game::editor_camera::{self, EditorCamera};
@@ -206,6 +206,8 @@ impl Game {
             if let Some(interface) = interface.filter(|_| editor_frame::is_ready()) {
                 editor_frame::set_camera_rotation(interface, rotation);
             }
+            // An orthographic view would take the new angle for a turn and swing the camera away.
+            ortho_view::camera_placed();
 
             let fov = self
                 .zoom

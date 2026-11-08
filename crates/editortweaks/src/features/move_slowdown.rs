@@ -1,8 +1,9 @@
 //! Slower mouse moves in the editor:
 //!
 //! - while Control is held ([`keybinds::SLOW_MOVES`], rebindable like the other), moving or
-//!   rotating bricks with the mouse in move mode (G, dragging a brick, or the gizmo) and turning the
-//!   camera go [`CONTROL_FACTOR`] as fast;
+//!   rotating bricks with the mouse in move mode (G, dragging a brick, or the gizmo) goes
+//!   [`CONTROL_FACTOR`] as fast. Not the camera: Control is also the camera speed key (with the
+//!   wheel), and turning the camera with it held shouldn't crawl;
 //! - while Shift is held ([`keybinds::SLOW_GIZMO_MOVES`]), moving or rotating bricks by a gizmo
 //!   handle goes [`SHIFT_FACTOR`] as fast (with Control too: their product). Not the camera, and
 //!   not bricks following the mouse (G, or dragging a brick), where Shift stays the game's "move
@@ -55,23 +56,29 @@ impl Feature for MoveSlowdown {
 
 /// The handlers can only be found through reflection, so they're hooked here.
 fn engine_init() -> Result<(), String> {
-    match (editor_mode::find(), editor_input::camera_flags()) {
-        (Ok(modes), Ok(camera)) if modes.knows_gizmo_axis() => {
-            let _ = MODES.set(modes);
+    match editor_input::camera_flags() {
+        Ok(camera) => {
             let _ = CAMERA.set(camera);
         }
-        (Ok(_), Ok(_)) => log!(
+        Err(reason) => log!("Control slows the camera too, and Shift won't slow down: {reason}"),
+    }
+    match editor_mode::find() {
+        Ok(modes) if modes.knows_gizmo_axis() => {
+            let _ = MODES.set(modes);
+        }
+        Ok(_) => log!(
             "Shift won't slow down: {} not found among the move mode's functions",
             editor_mode::SHOULD_CAPTURE_MOUSE.name
         ),
-        (Err(reason), _) | (_, Err(reason)) => log!("Shift won't slow down: {reason}"),
+        Err(reason) => log!("Shift won't slow down: {reason}"),
     }
     mouse_moves::listen(slow_down)
 }
 
 fn slow_down(movement: &Movement) -> Handling {
     let mut factor = 1.0;
-    if keybinds::SLOW_MOVES.is_held() {
+    // SAFETY: the movement's input component is live during its handler's call.
+    if keybinds::SLOW_MOVES.is_held() && !unsafe { turns_camera(movement.input) } {
         factor *= CONTROL_FACTOR;
     }
     // SAFETY: the movement's input component is live during its handler's call.
@@ -89,6 +96,18 @@ fn slow_down(movement: &Movement) -> Handling {
         )
     });
     Handling::Scale(factor)
+}
+
+/// Whether the mouse turns the camera of `input` (rather than moving bricks). Unknown (the camera
+/// flags weren't found): no, so Control still slows bricks down.
+///
+/// # Safety
+/// `input` must be a live editor input component.
+unsafe fn turns_camera(input: *const UObjectBase) -> bool {
+    // SAFETY: per the contract.
+    CAMERA
+        .get()
+        .is_some_and(|camera| unsafe { camera.moving(input) })
 }
 
 /// Whether the mouse moves bricks by a gizmo handle in the editor of `input` (rather than turning

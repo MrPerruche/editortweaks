@@ -19,8 +19,9 @@
 //! selected reference's values show; a change goes to every selected reference the row fits:
 //! positions move them together, the other values are set on each.
 //!
-//! In a coop session a member's references are the host's ([`super::received`]): the rows show their
-//! values but don't change them, nothing is added, and a row says how far they arrived.
+//! In a coop session a member's references are the host's ([`super::received`]): the rows change
+//! their place and look (sent to the host, which makes the change for everyone), but not their file;
+//! nothing is added, and a row says how far they arrived.
 //!
 //! Rows run on the game thread while the panel lists or changes them (never inside a tick of the
 //! feature), so they use the feature's state directly; each change shows at the next tick and is
@@ -34,7 +35,7 @@ use model_io::readers::Format;
 use model_io::sidecar::{Kind, Reference, SourceMode};
 use model_io::space::{Axis, Pivot, Units};
 
-use super::{CODE, State, edit, files, select, state};
+use super::{CODE, State, edit, files, received, select, state};
 use crate::features::editor_bounds;
 use crate::features::property_limits;
 use crate::features::settings_list;
@@ -305,7 +306,7 @@ impl List for Received {
 }
 
 const ADD_DESCRIPTION: &str = "Import an image or model as reference. This reference will only be visible in the editor! You cannot spawn it in the world. You can go in settings to set whether the game keeps a link to the file (meaning the imported file must not be moved or destroyed) or keeps a copy safe it in its game file..";
-const RECEIVED_DESCRIPTION: &str = "These references are the host's, sent over at the quality set in Editor Tweaks' coop settings. Saving the vehicle keeps a copy of them. You can hide them, only for you.";
+const RECEIVED_DESCRIPTION: &str = "These references are the host's, sent over at the quality set in Editor Tweaks' coop settings. Saving the vehicle keeps a copy of them. Moving, changing or removing one changes it for everyone; hiding one (or setting its opacity to 0) is only for you.";
 const HIDDEN_DESCRIPTION: &str = "Some references are invisible (opacity 0), so they can't be clicked. Click to make them visible again.";
 const SHOWN_DESCRIPTION: &str = "Hide references with \"Hidden\", make so you can't select them with \"Not selectable\", or use \"Visible\" to see them.";
 const OPACITY_DESCRIPTION: &str = "How opaque the reference is. How opacity is handled can be configured in Editor Tweaks' settings. If set to 0, it is invisible and can't be clicked but can be reverted in the side bar.";
@@ -355,11 +356,10 @@ fn edit_selected(mut change: impl FnMut(&mut Reference, &Context) -> Result<(), 
         return false;
     };
     let state = &mut *state;
-    // The session's references are the host's.
-    if state.received.is_some() {
-        return false;
-    }
-    let folder = state.folder.clone();
+    // The session's references are the host's: only their place and look change, here and at the
+    // host (see `show_session_references`).
+    let received = state.received.is_some();
+    let folder = if received { None } else { state.folder.clone() };
     let context = Context {
         folder: folder.as_deref(),
     };
@@ -374,6 +374,14 @@ fn edit_selected(mut change: impl FnMut(&mut Reference, &Context) -> Result<(), 
         let mut changed = reference.clone();
         if let Err(reason) = change(&mut changed, &context) {
             log!("{}: {reason}", changed.name);
+            all = false;
+            continue;
+        }
+        if received && !received::only_look_changed(reference, &changed) {
+            log!(
+                "{}: the host's reference: only its place and look change",
+                changed.name
+            );
             all = false;
             continue;
         }
@@ -545,13 +553,16 @@ static SHOW_HIDDEN: Buttons = Buttons {
         let Some(mut state) = state() else {
             return;
         };
-        if state.received.is_some() {
-            return;
-        }
+        let state = &mut *state;
         for reference in state.sidecar.references.iter_mut().filter(|r| is_hidden(r)) {
             reference.visible = true;
             if reference.opacity <= 0.0 {
-                reference.opacity = 1.0;
+                // A host's reference hidden here: back as the host has it (hiding was local).
+                reference.opacity = state
+                    .received_list
+                    .iter()
+                    .find(|listed| listed.id == reference.id)
+                    .map_or(1.0, |listed| listed.opacity.max(0.01));
             }
         }
         state.refresh_panel = true;

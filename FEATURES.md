@@ -13,12 +13,17 @@ Host your editor session at any time, and let up to 31 other friends build with 
 ## Fast Editing
 Fast Editing is a powerful feature which is meant to make working with scalables and spinners way easier and faster.
 - Extrude & resize bricks by using `ALT` and dragging faces/edges/corners in edit mode (Keybind: `Fast editing`) ;
+  - Dragged faces show their size; press `Enter` to type it exactly (Keybind: `Type length`) ;
+  - `Enter` no longer presses the last hovered button after using fast editing ;
 - Snap fast editing operations of all kinds to other bricks using `CTRL` (Keybind: `Snap`) (customizable) ;
   - Snap points are configurable in Editor Tweaks' config.
 - Move and rotate bricks easily and fast using Fast Editing in gizmo move mode ;
 - Create lines by `Right clicking` twice in fast editing gizmo move mode (Keybind: `Line point`);
   - Rotate bricks around these lines using other parts ;
+  - Rotation angle shows beside the grabbed point; press `Enter` to type it in degrees (Keybind: `Type length`) ;
   - Drag bricks along lines by holding right click ;
+  - Shows lines' length, and the distance to the mouse while placing one ;
+  - Press `Enter` to type a line's exact length, when one of its points is on the moved bricks (Keybind: `Type length`) ;
   - Full snapping support & switch rotations with `R` (Keybind: `Next orientation`).
 - Snap against detailed brick models using `Thumb button` (Keybind: `Use models`) ;
 - Modify spinners' shape using the curve tool ;
@@ -28,12 +33,13 @@ Fast Editing is a powerful feature which is meant to make working with scalables
 ## User Interface
 - Slider property limits are increased to the highest reasonable value. *See APPENDIX 1* ;
 - Out of vanilla bounds sliders / illegal values are highlighted / painted red respectively ;
-- Sliders no longer hide precision (full value comes back if pressed, trailing zeros appear if the displayed value is rounded) ;
+- Sliders no longer hide precision (full value comes back if pressed). `Slider decimals when typing` caps the decimals shown ;
 - Added a button to instantly switch values around for 2 numbers and 3 numbers properties. Pressing it repeatedly will cycle through all possible permutations ;
 - Can now use `x` and `X` in sliders to use this brick's value and this slider's value respectively ;
 - Use `ALT` to increase / decrease slider values over time (Keybind: `Value scrubbing`) ;
 - All 3 scale axis are available for thruster bricks ;
-- Many bricks whose names were identical to others were renamed.
+- Many bricks whose names were identical to others were renamed ;
+- Tells you at start when a newer version is out (`Check for updates` in the settings).
 
 ## Behavior Previews
 - Preview guns' stats and trajectory when selected (configurable) ;

@@ -9,6 +9,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver};
 use std::thread;
 
+use windows_sys::Win32::System::Com::{
+    COINIT_APARTMENTTHREADED, COINIT_DISABLE_OLE1DDE, CoInitializeEx, CoUninitialize,
+};
 use windows_sys::Win32::UI::Controls::Dialogs::{
     GetOpenFileNameW, OFN_EXPLORER, OFN_FILEMUSTEXIST, OFN_NOCHANGEDIR, OFN_PATHMUSTEXIST,
     OPENFILENAMEW,
@@ -55,6 +58,7 @@ pub fn open_file(
         .name("editortweaks-file-dialog".into())
         .spawn(move || {
             let _open_guard = open_guard;
+            let _com = ComApartment::enter();
             let chosen = show_dialog(&title, &filter, folder.as_deref());
             // The caller may have stopped listening.
             let _ = sender.send(chosen);
@@ -69,6 +73,41 @@ struct OpenGuard;
 impl Drop for OpenGuard {
     fn drop(&mut self) {
         DIALOG_OPEN.store(false, Ordering::Release);
+    }
+}
+
+/// The dialog thread's COM apartment, left when dropped. The dialog is shell UI: it loads Explorer's
+/// extensions (thumbnails, previews, icon overlays, cloud-storage folders) into the game, and they
+/// expect a single-threaded apartment. Without one the thread is in the process's shared
+/// multithreaded apartment, where such an extension can crash the game while the dialog shows its
+/// files (a bug report on 2026-11-07: a crash picking a GLB, before the mod read anything).
+struct ComApartment {
+    entered: bool,
+}
+
+impl ComApartment {
+    fn enter() -> ComApartment {
+        // SAFETY: called on the dialog thread, before anything COM; the reserved pointer must be
+        // null. It fails only if the thread already has an apartment, which ours can't.
+        let result = unsafe {
+            CoInitializeEx(
+                core::ptr::null(),
+                (COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE) as u32,
+            )
+        };
+        // S_OK or S_FALSE (already in one): either way it must be left once.
+        ComApartment {
+            entered: result >= 0,
+        }
+    }
+}
+
+impl Drop for ComApartment {
+    fn drop(&mut self) {
+        if self.entered {
+            // SAFETY: on the thread that entered the apartment, balancing its `CoInitializeEx`.
+            unsafe { CoUninitialize() };
+        }
     }
 }
 

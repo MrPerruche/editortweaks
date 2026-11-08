@@ -28,4 +28,4 @@ pub use session::{
     EndReason, Event, HostSettings, Outgoing, Session, SessionError, SnapshotRequest,
 };
 pub use transport::Transport;
-pub use undo::{Change, StepBack};
+pub use undo::{Change, Selection, StepBack};

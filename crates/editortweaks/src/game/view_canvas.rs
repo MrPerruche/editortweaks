@@ -64,6 +64,8 @@ pub struct ViewCanvas {
     set_visibility: SingleCall,
     shown: u8,
     hidden: u8,
+    /// `Visible`: shown and taking the mouse (our text boxes).
+    clickable: u8,
     /// `UCanvasPanelSlot::SetPosition(FVector2D InPosition)`, `SetSize(FVector2D InSize)`,
     /// `SetZOrder(int32 InZOrder)`.
     set_position: SingleCall,
@@ -140,6 +142,7 @@ pub fn find() -> Result<ViewCanvas, String> {
         )?,
         shown: visibility("ESlateVisibility::HitTestInvisible")?,
         hidden: visibility("ESlateVisibility::Collapsed")?,
+        clickable: visibility("ESlateVisibility::Visible")?,
         set_position: SingleCall::find(slot, "SetPosition", "InPosition", "StructProperty", 8)?,
         set_size: SingleCall::find(slot, "SetSize", "InSize", "StructProperty", 8)?,
         set_z_order: SingleCall::find(slot, "SetZOrder", "InZOrder", "IntProperty", 4)?,
@@ -272,6 +275,23 @@ impl ViewCanvas {
         unsafe {
             self.set_position.call(slot, position);
             self.set_visibility.call(widget, self.shown);
+        }
+    }
+
+    /// Shows `widget` like [`Self::show_widget`], taking the mouse (a text box being clicked into).
+    ///
+    /// # Safety
+    /// `widget` and `slot` must be live. Game thread only.
+    pub unsafe fn show_clickable_widget(
+        &self,
+        widget: *mut UObjectBase,
+        slot: *mut UObjectBase,
+        position: [f32; 2],
+    ) {
+        // SAFETY: per the contract.
+        unsafe {
+            self.set_position.call(slot, position);
+            self.set_visibility.call(widget, self.clickable);
         }
     }
 

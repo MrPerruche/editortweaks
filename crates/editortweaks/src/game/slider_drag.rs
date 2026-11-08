@@ -26,7 +26,13 @@
 //!   enough after a press; `OnReleased` clears it and commits the value (see `game::slider`).
 //! - `ShouldUseFastSliderMode` is false only for the distance types (15-19): those drag relatively
 //!   by default, and Ctrl makes them absolute. `Step` is `ValueStep`, or `GetDefaultValueStep
-//!   (ValueType)` when that's 0. Neither function is reflected.
+//!   (ValueType)` when that's 0. Neither function is reflected. `ShouldUseFastSliderMode` (game
+//!   0xEF9800 in build 26488256) is a leaf function, found through its call here
+//!   ([`FAST_MODE_CALL`]) and checked by its whole code ([`FAST_MODE`]), see [`drag_modes`].
+//! - Keeping the cursor over the slider in a relative drag clamps it to the slider's rectangle on
+//!   screen: `SetMousePos(Clamp(Event.ScreenPos, Left/Top, Right/Bottom))`, only when it's outside.
+//!   Whoever else moves the cursor during a relative drag fights that, and the jumps can end up in
+//!   the drag's movement.
 //! - The slider captures the mouse in high precision mode (`ShouldCaptureHighPrecisionMouseMovement`
 //!   is true): the cursor is hidden and `CursorDelta` holds raw mouse movement. Mouse move events
 //!   only come while the mouse moves.
@@ -37,8 +43,8 @@
 use core::ffi::c_void;
 
 use crate::framework::patch;
-use crate::framework::sig::FunctionSig;
-use crate::game::slate::{Geometry, PointerEvent};
+use crate::framework::sig::{self, CodeShape, FunctionSig};
+use crate::game::slate::{self, Geometry, PointerEvent};
 
 /// The start of `NativeOnMouseMove`: testing `bDragging` (the flags byte's offset at +2).
 pub const DRAGGING_CHECK: FunctionSig = FunctionSig {
@@ -60,6 +66,64 @@ pub const DRAG_CLAMP: FunctionSig = FunctionSig {
 const CLAMP_AT: usize = 19;
 const CLAMP: [u8; 9] = [0x72, 0x07, 0x0f, 0x28, 0xcc, 0xf3, 0x0f, 0x5d, 0xca];
 const NO_CLAMP: [u8; 9] = [0x66, 0x0f, 0x1f, 0x44, 0x00, 0x00, 0x0f, 0x28, 0xcc];
+
+/// `NativeOnMouseMove` calling `ShouldUseFastSliderMode(ValueType)` (the call at +5), between
+/// loading the event's modifier keys and keeping their Shift bits.
+pub const FAST_MODE_CALL: FunctionSig = FunctionSig {
+    name: "UBrickSliderWidget::NativeOnMouseMove (fast mode)",
+    pattern: "45 0f b7 79 08 e8 ?? ?? ?? ?? 66 41 83 e7 03",
+};
+const FAST_MODE_CALL_AT: usize = 5;
+
+/// `bool UUIFunctionLibrary::ShouldUseFastSliderMode(ENumericValueType Type)`: false for the five
+/// types from the one compared at +5 (the distance types), true for all others.
+pub const FAST_MODE: CodeShape = CodeShape {
+    name: "UUIFunctionLibrary::ShouldUseFastSliderMode",
+    shape: "0f b6 d1 83 ea ?? 74 17 83 ea 01 74 12 83 ea 01 74 0d 83 ea 01 74 08 83 fa 01 74 03 b0 01 c3 32 c0 c3",
+};
+const FIRST_RELATIVE_AT: usize = 5;
+const RELATIVE_TYPES: u8 = 5;
+
+/// Which drags are absolute (the value under the cursor) and which relative (moved by the mouse's
+/// movement), as `NativeOnMouseMove` decides.
+#[derive(Clone, Copy, Debug)]
+pub struct DragModes {
+    /// The value types that drag relatively without modifier keys: this one and the
+    /// [`RELATIVE_TYPES`]` - 1` after it.
+    first_relative: u8,
+}
+
+/// Reads [`DragModes`] from the game's code.
+pub fn drag_modes() -> Result<DragModes, String> {
+    let found = FAST_MODE_CALL.locate()?;
+    // SAFETY: the call (E8 and its 32-bit displacement) lies inside the match.
+    let target = unsafe {
+        let call = found.address.add(FAST_MODE_CALL_AT);
+        if call.read() != 0xE8 {
+            return Err(format!("{}: no call", FAST_MODE_CALL.name));
+        }
+        let relative = call.add(1).cast::<i32>().read_unaligned() as isize;
+        call.add(5).wrapping_offset(relative)
+    };
+    if !sig::is_code(target) || !FAST_MODE.matches(target) {
+        return Err(format!("{}: unexpected code", FAST_MODE.name));
+    }
+    // SAFETY: inside the code just matched against the shape.
+    let first_relative = unsafe { target.add(FIRST_RELATIVE_AT).read() };
+    Ok(DragModes { first_relative })
+}
+
+impl DragModes {
+    /// Whether a drag of a slider of `value_type` with `modifier_keys` held is absolute:
+    /// `!Shift && ShouldUseFastSliderMode(ValueType) != Control`.
+    pub fn is_absolute(&self, value_type: u8, modifier_keys: u16) -> bool {
+        let fast = !(self.first_relative..self.first_relative.saturating_add(RELATIVE_TYPES))
+            .contains(&value_type);
+        let shift = modifier_keys & slate::SHIFT != 0;
+        let control = modifier_keys & slate::CONTROL != 0;
+        !shift && fast != control
+    }
+}
 
 /// `FReply NativeOnMouseMove(const FGeometry&, const FPointerEvent&)`: the reply is returned
 /// through a hidden pointer, passed after `this` and returned.

@@ -12,6 +12,11 @@
 //! the object order, or anything on a brick it made or deleted). An edit of someone else's ordered
 //! before a step that still waits for its commit was skipped here (the step overwrites it), but it
 //! is what the step really overwrote: it becomes what undoing the step brings back.
+//!
+//! The selection is a member's own, never sent with an edit, but undo takes it back as the game's
+//! own undo does: a step may carry the selection before and after it ([`Selection`]), either
+//! alone (the player only selected) or along with the edit that changed it. Undoing selects what
+//! was selected before, redoing what was after.
 
 use crate::ids::{CoopId, LiveSet};
 use crate::ops::Op;
@@ -62,12 +67,52 @@ impl Change {
     }
 }
 
-/// One local edit (or undo, or redo), as changes.
+/// The local selection (coop ids) before and after a step.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Selection {
+    pub before: Vec<CoopId>,
+    pub after: Vec<CoopId>,
+}
+
+impl Selection {
+    /// The same, the other way round (for the step undoing or redoing it).
+    fn reversed(self) -> Self {
+        Self {
+            before: self.after,
+            after: self.before,
+        }
+    }
+
+    /// `self`, then `later`: from `self`'s before to `later`'s after.
+    fn then(self, later: Selection) -> Self {
+        Self {
+            before: self.before,
+            after: later.after,
+        }
+    }
+}
+
+/// What a step becomes once undone (or redone): the step the other way.
+#[derive(Debug, Default)]
+pub(crate) struct Reversed {
+    changes: Vec<Change>,
+    selection: Option<Selection>,
+}
+
+impl Reversed {
+    fn is_empty(&self) -> bool {
+        self.changes.is_empty() && self.selection.is_none()
+    }
+}
+
+/// One local edit (or undo, or redo, or a change of the selection), as changes.
 #[derive(Debug)]
 struct Step {
     changes: Vec<Change>,
+    /// The selection before and after it, if it changed.
+    selection: Option<Selection>,
     /// The proposal that sent it (`Session::edit`), to tell whether it's committed yet; 0 at the
-    /// subhost, whose edits are committed at once.
+    /// subhost, whose edits are committed at once, and for steps sending nothing.
     local: u32,
     /// Its changes dropped since, as someone else changed what they touched.
     dropped: usize,
@@ -122,6 +167,9 @@ pub struct StepBack {
     /// Changes of the step left out: someone else changed what they touched since, or (rarely)
     /// they can't be made any more (a brick to make again exists again).
     pub skipped: usize,
+    /// The selection to give back (after the ops), if the step changed it; bricks that aren't
+    /// there any more left out by the editor.
+    pub select: Option<Vec<CoopId>>,
 }
 
 /// A member's steps to undo and redo.
@@ -143,13 +191,56 @@ impl History {
         self.redo.clear();
     }
 
+    /// The local selection changed from `selection.before` to `selection.after`. `with_edit`: along
+    /// with the newest local edit, whose step takes it (undoing the edit selects what was
+    /// selected before it); else on its own, as a new step, which drops what could be redone.
+    pub fn select(&mut self, selection: Selection, with_edit: bool) {
+        if selection.before == selection.after {
+            return;
+        }
+        if with_edit && let Some(step) = self.undo.last_mut() {
+            step.selection = Some(match step.selection.take() {
+                Some(earlier) => earlier.then(selection),
+                None => selection,
+            });
+            return;
+        }
+        self.redo.clear();
+        self.push_step(
+            false,
+            Reversed {
+                changes: Vec::new(),
+                selection: Some(selection),
+            },
+            0,
+        );
+    }
+
     /// Adds a step to undo (`redo` false) or to redo, sent as proposal `local`.
     pub fn push(&mut self, redo: bool, changes: Vec<Change>, local: u32) {
-        if changes.is_empty() {
+        self.push_step(
+            redo,
+            Reversed {
+                changes,
+                selection: None,
+            },
+            local,
+        );
+    }
+
+    /// Adds the step a [`History::take`] gave back, to undo (`redo` false) or to redo, sent as
+    /// proposal `local`.
+    pub fn push_reversed(&mut self, redo: bool, reversed: Reversed, local: u32) {
+        self.push_step(redo, reversed, local);
+    }
+
+    fn push_step(&mut self, redo: bool, reversed: Reversed, local: u32) {
+        if reversed.is_empty() {
             return;
         }
         let step = Step {
-            changes,
+            changes: reversed.changes,
+            selection: reversed.selection,
             local,
             dropped: 0,
         };
@@ -189,15 +280,21 @@ impl History {
     /// made, in the order to make them, with `live` the bricks the local editor has; and the
     /// step the other way. Steps left with nothing to make (someone else changed all they
     /// touched) are passed over, counted as skipped, so that one undo always does something if
-    /// it can. `None` if there's no step.
-    pub fn take(&mut self, redo: bool, mut live: LiveSet) -> Option<(StepBack, Vec<Change>)> {
+    /// it can; a step that changed the selection always does something. `None` if there's no
+    /// step.
+    pub fn take(&mut self, redo: bool, mut live: LiveSet) -> Option<(StepBack, Reversed)> {
         let stack = if redo { &mut self.redo } else { &mut self.undo };
         let mut taken = None;
-        let mut other_way = Vec::new();
-        while other_way.is_empty() {
+        let mut reversed = Reversed::default();
+        while reversed.is_empty() {
             let Some(step) = stack.pop() else { break };
             let back = taken.get_or_insert_with(StepBack::default);
             back.skipped += step.dropped;
+            if let Some(selection) = step.selection {
+                back.select = Some(selection.before.clone());
+                reversed.selection = Some(selection.reversed());
+            }
+            let other_way = &mut reversed.changes;
             // Newest change first, but bricks are made first so that the rest can refer to them.
             let (making, rest): (Vec<Change>, Vec<Change>) = step
                 .changes
@@ -217,7 +314,7 @@ impl History {
                 }
             }
         }
-        taken.map(|back| (back, other_way))
+        taken.map(|back| (back, reversed))
     }
 
     /// Someone else's committed edit: `ops`, those of it that did something (see
@@ -342,7 +439,7 @@ mod tests {
         let (back, other_way) = history.take(false, live(&[1])).unwrap();
         assert_eq!(back.ops, vec![moved(1, 0.0)]);
         assert_eq!(back.skipped, 0);
-        history.push(true, other_way, 0);
+        history.push_reversed(true, other_way, 0);
         assert!(history.take(false, live(&[1])).is_none());
         let (back, _) = history.take(true, live(&[1])).unwrap();
         assert_eq!(back.ops, vec![moved(1, 5.0)]);
@@ -401,7 +498,10 @@ mod tests {
         let (back, other_way) = history.take(false, live(&[1, 2])).unwrap();
         assert_eq!(back.ops, vec![moved(1, 0.0)]);
         assert_eq!(back.skipped, 2);
-        assert_eq!(other_way, vec![change(moved(1, 0.0), moved(1, 1.0))]);
+        assert_eq!(
+            other_way.changes,
+            vec![change(moved(1, 0.0), moved(1, 1.0))]
+        );
     }
 
     #[test]
@@ -432,14 +532,17 @@ mod tests {
         let (back, other_way) = history.take(false, live(&[1])).unwrap();
         assert_eq!(back.ops, vec![color(1, 1)]);
         assert_eq!(back.skipped, 2);
-        assert_eq!(other_way, vec![change(color(1, 1), color(1, 2))]);
+        assert_eq!(other_way.changes, vec![change(color(1, 1), color(1, 2))]);
         assert!(history.take(false, live(&[1])).is_none());
         // Only steps with nothing left: still an answer, so the log can say why nothing happened.
         let mut history = History::default();
         history.record(vec![change(moved(1, 5.0), moved(1, 0.0))], 0);
         history.foreign(&[moved(1, 9.0)], |_| false);
         let (back, other_way) = history.take(false, live(&[1])).unwrap();
-        assert_eq!((back.ops.len(), back.skipped, other_way.len()), (0, 1, 0));
+        assert_eq!(
+            (back.ops.len(), back.skipped, other_way.changes.len()),
+            (0, 1, 0)
+        );
         assert!(history.take(false, live(&[1])).is_none());
     }
 
@@ -482,7 +585,8 @@ mod tests {
             back,
             StepBack {
                 ops: vec![],
-                skipped: 1
+                skipped: 1,
+                select: None,
             }
         );
     }
@@ -509,6 +613,87 @@ mod tests {
         let mut now = vec![id(1), id(3), id(5), id(2), id(4)];
         now = crate::order::reordered(&now, &list);
         assert_eq!(now, ids);
+    }
+
+    fn selection(before: &[u32], after: &[u32]) -> Selection {
+        Selection {
+            before: before.iter().map(|&n| id(n)).collect(),
+            after: after.iter().map(|&n| id(n)).collect(),
+        }
+    }
+
+    fn ids(ns: &[u32]) -> Option<Vec<CoopId>> {
+        Some(ns.iter().map(|&n| id(n)).collect())
+    }
+
+    #[test]
+    fn selecting_alone_is_a_step() {
+        let mut history = History::default();
+        history.record(vec![change(moved(1, 5.0), moved(1, 0.0))], 0);
+        history.select(selection(&[], &[1]), false);
+        history.select(selection(&[1], &[1, 2]), false);
+        // Newest first: the selections, then the move.
+        let (back, other_way) = history.take(false, live(&[1, 2])).unwrap();
+        assert_eq!((back.ops.len(), back.select.clone()), (0, ids(&[1])));
+        history.push_reversed(true, other_way, 0);
+        let (back, _) = history.take(false, live(&[1, 2])).unwrap();
+        assert_eq!(back.select, ids(&[]));
+        let (back, _) = history.take(false, live(&[1, 2])).unwrap();
+        assert_eq!((back.ops, back.select), (vec![moved(1, 0.0)], None));
+        // Redoing the first undone selection selects what was after it.
+        let (back, _) = history.take(true, live(&[1, 2])).unwrap();
+        assert_eq!(back.select, ids(&[1, 2]));
+    }
+
+    #[test]
+    fn selecting_drops_redo_and_nothing_changed_is_no_step() {
+        let mut history = History::default();
+        history.push(true, vec![change(moved(1, 5.0), moved(1, 0.0))], 0);
+        history.select(selection(&[1], &[1]), false);
+        assert!(history.take(true, live(&[1])).is_some());
+        history.push(true, vec![change(moved(1, 5.0), moved(1, 0.0))], 0);
+        history.select(selection(&[], &[1]), false);
+        assert!(history.take(true, live(&[1])).is_none());
+    }
+
+    #[test]
+    fn an_edits_selection_comes_back_with_it() {
+        let mut history = History::default();
+        let create = Op::Create {
+            ids: vec![id(2)],
+            archive: vec![],
+        };
+        history.record(vec![change(Op::Delete { id: id(2) }, create.clone())], 0);
+        history.select(selection(&[2], &[]), true);
+        let (back, other_way) = history.take(false, live(&[1])).unwrap();
+        assert_eq!((back.ops, back.select), (vec![create], ids(&[2])));
+        history.push_reversed(true, other_way, 0);
+        let (back, _) = history.take(true, live(&[1, 2])).unwrap();
+        assert_eq!(
+            (back.ops, back.select),
+            (vec![Op::Delete { id: id(2) }], ids(&[]))
+        );
+        // Two selection changes with one edit: from the first's before to the last's after.
+        history.record(vec![change(moved(1, 5.0), moved(1, 0.0))], 0);
+        history.select(selection(&[3], &[]), true);
+        history.select(selection(&[], &[1]), true);
+        let (back, _) = history.take(false, live(&[1])).unwrap();
+        assert_eq!(back.select, ids(&[3]));
+    }
+
+    #[test]
+    fn a_step_others_overwrote_still_gives_its_selection_back() {
+        let mut history = History::default();
+        history.record(vec![change(moved(1, 5.0), moved(1, 0.0))], 0);
+        history.select(selection(&[], &[1]), true);
+        history.foreign(&[moved(1, 9.0)], |_| false);
+        let (back, other_way) = history.take(false, live(&[1])).unwrap();
+        assert_eq!((back.ops.len(), back.skipped), (0, 1));
+        assert_eq!(back.select, ids(&[]));
+        assert!(other_way.changes.is_empty());
+        history.push_reversed(true, other_way, 0);
+        let (back, _) = history.take(true, live(&[1])).unwrap();
+        assert_eq!(back.select, ids(&[1]));
     }
 
     #[test]

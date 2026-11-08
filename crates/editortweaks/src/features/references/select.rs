@@ -267,11 +267,13 @@ fn delete_selected(state: &mut State) -> bool {
     if state.selected.is_empty() {
         return false;
     }
-    // The session's references are the host's: taken, doing nothing.
-    if state.received.is_some() {
-        return true;
-    }
-    let folder = state.folder.clone();
+    // The session's references are the host's: removed here, the host is told (see
+    // `show_session_references`), and their files stay.
+    let folder = if state.received.is_some() {
+        None
+    } else {
+        state.folder.clone()
+    };
     for id in core::mem::take(&mut state.selected) {
         if let Err(reason) = edit::remove(&mut state.sidecar, folder.as_deref(), &id) {
             log!("removing {id}: {reason}");

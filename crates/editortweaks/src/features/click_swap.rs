@@ -13,7 +13,9 @@
 //! in as the other button, and its release the same way as its press, so no button stays down when
 //! the setting or the view changes in between.
 //!
-//! The same hook tells `keybinds` which keys reach the viewport, as they come in (before the swap).
+//! The same hook tells `keybinds` which keys reach the viewport, as they come in (before the
+//! swap). First it lets fast editing take the keys typed into a line's length
+//! (`brick_resize::typed_key`), which then go no further.
 
 use std::sync::{Mutex, OnceLock, PoisonError};
 
@@ -105,6 +107,15 @@ unsafe extern "C" fn input_key(
 ) -> bool {
     let _span = timings::span("click_swap::input_key");
     let original = *ORIGINAL.get().expect("hook recorded before use");
+    // SAFETY: the function's own argument: the caller's live copy of the key, on the game thread.
+    // A key taken for typing a line's length (`brick_resize`) goes no further, neither to the game
+    // nor to the keybinds: the key is destroyed here, as the function would.
+    unsafe {
+        if super::brick_resize::typed_key(&(*key).name, event) {
+            (*key).discard();
+            return true;
+        }
+    }
     // SAFETY: the function's own argument: the caller's live copy of the key. Before the swap
     // below, which only touches mouse buttons: the keybinds want the physical key.
     unsafe { keybinds::key_delivered(&(*key).name, event) };

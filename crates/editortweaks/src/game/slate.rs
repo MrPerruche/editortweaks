@@ -7,6 +7,8 @@ use core::mem::offset_of;
 
 /// `FModifierKeysState` bits for the left and right Shift keys (Control is 0b1100, Alt 0b11_0000).
 pub const SHIFT: u16 = 0b00_0011;
+/// `FModifierKeysState` bits for the left and right Control keys.
+pub const CONTROL: u16 = 0b00_1100;
 
 /// `FPointerEvent` (a mouse event): `FInputEvent`'s fields, then the positions in screen space.
 #[repr(C)]
@@ -49,5 +51,11 @@ impl Geometry {
     /// slider computes it.
     pub fn absolute_width(&self) -> f32 {
         self.size[0] * self.render_matrix[0] + self.size[1] * self.render_matrix[2]
+    }
+
+    /// The screen X of the widget's left edge: its local origin transformed to screen space, as
+    /// the slider computes it (`FVector2D::ZeroVector` through the render transform).
+    pub fn absolute_left(&self) -> f32 {
+        self.render_translation[0]
     }
 }

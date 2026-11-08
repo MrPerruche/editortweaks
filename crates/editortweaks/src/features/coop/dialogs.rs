@@ -11,10 +11,11 @@ use brickrust::ue::coreuobject::UObjectBase;
 
 use super::log::coop_log;
 use super::ui::{self, Request};
-use crate::framework::{hook, timings};
+use crate::features::popup_answers;
+use crate::framework::timings;
 use crate::game::kismet;
 use crate::game::match_players::MatchPlayers;
-use crate::game::popup::{ConfirmFn, HiddenButton, Popups};
+use crate::game::popup::{HiddenButton, Popups};
 use crate::game::weak_object::WeakObject;
 
 struct Kit {
@@ -24,7 +25,6 @@ struct Kit {
 }
 
 static KIT: OnceLock<Result<Kit, String>> = OnceLock::new();
-static ORIGINAL_CONFIRM: OnceLock<ConfirmFn> = OnceLock::new();
 
 /// The dialogs open. Game thread only; never locked while calling the game.
 struct State {
@@ -62,20 +62,11 @@ fn state() -> MutexGuard<'static, State> {
     STATE.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
-/// Finds the popups and hooks their confirming, once. After engine init.
+/// Finds the popups and listens to their confirming, once. After engine init.
 pub fn start() -> Result<(), String> {
     let kit = KIT.get_or_init(|| {
         let popups = Popups::find()?;
-        // SAFETY: the target is `UPopupContainerWidget::ConfirmPopup`, whose signature
-        // `ConfirmFn` is.
-        unsafe {
-            hook::install_typed(
-                "UPopupContainerWidget::ConfirmPopup",
-                popups.confirm_popup,
-                confirmed as ConfirmFn,
-                &ORIGINAL_CONFIRM,
-            )?;
-        }
+        popup_answers::intercept(confirmed)?;
         let players = MatchPlayers::find()
             .inspect_err(|reason| coop_log!("the ban dialog shows no player ids: {reason}"))
             .ok();
@@ -283,21 +274,13 @@ pub fn tick() {
     }
 }
 
-/// A popup is confirmed: one of our questions requests what it asked about; our ban dialog bans
-/// from coop and closes as cancelled; any other popup goes on as the game wants.
-unsafe extern "C" fn confirmed(container: *mut UObjectBase) {
+/// A popup is confirmed (`popup_answers`): one of our questions requests what it asked about (the
+/// game then closes it); our ban dialog bans from coop and closes as cancelled (handled: `true`);
+/// any other popup goes on as the game wants.
+fn confirmed(container: *mut UObjectBase) -> bool {
     let _span = timings::span("coop::confirmed");
-    let Some(original) = ORIGINAL_CONFIRM.get() else {
-        return;
-    };
     let Some(kit) = kit() else {
-        // SAFETY: forwards the caller's argument.
-        unsafe {
-            timings::game("UPopupContainerWidget::ConfirmPopup", || {
-                original(container)
-            })
-        };
-        return;
+        return false;
     };
     // SAFETY: the live container being confirmed, on the game thread.
     let params = unsafe { kit.popups.params_of(container) };
@@ -312,13 +295,7 @@ unsafe extern "C" fn confirmed(container: *mut UObjectBase) {
     if let Some(request) = question {
         coop_log!("a question was confirmed");
         ui::request(request);
-        // SAFETY: forwards the caller's argument.
-        unsafe {
-            timings::game("UPopupContainerWidget::ConfirmPopup", || {
-                original(container)
-            })
-        };
-        return;
+        return false;
     }
     let banning = {
         let mut state = state();
@@ -329,13 +306,7 @@ unsafe extern "C" fn confirmed(container: *mut UObjectBase) {
         if ours { state.banning.take() } else { None }
     };
     let Some(banning) = banning else {
-        // SAFETY: forwards the caller's argument.
-        unsafe {
-            timings::game("UPopupContainerWidget::ConfirmPopup", || {
-                original(container)
-            })
-        };
-        return;
+        return false;
     };
     // SAFETY: our live ban params; the values are read before the dialog closes.
     unsafe {
@@ -349,4 +320,5 @@ unsafe extern "C" fn confirmed(container: *mut UObjectBase) {
         }
         kit.popups.cancel(container);
     }
+    true
 }

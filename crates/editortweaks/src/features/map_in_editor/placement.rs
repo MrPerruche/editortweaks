@@ -18,6 +18,17 @@ pub struct VehicleBox {
 }
 
 impl VehicleBox {
+    /// An empty vehicle's: nothing, at its origin.
+    pub const EMPTY: Self = Self {
+        min: [0.0; 3],
+        max: [0.0; 3],
+    };
+
+    /// Whether it holds nothing (an empty vehicle's).
+    pub fn is_empty(&self) -> bool {
+        self.min == self.max
+    }
+
     fn half(&self) -> Vec3 {
         math::scale(math::sub(self.max, self.min), 0.5)
     }

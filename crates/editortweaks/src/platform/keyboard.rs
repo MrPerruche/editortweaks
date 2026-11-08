@@ -72,6 +72,12 @@ pub fn is_mouse_button_down() -> bool {
     is_down(VK_LBUTTON) || is_down(VK_RBUTTON)
 }
 
+/// Whether Escape is held right now with the game focused, whoever got its press (a text box of
+/// ours, say).
+pub fn is_escape_down() -> bool {
+    is_game_focused() && is_down(VK_ESCAPE)
+}
+
 /// Whether the middle mouse button is held right now.
 pub fn is_middle_button_down() -> bool {
     is_down(VK_MBUTTON)

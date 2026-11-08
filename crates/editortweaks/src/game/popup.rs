@@ -12,6 +12,7 @@
 //! ([`Popups::unhide`]), or the next one to get it lacks it.
 
 use brickrust::ue::coreuobject::UObjectBase;
+use brickrust::ue::fname::FName;
 use brickrust::ue::uclass::{UClass, UFunction, UStruct};
 
 use crate::game::menu::ButtonPanels;
@@ -301,6 +302,52 @@ impl Popups {
                 self.set_visibility.call(*confirm, self.collapsed);
             }
             Ok((params, hidden))
+        }
+    }
+
+    /// Adds a button showing `text` and the icon at `icon` (a texture's path) after the stock ones
+    /// of the popup of `params`, as the game's unsaved-changes popup adds its "Discard changes"
+    /// (`CreateButton` on the container's panel). Its clicks come to `menu_buttons`' listeners;
+    /// the button is one of the panel's pooled ones, so it's only ours while
+    /// [`Popups::shows_button`] says so. The button, if made.
+    ///
+    /// # Safety
+    /// Game thread only.
+    pub unsafe fn add_button(
+        &self,
+        params: *mut UObjectBase,
+        text: &Text,
+        icon: FName,
+    ) -> Result<*mut UObjectBase, String> {
+        // SAFETY: on the game thread; the container's panel is a reflected object property.
+        unsafe {
+            let container = self
+                .container_of(params)
+                .ok_or("its container wasn't found")?;
+            let panel = read::<*mut UObjectBase>(container, self.container_buttons);
+            if panel.is_null() {
+                return Err("its container has no button panel".into());
+            }
+            self.panels
+                .add_button(panel, text, icon)
+                .ok_or_else(|| "no button made".into())
+        }
+    }
+
+    /// Whether `button` is a button of the popup of `params` (still shown): its container, if so.
+    ///
+    /// # Safety
+    /// Game thread only.
+    pub unsafe fn shows_button(
+        &self,
+        params: *mut UObjectBase,
+        button: *mut UObjectBase,
+    ) -> Option<*mut UObjectBase> {
+        // SAFETY: on the game thread; the container's panel is a reflected object property.
+        unsafe {
+            let container = self.container_of(params)?;
+            let panel = read::<*mut UObjectBase>(container, self.container_buttons);
+            (!panel.is_null() && self.panels.shows(panel, button)).then_some(container)
         }
     }
 

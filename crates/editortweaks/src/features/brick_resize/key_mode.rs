@@ -14,6 +14,7 @@
 //! [`update`] follows the key once per editor frame; [`is_on`] tells the result to everything that
 //! used to ask whether the key was held.
 
+use core::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
@@ -60,22 +61,26 @@ pub fn is_on() -> bool {
     KEY_MODE.get() == TOGGLE && TAP.lock().unwrap_or_else(PoisonError::into_inner).toggled
 }
 
+/// Whether the key was held at the last [`update`].
+static WAS_HELD: AtomicBool = AtomicBool::new(false);
+
 /// Follows the key for one editor frame: flips the toggle on a tap, and clears it while the key is
-/// a hold. Called once per frame, before anything asks [`is_on`].
-pub(super) fn update() {
+/// a hold. Called once per frame, before anything asks [`is_on`]. Whether the key went down since
+/// the last frame (held or tapped).
+pub(super) fn update() -> bool {
+    let held = keybinds::RESIZE_BRICKS.is_held();
+    let was_held = WAS_HELD.swap(held, Ordering::Relaxed);
+    let pressed = held && !was_held;
     let mut tap = TAP.lock().unwrap_or_else(PoisonError::into_inner);
     if KEY_MODE.get() != TOGGLE {
         *tap = Tap::new();
-        return;
+        return pressed;
     }
     let interrupted = keyboard::is_mouse_button_down()
         || keyboard::is_middle_button_down()
         || !keyboard::is_game_focused();
-    tap.step(
-        Instant::now(),
-        keybinds::RESIZE_BRICKS.is_held(),
-        interrupted,
-    );
+    tap.step(Instant::now(), held, interrupted);
+    pressed
 }
 
 /// The key between frames.

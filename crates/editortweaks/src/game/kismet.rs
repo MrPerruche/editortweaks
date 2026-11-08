@@ -185,3 +185,27 @@ impl Conversion {
         }
     }
 }
+
+/// Opens `url` in the player's browser, as Blueprints do (`UKismetSystemLibrary::LaunchURL`; on
+/// Windows the shell opens it). Game thread only, after engine init.
+pub fn launch_url(url: &str) -> Result<(), String> {
+    const LIBRARY: &str = "KismetSystemLibrary";
+    let class = reflection::find_class(LIBRARY).ok_or(format!("class {LIBRARY} not found"))?;
+    let defaults = reflection::find_object("Default__KismetSystemLibrary", LIBRARY)
+        .ok_or(format!("{LIBRARY}'s default object not found"))?;
+    let launch = Function::find(class, "LaunchURL")?;
+    let at = launch.parameter("URL", "StrProperty", size_of::<FString>() as i32)?;
+    let string = OwnedFString::new(url);
+    let mut parameters = Parameters::new();
+    // SAFETY: on the game thread; the URL goes in as our string's header at its reflected offset,
+    // which the function only reads (`const FString&`) and ProcessEvent doesn't destroy.
+    unsafe {
+        core::ptr::copy_nonoverlapping(
+            string.as_ptr().cast::<u8>(),
+            parameters.as_mut_ptr().add(at),
+            size_of::<FString>(),
+        );
+        launch.call(defaults, &mut parameters);
+    }
+    Ok(())
+}

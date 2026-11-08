@@ -17,6 +17,11 @@
 //! Whenever the line shows it can be clicked away, even when no point can be placed: a move can
 //! lose the brick it's about (a coop resend replaces every brick), which leaves nothing to snap to
 //! but a line still showing.
+//!
+//! The line's length shows beside its middle, and so does the dashed line's from a first point to
+//! what a click would place: a way to measure ([`super::line_label`]). With one of its points on
+//! the moved bricks, its length can be typed: they slide along it to make it so
+//! ([`super::typed_length`]). Each point remembers the bricks it was placed on for that.
 
 use std::sync::Once;
 
@@ -26,6 +31,7 @@ use super::hinge::Line;
 use super::scene::{Scene, View};
 use super::snap::{self, Snapper};
 use crate::framework::settings::{Alternative, Choice};
+use crate::game::weak_object::WeakObject;
 use crate::prelude::*;
 
 /// How long a line lasts, a setting: the options of [`LineLasts`], in order.
@@ -92,14 +98,16 @@ const FIRST_MARK_PIXELS: f32 = 16.0;
 /// The line, its points, and the line key's clicks.
 pub struct LineTool {
     /// The line's two points (in the vehicle), once both are placed.
-    ends: Option<[Vec3; 2]>,
+    ends: Option<[Point; 2]>,
     /// The first point of the next line, while its second isn't placed.
-    first: Option<Vec3>,
+    first: Option<Point>,
     /// Where the vehicle was when a point was last placed: to show them without bricks gathered.
     vehicle: Option<Frame>,
     /// What a click would place, with the mouse where it is (while that can be done). Made when
     /// first needed: the tool lives in a static, made at compile time.
     snapper: Option<Snapper>,
+    /// The bricks what a click would place is on.
+    shown_on: Vec<WeakObject>,
     /// A press of the line key that may turn out to be a click.
     press: Option<Press>,
     /// Whether the line key was down last frame, and whether a press could place a point then.
@@ -114,11 +122,18 @@ pub struct LineTool {
     took_button: bool,
 }
 
+/// A point of the line (in the vehicle), and the bricks it was placed on.
+#[derive(Clone)]
+struct Point {
+    at: Vec3,
+    on: Vec<WeakObject>,
+}
+
 /// A press of the line key: what it would place (nothing: clear), where the mouse was, how far the
 /// cursor has gone from there at most, and the mouse's movement the engine reported meanwhile (it
 /// may hold the cursor still), all in pixels.
 struct Press {
-    pick: Option<Vec3>,
+    pick: Option<Point>,
     at: Option<[f32; 2]>,
     moved: f32,
     reported: [f32; 2],
@@ -138,6 +153,7 @@ impl LineTool {
             first: None,
             vehicle: None,
             snapper: None,
+            shown_on: Vec::new(),
             press: None,
             held: false,
             ready: false,
@@ -149,8 +165,38 @@ impl LineTool {
 
     /// The line, if both its points are placed.
     pub fn line(&self) -> Option<Line> {
-        let [start, end] = self.ends?;
+        let [start, end] = self.ends()?;
         Line::through(start, end)
+    }
+
+    /// The line's two points, once both are placed.
+    pub fn ends(&self) -> Option<[Vec3; 2]> {
+        let [start, end] = self.ends.as_ref()?;
+        Some([start.at, end.at])
+    }
+
+    /// Which of the line's points is on a brick that's `moving` while the other isn't: the one
+    /// whose distance to the other changes as they move.
+    pub fn moved_end(&self, moving: impl Fn(&WeakObject) -> bool) -> Option<usize> {
+        let ends = self.ends.as_ref()?;
+        let moves = ends.each_ref().map(|end| end.on.iter().any(&moving));
+        match moves {
+            [true, false] => Some(0),
+            [false, true] => Some(1),
+            _ => None,
+        }
+    }
+
+    /// The line's point `index` moved to `to`, with the bricks it's on. Onto the other point, the
+    /// line is gone: it has no direction left.
+    pub fn move_end(&mut self, index: usize, to: Vec3) {
+        let Some(ends) = &mut self.ends else {
+            return;
+        };
+        ends[index].at = to;
+        if geometry::length(geometry::sub(ends[0].at, ends[1].at)) < SAME_POINT {
+            self.ends = None;
+        }
     }
 
     /// Whether there's nothing to show or follow: no line, no first point, no press.
@@ -198,7 +244,11 @@ impl LineTool {
     /// models with `models`), to show it.
     pub fn preview(&mut self, scene: &Scene, view: &View, models: bool) {
         let snapper = self.snapper.get_or_insert_with(Snapper::default);
-        snapper.snap(&snap::snapping(), scene, view, models, |_| false);
+        let snapped = snapper.snap(&snap::snapping(), scene, view, models, |_| false);
+        self.shown_on = snapped.map_or_else(Vec::new, |snapped| {
+            let objects = snapped.on.iter().map(|&(index, _)| scene.get(index).object);
+            objects.collect()
+        });
     }
 
     /// Shows nothing a click would place (it can't be done now).
@@ -206,6 +256,7 @@ impl LineTool {
         if let Some(snapper) = &mut self.snapper {
             snapper.stop();
         }
+        self.shown_on.clear();
     }
 
     /// Follows the line key, `held` or not this frame: a press while a point `can_be_placed`
@@ -227,7 +278,10 @@ impl LineTool {
                 .snapper
                 .as_ref()
                 .and_then(Snapper::snapped)
-                .map(|snapped| snapped.target.point);
+                .map(|snapped| Point {
+                    at: snapped.target.point,
+                    on: self.shown_on.clone(),
+                });
             self.press = Some(Press {
                 pick,
                 at: mouse,
@@ -300,7 +354,7 @@ impl LineTool {
     }
 
     /// Places `pick` (nothing: clears), with the vehicle at `vehicle`.
-    fn place(&mut self, pick: Option<Vec3>, vehicle: Option<Frame>) {
+    fn place(&mut self, pick: Option<Point>, vehicle: Option<Frame>) {
         let Some(point) = pick else {
             self.clear();
             return;
@@ -309,13 +363,13 @@ impl LineTool {
             self.vehicle = vehicle;
         }
         match self.first.take() {
-            Some(first) if geometry::length(geometry::sub(point, first)) < SAME_POINT => {}
+            Some(first) if geometry::length(geometry::sub(point.at, first.at)) < SAME_POINT => {}
             Some(first) => {
+                let length = geometry::length(geometry::sub(point.at, first.at));
                 self.ends = Some([first, point]);
                 LOG_PLACED.call_once(|| {
                     log!(
-                        "line placed: {:.1} cm long (move bricks about it by fast editing them)",
-                        geometry::length(geometry::sub(point, first))
+                        "line placed: {length:.1} cm long (move bricks about it by fast editing them)"
                     )
                 });
             }
@@ -323,10 +377,17 @@ impl LineTool {
         }
     }
 
+    /// The dashed line from a first point to what a click would place, if it shows: its length
+    /// shows like the line's (see [`super::line_label`]).
+    pub fn dashed(&self) -> Option<[Vec3; 2]> {
+        let shown = self.snapper.as_ref().and_then(Snapper::snapped)?;
+        Some([self.first.as_ref()?.at, shown.target.point])
+    }
+
     /// Shows the line and its points, a first point, and what a click would place (with a dashed
     /// line from a first point to it).
     pub fn draw(&self, drawing: &mut Drawing) {
-        if let (Some([start, end]), Some(line)) = (self.ends, self.line()) {
+        if let (Some([start, end]), Some(line)) = (self.ends(), self.line()) {
             let past = geometry::scale(line.direction, SHOWN_PAST);
             drawing.segment(
                 geometry::sub(start, past),
@@ -339,10 +400,10 @@ impl LineTool {
             }
         }
         let shown = self.snapper.as_ref().and_then(Snapper::snapped);
-        if let Some(first) = self.first {
-            drawing.mark(Mark::Circle, first, FIRST_MARK_PIXELS, draw::LINE);
+        if let Some(first) = &self.first {
+            drawing.mark(Mark::Circle, first.at, FIRST_MARK_PIXELS, draw::LINE);
             if let Some(shown) = shown {
-                drawing.dashed(first, shown.target.point, draw::LINE);
+                drawing.dashed(first.at, shown.target.point, draw::LINE);
             }
         }
         if let Some(shown) = shown {

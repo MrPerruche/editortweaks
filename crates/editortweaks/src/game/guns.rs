@@ -14,6 +14,10 @@
 //!   `CollisionProfileName`, and its movement component's template whether it bounces
 //!   (`bShouldBounce`, set by `UBrickProjectileMovementComponent`'s constructor) and how slow a
 //!   bounce stops it (`BounceVelocityStopSimulatingThreshold`).
+//! - Its collision is a sphere (`SphereComponent`, the root) of `GetProjectileRadius()` (BRMK
+//!   0x3257F0, set in `PreRegisterAllComponents`, 0x33F4F0): half the Y size of its mesh's local
+//!   bounds, times `MeshScale`. Its mesh is its `StaticMesh` (the mesh component's, set from it), so
+//!   the radius is that mesh's `GetBounds()` box extent along Y times `MeshScale` ([`Radius`]).
 //! - A brick's connectors are its static info's `Connectors` (`TArray<FConnectorField>`, what
 //!   `UBrick::GetBrickConnectors` returns; scalable bricks make their own instead). The first one
 //!   of a gun is its muzzle (`UBrick::CalcMuzzleTransform`).
@@ -25,7 +29,8 @@ use brickrust::ue::coreuobject::UObjectBase;
 use brickrust::ue::tarray::TArray;
 use brickrust::ue::uclass::{UClass, UStruct};
 
-use crate::game::reflection::{self, BoolField};
+use crate::framework::log::log;
+use crate::game::reflection::{self, BoolField, Getter};
 use crate::math::{self, Quat, Vec3};
 
 /// `FProjectileParams`: what a gun gives its projectiles (ranges in cm, speed in cm/s).
@@ -72,6 +77,9 @@ pub struct ProjectileInfo {
     /// ricochet stops it instead.
     pub bounces: bool,
     pub bounce_stop_speed: f64,
+    /// The radius of its collision sphere (cm), if it can be read: what it sweeps and measures
+    /// what it goes through with.
+    pub radius: Option<f64>,
 }
 
 /// How fast a gun fires, as far as its static info tells (`None`: not reflected, or not a number).
@@ -157,6 +165,53 @@ pub struct Guns {
     max_speed: usize,
     should_bounce: BoolField,
     bounce_stop_speed: usize,
+    /// What its collision sphere's radius is read from, if reflected.
+    radius: Option<Radius>,
+}
+
+/// What a projectile's collision radius is read from: the offsets of `ABrickProjectile::StaticMesh`
+/// and `MeshScale`, `StaticMesh` (the class), and `FBoxSphereBounds UStaticMesh::GetBounds() const`
+/// (origin, box extent, sphere radius).
+struct Radius {
+    mesh: usize,
+    scale: usize,
+    mesh_class: *const UStruct,
+    bounds: Getter<[f32; 7]>,
+}
+
+impl Radius {
+    fn find(projectile: *const UClass) -> Result<Self, String> {
+        let mesh_class =
+            reflection::find_class("StaticMesh").ok_or("class StaticMesh not found")?;
+        Ok(Self {
+            mesh: reflection::field_offset(projectile, "StaticMesh", "ObjectProperty", 8)?,
+            scale: reflection::field_offset(projectile, "MeshScale", "FloatProperty", 4)?,
+            mesh_class: mesh_class.cast(),
+            bounds: Getter::find(mesh_class, "GetBounds", "StructProperty")?,
+        })
+    }
+
+    /// The radius of the collision sphere of a projectile whose default object is `defaults`:
+    /// `GetProjectileRadius()`, 0 without a mesh (the bounds of none are zero).
+    ///
+    /// # Safety
+    /// `defaults` must be a live `ABrickProjectile`. Game thread only.
+    unsafe fn of(&self, defaults: *const u8) -> f64 {
+        // SAFETY: per the contract; the mesh is null or a live object the default object holds,
+        // checked to be a static mesh before its getter is called on it.
+        unsafe {
+            let scale = f64::from(defaults.add(self.scale).cast::<f32>().read_unaligned());
+            let mesh = defaults
+                .add(self.mesh)
+                .cast::<*mut UObjectBase>()
+                .read_unaligned();
+            if mesh.is_null() || !reflection::is_a(mesh, self.mesh_class) {
+                return 0.0;
+            }
+            let [_, _, _, _, extent_y, _, _] = self.bounds.call(mesh);
+            f64::from(extent_y) * scale
+        }
+    }
 }
 
 // SAFETY: reflection records and offsets living as long as the game; only used on the game thread.
@@ -274,6 +329,9 @@ pub fn find() -> Result<Guns, String> {
         max_speed: float(movement_class, "MaxSpeed")?,
         should_bounce: reflection::bool_field(movement_class.cast(), "bShouldBounce")?,
         bounce_stop_speed: float(movement_class, "BounceVelocityStopSimulatingThreshold")?,
+        radius: Radius::find(projectile)
+            .map_err(|reason| log!("projectiles' radius unknown, taken as 0: {reason}"))
+            .ok(),
     })
 }
 
@@ -436,6 +494,11 @@ impl Guns {
                 profile: (profile != [0; 8]).then_some(profile),
                 bounces: movement.is_some_and(|movement| self.should_bounce.get(movement)),
                 bounce_stop_speed: movement_float(self.bounce_stop_speed),
+                radius: self
+                    .radius
+                    .as_ref()
+                    .map(|radius| radius.of(defaults))
+                    .filter(|radius| radius.is_finite() && *radius >= 0.0),
             };
             [
                 found.gravity_scale,
