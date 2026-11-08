@@ -1,4 +1,4 @@
-# FULL FEATURE LIST OF EDITOR TWEAKS 0.1
+# FULL FEATURE LIST OF EDITOR TWEAKS 0.1.1
 
 ## Coop Building
 Host your editor session at any time, and let up to 31 other friends build with you
