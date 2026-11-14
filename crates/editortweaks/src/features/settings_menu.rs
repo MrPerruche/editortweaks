@@ -660,12 +660,15 @@ unsafe extern "C" fn remove_unused_buttons(panel: *mut UObjectBase) {
             }
         }
     }
+    // Other features' buttons for other panels (the vehicle browser's).
+    menu_buttons::run_makers(panel);
     // SAFETY: forwards the caller's argument.
     unsafe {
         timings::game("UMenuButtonPanelWidget::RemoveUnusedButtons", || {
             original(panel)
         })
     };
+    menu_buttons::run_arrangers(panel);
     if let (true, Some(menus)) = (made_page, MENUS.get()) {
         // SAFETY: the menu's live panel, done making buttons, on the game thread.
         unsafe { check_order(menus, panel) };

@@ -291,8 +291,81 @@ impl ButtonGrid {
                     ours.join(", "),
                     buttons.len()
                 ));
-                buttons.copy_from_slice(&wanted);
             }
+            let applied = self.apply(panels, panel, &wanted);
+            wrong.extend(applied.failed);
+            wrong.extend(applied.fixed);
+        }
+        wrong
+    }
+
+    /// Moves `moved` (those of them `panel` shows, in that order) right before `before`, one of
+    /// its buttons, and puts every button in its cell. What couldn't be done, empty if all was;
+    /// nothing moves if `before` isn't shown or a button is shown twice. (The cells moved for the
+    /// new order are expected, not told.)
+    ///
+    /// # Safety
+    /// `panel` must be a live button panel that isn't making buttons now. Game thread only.
+    #[cfg_attr(not(feature = "vehicle-menu"), allow(dead_code))]
+    pub unsafe fn put_before(
+        &self,
+        panels: &ButtonPanels,
+        panel: *mut UObjectBase,
+        moved: &[*mut UObjectBase],
+        before: *mut UObjectBase,
+    ) -> Vec<String> {
+        // SAFETY: per the contract.
+        unsafe {
+            let buttons = panels.buttons(panel);
+            if moved.contains(&before) || !buttons.contains(&before) {
+                return vec!["the button to go before isn't shown".into()];
+            }
+            let moving: Vec<_> = moved
+                .iter()
+                .copied()
+                .filter(|button| buttons.contains(button))
+                .collect();
+            let mut wanted: Vec<_> = buttons
+                .iter()
+                .copied()
+                .filter(|button| !moving.contains(button))
+                .collect();
+            let at = wanted
+                .iter()
+                .position(|&button| button == before)
+                .unwrap_or(0);
+            wanted.splice(at..at, moving);
+            self.apply(panels, panel, &wanted).failed
+        }
+    }
+
+    /// Shows `panel`'s buttons in the order `wanted` (the same buttons, reordered): the panel's
+    /// list, then each button's cell and visibility. What it put back, and what it couldn't.
+    ///
+    /// # Safety
+    /// As for [`Self::put_before`]; `wanted` holds exactly the panel's buttons.
+    unsafe fn apply(
+        &self,
+        panels: &ButtonPanels,
+        panel: *mut UObjectBase,
+        wanted: &[*mut UObjectBase],
+    ) -> Applied {
+        let mut applied = Applied::default();
+        let (fixed, wrong) = (&mut applied.fixed, &mut applied.failed);
+        // SAFETY: per the contract; the buttons are live widgets (the panel holds them), each
+        // field read at its reflected offset, and a widget's slot and its parent are live objects.
+        unsafe {
+            let buttons = panels.buttons_mut(panel);
+            for (at, button) in buttons.iter().enumerate() {
+                if let Some(first) = buttons[..at].iter().position(|other| other == button) {
+                    wrong.push(format!("button {at} is button {first} too"));
+                }
+            }
+            if !wrong.is_empty() || wanted.len() != buttons.len() {
+                wrong.push("the buttons changed".into());
+                return applied;
+            }
+            buttons.copy_from_slice(wanted);
             let grid = field::<*mut UObjectBase>(panel, self.grid);
             let per_row = field::<i32>(panel, self.per_row);
             for (at, &button) in buttons.iter().enumerate() {
@@ -316,7 +389,7 @@ impl ButtonGrid {
                     field::<i32>(slot, self.column),
                 );
                 if shown != (row, column) {
-                    wrong.push(format!(
+                    fixed.push(format!(
                         "button {at} was in row {}, column {}",
                         shown.0, shown.1
                     ));
@@ -324,13 +397,22 @@ impl ButtonGrid {
                     self.set_column.call(slot, column);
                 }
                 if field::<u8>(button, self.visibility) == self.collapsed {
-                    wrong.push(format!("button {at} was hidden"));
+                    fixed.push(format!("button {at} was hidden"));
                     self.set_visibility.call(button, self.visible);
                 }
             }
         }
-        wrong
+        applied
     }
+}
+
+/// What [`ButtonGrid::apply`] did.
+#[derive(Default)]
+struct Applied {
+    /// What it put back (a cell, a hidden button).
+    fixed: Vec<String>,
+    /// What it couldn't (nothing is reordered when the buttons aren't as expected).
+    failed: Vec<String>,
 }
 
 /// The menu functions and fields we use.
@@ -593,7 +675,7 @@ impl WindowManager {
     ///
     /// # Safety
     /// Game thread only.
-    unsafe fn manager(&self) -> Option<*mut UObjectBase> {
+    pub unsafe fn manager(&self) -> Option<*mut UObjectBase> {
         // SAFETY: on the game thread; each object comes from a reflected object property of the
         // one before (the game instance's class checked).
         unsafe {

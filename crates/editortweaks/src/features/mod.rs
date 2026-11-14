@@ -56,6 +56,8 @@ mod spawn_mode;
 mod suspension_arrows;
 mod thruster_size;
 mod update_check;
+#[cfg(feature = "vehicle-menu")]
+mod vehicle_menu;
 mod view_modes;
 
 /// All features, in load order.
@@ -97,6 +99,8 @@ pub static ALL: &[&dyn Feature] = &[
     &editor_menu::EditorMenu,
     &coop::Coop,
     &update_check::UpdateCheck,
+    #[cfg(feature = "vehicle-menu")]
+    &vehicle_menu::VehicleMenu,
 ];
 
 /// Every feature's settings, by section of the menu, in the menu's order (see `settings_menu`).
@@ -105,6 +109,8 @@ pub static SETTINGS: &[&[Section]] = &[
     &brick_resize::SETTINGS,
     &references::SETTINGS,
     &model_export::SETTINGS,
+    #[cfg(feature = "vehicle-menu")]
+    &vehicle_menu::SETTINGS,
     &PREVIEWS,
     &coop::SETTINGS,
     &update_check::SETTINGS,

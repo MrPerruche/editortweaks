@@ -31,6 +31,8 @@ pub const DEFAULT_HIGHLIGHT: [f32; 4] = [0.791, 0.258, 0.03, 1.0];
 pub struct ColorStyleValues {
     pub default: u8,
     pub highlight: u8,
+    #[cfg_attr(not(feature = "vehicle-menu"), allow(dead_code))]
+    pub positive: u8,
     pub negative: u8,
 }
 
@@ -42,6 +44,7 @@ pub fn color_style_values() -> Result<ColorStyleValues, String> {
     Ok(ColorStyleValues {
         default: value("EBrickUIColorStyle::Default")?,
         highlight: value("EBrickUIColorStyle::Highlight")?,
+        positive: value("EBrickUIColorStyle::Positive")?,
         negative: value("EBrickUIColorStyle::Negative")?,
     })
 }

@@ -157,6 +157,7 @@ use crate::game::editor_object::{
 use crate::game::editor_view::{self, Bricks, EditorCode};
 use crate::game::line_batcher::{self, LineBatcher};
 use crate::game::mirror_mode::{self, MirrorMode};
+use crate::game::mirrored_size::MirroredSizes;
 use crate::game::move_mode::{self, Move, MoveMode};
 use crate::game::scalable_brick::BrickSizes;
 use crate::game::spinner::{Spinners, Values};
@@ -282,6 +283,9 @@ struct Game {
     selection: Option<Selection>,
     /// For the counterparts of resized bricks; without it they stay as they are.
     mirror: Option<MirrorMode>,
+    /// The order of a resized brick's size on its counterpart; without it the counterpart gets
+    /// the same order (wrong for bricks mirrored by a quarter turn, like quarter pyramids).
+    mirrored_sizes: Option<MirroredSizes>,
     /// Bricks' models; without them, bricks keep their boxes with the model key held.
     models: Option<BrickModels>,
     /// How the move mode moves bricks; without it (or without the selection, which tells the
@@ -334,6 +338,10 @@ fn engine_init() -> Result<(), String> {
         lines: line_batcher::find()?,
         selection,
         mirror: optional(mirror_mode::find(), "mirrored counterparts won't follow"),
+        mirrored_sizes: optional(
+            MirroredSizes::find(),
+            "counterparts of bricks mirrored by a quarter turn get their size in the wrong order",
+        ),
         models: optional(BrickModels::find(), "bricks keep their boxes on models"),
         moves,
         spinners: optional(
@@ -3531,7 +3539,14 @@ unsafe fn apply(game: &Game, resizing: &mut Resizing, size: Vector, interactive:
         if let (Some((other, axis)), Some(mirror)) = (&resizing.counterpart, &game.mirror)
             && let Some(counterpart) = other.object.get()
         {
-            game.sizes.resize(counterpart, kept, interactive);
+            // A brick mirrored by a quarter turn (a quarter pyramid) has its counterpart's X and
+            // Y sizes swapped.
+            let size = game
+                .mirrored_sizes
+                .as_ref()
+                .and_then(|sizes| sizes.of_counterpart(counterpart, kept))
+                .unwrap_or(kept);
+            game.sizes.resize(counterpart, size, interactive);
             let mirrored =
                 mirror.mirrored_location(object, location, resizing.brick.rotation, *axis);
             game.spawn.set(counterpart, mirrored, other.rotation);

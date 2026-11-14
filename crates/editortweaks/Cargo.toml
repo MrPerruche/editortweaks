@@ -14,6 +14,9 @@ crate-type = ["cdylib"]
 # What only coop testing needs: the local test (two games on one PC) and the
 # Steam self-send probe. `et.py build --coop-test`.
 coop-test = []
+# The vehicle menu's folders and pins, until they are done (`docs/vehicle-menu.md`).
+# `et.py build --vehicle-menu`.
+vehicle-menu = ["dep:vehicle_folders"]
 
 [dependencies]
 brickrust.workspace = true
@@ -23,4 +26,5 @@ model_io = { path = "../model_io" }
 coop = { path = "../coop" }
 release_check = { path = "../release_check" }
 typed_formula = { path = "../typed_formula" }
+vehicle_folders = { path = "../vehicle_folders", optional = true }
 windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Graphics_Gdi", "Win32_Networking_WinHttp", "Win32_System_Com", "Win32_System_Diagnostics_Debug", "Win32_System_LibraryLoader", "Win32_System_Memory", "Win32_System_Threading", "Win32_UI_Controls_Dialogs", "Win32_UI_Input_KeyboardAndMouse", "Win32_UI_WindowsAndMessaging"] }

@@ -45,7 +45,7 @@ pub type LoadAssetLibrariesFn = unsafe extern "C" fn(manager: *mut UObjectBase, 
 ///
 /// ```text
 /// RowStruct->InitializeStruct(Row, 1);            // virtual, slot read at INITIALIZE_STRUCT_SLOT
-/// RowStruct->CopyScriptStruct(Row, &RowData, 1);
+/// RowStruct->CopyScriptStruct(Row, &RowData, 1);  // call read at COPY_SCRIPT_STRUCT_CALL
 /// this->AddRowInternal(RowName, Row);             // virtual, slot read at ADD_ROW_INTERNAL_SLOT
 /// ```
 const ADD_ROW: FunctionSig = FunctionSig {
@@ -505,6 +505,35 @@ fn nested(ustruct: *const UStruct, name: &'static str) -> Result<(usize, *const 
         }
         Ok(((*property).offset_internal as usize, nested))
     }
+}
+
+/// The vtable offset of `UStruct::InitializeStruct` (see [`ADD_ROW`]), for other structs to be
+/// constructed as the game constructs them.
+#[cfg_attr(not(feature = "vehicle-menu"), allow(dead_code))]
+pub fn initialize_struct_slot() -> Result<usize, String> {
+    slots().map(|(initialize, _)| initialize)
+}
+
+/// Where [`ADD_ROW`]'s match calls `UScriptStruct::CopyScriptStruct` (`call rel32`; game RVA
+/// 0x11EBFC0 in build 25831956: `STRUCT_CopyNative` -> the C++ copy, `STRUCT_IsPlainOldData` ->
+/// `memcpy`, else property by property).
+const COPY_SCRIPT_STRUCT_CALL: usize = 43;
+
+/// `void UScriptStruct::CopyScriptStruct(void* Dest, void const* Src, int32 ArrayDim) const`:
+/// copies `count` structs in a row from `source` to `target` (constructed), as the game copies
+/// them.
+pub type CopyScriptStructFn =
+    unsafe extern "C" fn(ustruct: *const UStruct, target: *mut u8, source: *const u8, count: i32);
+
+/// `UScriptStruct::CopyScriptStruct`, called by [`ADD_ROW`].
+#[cfg_attr(not(feature = "vehicle-menu"), allow(dead_code))]
+pub fn copy_script_struct() -> Result<CopyScriptStructFn, String> {
+    let found = ADD_ROW.locate()?;
+    // SAFETY: the call and its 4-byte offset lie within the matched pattern.
+    let function = unsafe { found.call_target(COPY_SCRIPT_STRUCT_CALL) }
+        .ok_or_else(|| format!("{}: no call of CopyScriptStruct", ADD_ROW.name))?;
+    // SAFETY: the function `AddRow` calls as (struct, row, row data, 1), a game function start.
+    Ok(unsafe { core::mem::transmute::<*const u8, CopyScriptStructFn>(function) })
 }
 
 /// The vtable offsets of `InitializeStruct` and `AddRowInternal`, read from [`ADD_ROW`].

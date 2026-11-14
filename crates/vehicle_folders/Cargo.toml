@@ -1,0 +1,13 @@
+[package]
+name = "vehicle_folders"
+description = "Folders and pins of the vehicle browser: the folder tree, its file, the listing of one level (no game code)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+# Pure logic, so `cargo test -p vehicle_folders` runs anywhere. Both are already in the build
+# through `model_io`.
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+toml = "1"

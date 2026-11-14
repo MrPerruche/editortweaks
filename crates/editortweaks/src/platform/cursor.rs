@@ -101,3 +101,18 @@ fn empty_rect() -> RECT {
         bottom: 0,
     }
 }
+
+/// Whether the primary mouse button is down now: the left one, or the right one when the user
+/// swapped them (`GetAsyncKeyState` reads the physical buttons).
+#[cfg_attr(not(feature = "vehicle-menu"), allow(dead_code))]
+pub fn primary_button_down() -> bool {
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
+        GetAsyncKeyState, VK_LBUTTON, VK_RBUTTON,
+    };
+    use windows_sys::Win32::UI::WindowsAndMessaging::{GetSystemMetrics, SM_SWAPBUTTON};
+    // SAFETY: no preconditions.
+    let swapped = unsafe { GetSystemMetrics(SM_SWAPBUTTON) } != 0;
+    let button = if swapped { VK_RBUTTON } else { VK_LBUTTON };
+    // SAFETY: no preconditions. The high bit is set while the button is down.
+    unsafe { GetAsyncKeyState(i32::from(button)) < 0 }
+}

@@ -103,7 +103,7 @@ pub struct Field {
 }
 
 /// `WBP_PagedListHeaderField.UpdateItem`, and where its parameters go.
-struct UpdateItem {
+pub(super) struct UpdateItem {
     function: Function,
     visible: usize,
     text: usize,
@@ -367,25 +367,19 @@ impl ListHeader {
         let Some(widget) = field.widget.get_live() else {
             return;
         };
-        let update = &field.update;
         let color = if negative {
             self.negative_color
         } else {
             self.default_color
         };
-        let mut parameters = Parameters::new();
-        // SAFETY: on the game thread; the box is live and of the class `update` was found on, its
-        // parameters go to their reflected offsets. The text goes in as is: the Blueprint copies
-        // it into its text block, and ProcessEvent doesn't destroy parameters, so it's released
-        // after.
+        // SAFETY: on the game thread; the box is live and of the class `update` was found on.
         unsafe {
-            put(&mut parameters, update.visible, true);
-            put(&mut parameters, update.text, self.texts.text(text));
-            put(&mut parameters, update.color, color);
-            put(&mut parameters, update.text_style, self.text_style);
-            put(&mut parameters, update.brush_style, self.brush_style);
-            update.function.call(widget, &mut parameters);
-            take::<Text>(&parameters, update.text).release();
+            field.update.call(
+                widget,
+                true,
+                self.texts.text(text),
+                [color, self.text_style, self.brush_style],
+            );
         }
     }
 
@@ -434,7 +428,33 @@ impl ListHeader {
 }
 
 impl UpdateItem {
-    fn find(class: *const UClass) -> Result<Self, String> {
+    /// Fills `field` (a box of the class this was found on): shown or collapsed, its text, and
+    /// its styles (`EBrickUIColorStyle`, `EBrickUITextStyle`, `EBrickUIBrushStyle` values).
+    ///
+    /// # Safety
+    /// `field` must be a live box of that class. Game thread only.
+    pub(super) unsafe fn call(
+        &self,
+        field: *mut UObjectBase,
+        visible: bool,
+        text: Text,
+        [color, text_style, brush_style]: [u8; 3],
+    ) {
+        let mut parameters = Parameters::new();
+        // SAFETY: per the contract; each parameter goes to its reflected offset. ProcessEvent
+        // doesn't destroy parameters, and the Blueprint copies the text: released after.
+        unsafe {
+            put(&mut parameters, self.visible, visible);
+            put(&mut parameters, self.text, text);
+            put(&mut parameters, self.color, color);
+            put(&mut parameters, self.text_style, text_style);
+            put(&mut parameters, self.brush_style, brush_style);
+            self.function.call(field, &mut parameters);
+            take::<Text>(&parameters, self.text).release();
+        }
+    }
+
+    pub(super) fn find(class: *const UClass) -> Result<Self, String> {
         let function = Function::find(class, "UpdateItem")?;
         let style = |name| {
             function
@@ -456,7 +476,7 @@ impl UpdateItem {
 ///
 /// # Safety
 /// `object` must be a live object of `class`.
-unsafe fn variable(
+pub(super) unsafe fn variable(
     object: *mut UObjectBase,
     class: *const UStruct,
     name: &'static str,

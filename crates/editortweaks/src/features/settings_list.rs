@@ -170,7 +170,9 @@ fn hook_add_property() -> Result<(), String> {
     }
 }
 
-fn rows() -> Result<&'static Rows, String> {
+/// The game's code for rows, found the first time: for panels other than the settings list that get
+/// rows of ours (e.g. the vehicle menu's).
+pub fn rows() -> Result<&'static Rows, String> {
     ROWS.get_or_init(Rows::find).as_ref().map_err(Clone::clone)
 }
 

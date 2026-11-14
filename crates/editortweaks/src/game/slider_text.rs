@@ -61,6 +61,34 @@ impl FString {
         String::from_utf16_lossy(unsafe { core::slice::from_raw_parts(self.data, len) })
     }
 
+    /// A new string with its characters in the game's allocator (`FMemory`), as the game makes
+    /// them: it can go into the game's structs, which free it like their own. Game thread only.
+    #[cfg_attr(not(feature = "vehicle-menu"), allow(dead_code))]
+    pub fn allocated(text: &str) -> Self {
+        let chars: Vec<u16> = text.encode_utf16().chain([0]).collect();
+        if chars.len() == 1 {
+            // The game's empty string has no characters at all.
+            return Self {
+                data: core::ptr::null(),
+                num: 0,
+                max: 0,
+            };
+        }
+        let num = i32::try_from(chars.len()).expect("a short text");
+        // SAFETY: room for every character is allocated, then filled.
+        let data = unsafe {
+            let data = brickrust::ue::fmalloc::malloc(chars.len() * size_of::<u16>()).cast::<u16>();
+            assert!(!data.is_null(), "out of memory");
+            core::ptr::copy_nonoverlapping(chars.as_ptr(), data, chars.len());
+            data
+        };
+        Self {
+            data,
+            num,
+            max: num,
+        }
+    }
+
     /// Frees the characters of a string the game handed over (allocated with `FMemory`).
     ///
     /// # Safety

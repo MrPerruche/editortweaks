@@ -112,8 +112,11 @@ def cmd_setup(args: argparse.Namespace) -> None:
 
 
 def cargo_features(args: argparse.Namespace) -> list[str]:
-    """The cargo feature arguments for `--coop-test` (coop building itself is in every build)."""
-    return ["--features", "coop-test"] if args.coop_test else []
+    """The cargo feature arguments for `--coop-test` (coop building itself is in every build) and
+    `--vehicle-menu` (the unfinished vehicle menu revamp, `docs/vehicle-menu.md`)."""
+    features = [name for name, on in (("coop-test", args.coop_test),
+                                      ("vehicle-menu", args.vehicle_menu)) if on]
+    return ["--features", ",".join(features)] if features else []
 
 
 def cmd_build(args: argparse.Namespace) -> None:
@@ -269,7 +272,8 @@ def cmd_package(args: argparse.Namespace) -> None:
 
     out_dir = Path(args.out) if args.out else paths.PROJECT_ROOT / ".local" / "packages"
     out_dir.mkdir(parents=True, exist_ok=True)
-    name = f"editortweaks-{version}{'-coop-test' if args.coop_test else ''}-{built:%Y%m%d-%H%M}.zip"
+    variant = ("-coop-test" if args.coop_test else "") + ("-vehicle-menu" if args.vehicle_menu else "")
+    name = f"editortweaks-{version}{variant}-{built:%Y%m%d-%H%M}.zip"
     archive = out_dir / name
     with zipfile.ZipFile(archive, "w", zipfile.ZIP_DEFLATED) as zf:
         for inside, source in files.items():
@@ -560,6 +564,7 @@ def main() -> None:
     p = sub.add_parser("build", help="build the mod DLL")
     p.add_argument("--debug", action="store_true", help="debug profile instead of release")
     p.add_argument("--coop-test", action="store_true", help="with coop's test-only tools (local test, probe)")
+    p.add_argument("--vehicle-menu", action="store_true", help="with the unfinished vehicle menu revamp (folders, pins)")
     p.add_argument("--expires", type=parse_expiry, metavar="WHEN", help=expires_help)
     p.set_defaults(func=cmd_build)
 
@@ -567,6 +572,7 @@ def main() -> None:
     p.add_argument("--debug", action="store_true", help="install the debug build")
     p.add_argument("--no-build", action="store_true", help="install the existing build as-is")
     p.add_argument("--coop-test", action="store_true", help="with coop's test-only tools (local test, probe)")
+    p.add_argument("--vehicle-menu", action="store_true", help="with the unfinished vehicle menu revamp (folders, pins)")
     p.add_argument("--expires", type=parse_expiry, metavar="WHEN", help=expires_help)
     p.set_defaults(func=cmd_install)
 
@@ -575,6 +581,7 @@ def main() -> None:
                    help="also include the brickworks loader (brickworks.dll, xinput1_3.dll) from this game install")
     p.add_argument("--coop-test", action="store_true",
                    help="a tester's zip: coop's test-only tools and COOP-TEST.txt")
+    p.add_argument("--vehicle-menu", action="store_true", help="with the unfinished vehicle menu revamp (folders, pins)")
     p.add_argument("--expires", type=parse_expiry, metavar="WHEN", help=expires_help)
     p.add_argument("--out", help="folder for the zip (default: .local/packages)")
     p.set_defaults(func=cmd_package)

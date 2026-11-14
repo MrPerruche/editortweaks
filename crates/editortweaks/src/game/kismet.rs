@@ -125,6 +125,65 @@ impl Texts {
     }
 }
 
+/// Dates as the game's details show them (a vehicle's Created and Last updated rows): its
+/// `FDateTimeBrickProperty` text is `FText::AsDate(time, EDateTimeStyle::Default, TimeZone "")`
+/// (game 0xE279F0), the call `UKismetTextLibrary::AsTimeZoneDate_DateTime(InDateTime, InTimeZone)`
+/// makes with an empty zone (game 0x262A500): the date in the player's culture, no time. Found
+/// 2026-11-11 in game 1.11.8. Not `AsDate_DateTime`, which passes the invariant time zone.
+#[cfg_attr(not(feature = "vehicle-menu"), allow(dead_code))]
+pub struct Dates {
+    defaults: *mut UObjectBase,
+    as_date: Function,
+    /// Offsets of `InDateTime` (`FDateTime`: ticks), `InTimeZone` (left empty) and the result.
+    date: usize,
+    result: usize,
+    texts: Texts,
+}
+
+// SAFETY: reflection records and a default object living as long as the game; only called on the
+// game thread.
+unsafe impl Send for Dates {}
+unsafe impl Sync for Dates {}
+
+#[cfg_attr(not(feature = "vehicle-menu"), allow(dead_code))]
+impl Dates {
+    /// Finds the function. After engine init.
+    pub fn find() -> Result<Self, String> {
+        let class = reflection::find_class(TEXT_LIBRARY)
+            .ok_or(format!("class {TEXT_LIBRARY} not found"))?;
+        let as_date = Function::find(class, "AsTimeZoneDate_DateTime")?;
+        // Left zeroed: an empty string.
+        as_date.parameter("InTimeZone", "StrProperty", size_of::<FString>() as i32)?;
+        Ok(Self {
+            defaults: reflection::find_object("Default__KismetTextLibrary", TEXT_LIBRARY)
+                .ok_or(format!("{TEXT_LIBRARY}'s default object not found"))?,
+            date: as_date.parameter("InDateTime", "StructProperty", 8)?,
+            result: as_date.parameter("ReturnValue", "TextProperty", size_of::<Text>() as i32)?,
+            as_date,
+            texts: texts()?,
+        })
+    }
+
+    /// The date of `unix_seconds` (UTC, as the game keeps its files' times). Game thread only.
+    pub fn date(&self, unix_seconds: i64) -> String {
+        /// `FDateTime(1970, 1, 1).GetTicks()`, and ticks (100 ns) per second.
+        const UNIX_EPOCH_TICKS: i64 = 621_355_968_000_000_000;
+        const TICKS_PER_SECOND: i64 = 10_000_000;
+        let ticks = unix_seconds
+            .saturating_mul(TICKS_PER_SECOND)
+            .saturating_add(UNIX_EPOCH_TICKS);
+        let mut parameters = Parameters::new();
+        // SAFETY: on the game thread (the contract); the date is an 8-byte `FDateTime` at its
+        // reflected offset, the zone an empty string (zeroed); the result is a new text, ours.
+        unsafe {
+            reflection::put(&mut parameters, self.date, ticks);
+            self.as_date.call(self.defaults, &mut parameters);
+            let text = reflection::take::<Text>(&parameters, self.result);
+            self.texts.string(text)
+        }
+    }
+}
+
 /// A static reflected function taking `const FString& InString` and returning `ReturnValue`.
 struct Conversion {
     /// The library's default object, which static functions are called on.

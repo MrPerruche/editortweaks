@@ -24,6 +24,63 @@ static HOOKED: OnceLock<Result<(), String>> = OnceLock::new();
 static LISTENERS: Mutex<Vec<Listener>> = Mutex::new(Vec::new());
 static INTERCEPTORS: Mutex<Vec<Interceptor>> = Mutex::new(Vec::new());
 
+/// Called with a button panel that made its buttons and is about to pool the rest
+/// (`UMenuButtonPanelWidget::RemoveUnusedButtons`), on the game thread: buttons it adds now stay.
+pub type Maker = fn(*mut UObjectBase);
+
+static MAKERS: Mutex<Vec<Maker>> = Mutex::new(Vec::new());
+
+/// Called with a button panel that just pooled its unused buttons, on the game thread: its buttons
+/// are the ones it shows, e.g. to reorder them.
+pub type Arranger = fn(*mut UObjectBase);
+
+static ARRANGERS: Mutex<Vec<Arranger>> = Mutex::new(Vec::new());
+
+/// Gives `maker` every button panel about to pool its unused buttons (see [`Maker`]). Run from
+/// `settings_menu`'s hook of `RemoveUnusedButtons` (the loader hooks a function only once), so only
+/// while that feature runs.
+#[cfg_attr(not(feature = "vehicle-menu"), allow(dead_code))]
+pub fn before_pooling(maker: Maker) {
+    MAKERS
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .push(maker);
+}
+
+/// Runs the [`Maker`]s for `panel` (see [`before_pooling`]).
+pub fn run_makers(panel: *mut UObjectBase) {
+    // Copied out, so that a maker may register too without a deadlock.
+    let makers = MAKERS
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .clone();
+    for maker in makers {
+        maker(panel);
+    }
+}
+
+/// Gives `arranger` every button panel that just pooled its unused buttons (see [`Arranger`]). Run
+/// from `settings_menu`'s hook, as [`before_pooling`].
+#[cfg_attr(not(feature = "vehicle-menu"), allow(dead_code))]
+pub fn after_pooling(arranger: Arranger) {
+    ARRANGERS
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .push(arranger);
+}
+
+/// Runs the [`Arranger`]s for `panel` (see [`after_pooling`]).
+pub fn run_arrangers(panel: *mut UObjectBase) {
+    // Copied out, as the makers.
+    let arrangers = ARRANGERS
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .clone();
+    for arranger in arrangers {
+        arranger(panel);
+    }
+}
+
 /// Calls `listener` with every menu button clicked from now on (after engine init: the handler is
 /// found through reflection).
 pub fn listen(listener: Listener) -> Result<(), String> {

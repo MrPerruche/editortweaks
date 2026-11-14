@@ -48,3 +48,19 @@ fn class_name(hwnd: HWND) -> String {
     let len = unsafe { GetClassNameW(hwnd, buf.as_mut_ptr(), buf.len() as i32) }.max(0);
     String::from_utf16_lossy(&buf[..len as usize])
 }
+
+/// Whether the window the user works in now (the foreground one) is this process's.
+#[cfg_attr(not(feature = "vehicle-menu"), allow(dead_code))]
+pub fn is_foreground() -> bool {
+    use windows_sys::Win32::UI::WindowsAndMessaging::GetForegroundWindow;
+    // SAFETY: no preconditions.
+    let window = unsafe { GetForegroundWindow() };
+    if window.is_null() {
+        return false;
+    }
+    let mut pid = 0;
+    // SAFETY: a window handle from Windows; `pid` is a valid out pointer.
+    unsafe { GetWindowThreadProcessId(window, &mut pid) };
+    // SAFETY: no preconditions.
+    pid == unsafe { GetCurrentProcessId() }
+}

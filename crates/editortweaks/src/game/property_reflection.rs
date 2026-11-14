@@ -44,6 +44,26 @@ pub enum Value {
     Number(&'static dyn Number),
     /// A color, shown as the game's color picker, like a brick's.
     Color(&'static dyn Color),
+    /// Text in the game's text box (a vehicle's title, the search text), or shown read-only.
+    #[cfg_attr(not(feature = "vehicle-menu"), allow(dead_code))]
+    Text(&'static dyn Editable),
+}
+
+/// Text shown in a text box, typed into unless read-only. Its functions run on the game thread,
+/// whenever a panel lists the row or changes it.
+pub trait Editable: Sync {
+    /// The text shown.
+    fn text(&self) -> String;
+    /// Takes the text typed. The game sends it at every keystroke while typing, then once more
+    /// when it's committed (Enter, or leaving the box), so keep it cheap and don't rebuild the
+    /// panel showing the row. Whether it was taken.
+    fn set_text(&self, text: &str) -> bool;
+    /// The most characters the box takes.
+    fn max_chars(&self) -> usize;
+    /// Whether the text is only shown: the box can't be typed into.
+    fn read_only(&self) -> bool {
+        false
+    }
 }
 
 /// One to three numbers shown as sliders side by side, like a brick's position. Its functions run
@@ -289,6 +309,30 @@ const EDIT_INFO_DESCRIPTION: usize = 0x80;
 const EDIT_INFO_LIST_FLAG: usize = 0xB1;
 const EDIT_INFO_MAX_LIST_ITEMS: usize = 0xB4;
 
+/// Offset of an edit info's read-only byte (the flag above): the typed write helpers refuse to
+/// write (`FBrickPropertyEditInfo::CanModify`, and the text one at its start, game 0xEB3E6F), and a
+/// text box shows its text without taking typing (`WBP_GenericProperty` reads `IsReadOnly`).
+const EDIT_INFO_READ_ONLY: usize = EDIT_INFO_LIST_FLAG;
+
+/// Offsets of an edit info's `TOptional<EOrientation>` (value, then its "set" byte), at its end: set,
+/// it wins over the panel's orientation for that row (`UPropertyContainerWidget::InitializeProperty`,
+/// game 0xEDA8B0). The vehicle browser's details panel is vertical (label above value); the game
+/// sets Horizontal (label left, value right) on a vehicle's Created and Last updated rows
+/// (`FUGCFileInfo`'s reflection, game 0xE8A0A0: `mov word ptr [info + 0xD0], 0x100`). Found
+/// 2026-11-11 in game 1.11.8 (build 26488256).
+const EDIT_INFO_ORIENTATION: usize = 0xD0;
+const EDIT_INFO_ORIENTATION_SET: usize = 0xD1;
+
+/// `EOrientation::Orient_Horizontal`.
+const HORIZONTAL: u8 = 0;
+
+/// `InitializeProperty`'s read of the orientation override (`cmp [info + 0xD1], r14b; je ...;
+/// movzx edi, byte ptr [info + 0xD0]`): matching, the offsets above are still the game's.
+pub const ORIENTATION_READ: FunctionSig = FunctionSig {
+    name: "UPropertyContainerWidget::InitializeProperty orientation read",
+    pattern: "44 38 ?? d1 00 00 00 74 ?? 0f b6 ?? d0 00 00 00",
+};
+
 /// The game's brick property classes ours copy the tables of.
 const BOOL_PROPERTY: VtableSig = VtableSig {
     name: "FBoolBrickProperty vtable",
@@ -307,6 +351,30 @@ const NUMERIC_PROPERTY: VtableSig = VtableSig {
     type_name: "FNumericBrickProperty",
     length: 21,
 };
+/// Text (an `FString` field): only the base's 18 slots, its value read and written as an `FText`
+/// ([`slot::GET_TEXT`], [`slot::SET_TEXT`]). Shown by `UGenericPropertyWidget` (`WBP_GenericProperty`,
+/// a text box), whose `UpdateValue` (game 0xF03280) reads the text through slot 11, checks the type
+/// name, then the type's own fields (see [`TEXT_MAX_CHARS`]). Typing reaches slot 12 through the
+/// text write helper (game 0xEB3E40, a virtual call), as for the game's own rows: no hook needed.
+const TEXT_PROPERTY: VtableSig = VtableSig {
+    name: "FTextBrickProperty vtable",
+    type_name: "FTextBrickProperty",
+    length: 18,
+};
+
+/// Text's "user text" flag reader (game 0xD49590) as it should be in [`slot::IS_USER_TEXT`]: the byte
+/// at +0x1E, so the type's own fields are where brickrust's `FTextBrickProperty` says (max length
+/// +0x18, password +0x1C, multiline +0x1D, user text +0x1E; game 0xE72810, its import, reads the
+/// first and the third). Then a pointer (+0x20) the widget checks for null.
+const TEXT_USER_FLAG: CodeShape = CodeShape {
+    name: "FTextBrickProperty is user text",
+    shape: "0f b6 41 1e c3",
+};
+
+/// Where a text property keeps the most characters its box takes (`int32`), from the start of
+/// [`Property::fields`]. The other fields stay zero: no password, one line, not user text (which
+/// would filter it), no rich text.
+const TEXT_MAX_CHARS: usize = 0x18 - FIELDS;
 
 /// The slots of a brick property's table we replace (brickrust's `FBrickPropertyVTable`, then the
 /// typed functions).
@@ -331,6 +399,21 @@ mod slot {
     pub const ALLOWED: usize = 21;
     /// Numbers: `(this, FNumericBrickPropertyRange* out, container) -> out`, the sliders' ends.
     pub const RANGE: usize = 20;
+    /// `(this, container, FText* out) -> bool`: the value as text (game 0xD47F50 for text).
+    pub const GET_TEXT: usize = 11;
+    /// `(this, container, const FText* value) -> bool`: the value from text (game 0xD6BF00).
+    pub const SET_TEXT: usize = 12;
+    /// `(this) -> bool`: whether it's user text.
+    pub const IS_USER_TEXT: usize = 13;
+    /// `(this, FString* out, container) -> out`: the value exported (copying it); reads the field.
+    pub const EXPORT: usize = 14;
+    /// `(this, container) -> bool`: whether it can be exported.
+    pub const CAN_EXPORT: usize = 15;
+    /// `(this, container, const TCHAR* text) -> bool`: the value imported (pasting it); writes the
+    /// field.
+    pub const IMPORT: usize = 16;
+    /// `(this, const TCHAR* text) -> bool`: whether `text` can be imported.
+    pub const CAN_IMPORT: usize = 17;
 }
 
 /// The float variant's getter (game 0xCE8BE0) as it is in [`slot::GET`]: one float from the
@@ -388,6 +471,12 @@ impl Reflection {
         unsafe { core::slice::from_raw_parts(self.categories.data, count) }
     }
 
+    /// Whether this reflection lists rows to show in a panel, not to save or load them.
+    #[cfg_attr(not(feature = "vehicle-menu"), allow(dead_code))]
+    pub fn lists_rows(&self) -> bool {
+        !self.is_serializing
+    }
+
     /// Whether this reflection lists rows to show in the category `tag` (not to save or load them).
     pub fn shows(&self, tag: &FName) -> bool {
         self.shown_categories().iter().any(|category| {
@@ -426,6 +515,8 @@ pub struct Rows {
     number_table: Option<&'static [*const c_void]>,
     /// `None` if not found or not hooked (logged).
     color_table: Option<&'static [*const c_void]>,
+    /// `None` if not found (logged).
+    text_table: Option<&'static [*const c_void]>,
 }
 
 // SAFETY: code pointers and tables that live for the whole game; only used on the game thread.
@@ -486,6 +577,30 @@ impl Rows {
         let color_table = color::table(&shared)
             .map_err(|reason| log!("no color rows: {reason}"))
             .ok();
+        // Without it, only text rows are missing. Exporting and importing (copy and paste) would
+        // touch the field: an empty text, refused. Only the vehicle menu has text rows (for now):
+        // other builds don't look for the table.
+        let text_table = if !cfg!(feature = "vehicle-menu") {
+            None
+        } else {
+            table(
+                &TEXT_PROPERTY,
+                None,
+                (slot::IS_USER_TEXT, &TEXT_USER_FLAG),
+                &[
+                    (slot::COMPARE_VALUES, compare_strings as *const c_void),
+                    (slot::GET_TEXT, get_text as *const c_void),
+                    (slot::SET_TEXT, set_text as *const c_void),
+                    (slot::EXPORT, export_nothing as *const c_void),
+                    (slot::CAN_EXPORT, refuse as *const c_void),
+                    (slot::IMPORT, refuse_import as *const c_void),
+                    (slot::CAN_IMPORT, refuse as *const c_void),
+                ],
+                &shared,
+            )
+            .map_err(|reason| log!("no text rows: {reason}"))
+            .ok()
+        };
         // SAFETY: the functions found have these signatures (see their declarations).
         unsafe {
             Ok(Self {
@@ -495,6 +610,7 @@ impl Rows {
                 enum_table,
                 number_table,
                 color_table,
+                text_table,
             })
         }
     }
@@ -548,6 +664,7 @@ impl Rows {
             Value::List(_) => self.enum_table,
             Value::Number(_) => self.number_table.ok_or("number rows aren't available")?,
             Value::Color(_) => self.color_table.ok_or("color rows aren't available")?,
+            Value::Text(_) => self.text_table.ok_or("text rows aren't available")?,
         };
         let mut fields = [0; FIELDS_SIZE];
         match value {
@@ -558,6 +675,10 @@ impl Rows {
             Value::Color(color) => {
                 fields[color::ALPHA] = u8::from(color.has_alpha());
                 fields[color::ALPHA_SET] = 1;
+            }
+            Value::Text(text) => {
+                let max = i32::try_from(text.max_chars()).unwrap_or(i32::MAX);
+                fields[TEXT_MAX_CHARS..TEXT_MAX_CHARS + 4].copy_from_slice(&max.to_le_bytes());
             }
             Value::Check(_) | Value::List(_) => {}
         }
@@ -587,6 +708,7 @@ impl Rows {
             description: texts.text(description),
             when: None,
             label: None,
+            side_by_side: false,
         })
     }
 
@@ -631,8 +753,13 @@ impl Rows {
                 return info;
             }
             describe(info, row);
-            if matches!((*row.shared).property.value, Value::List(list) if list.dropdown()) {
-                show_as_dropdown(info);
+            match (*row.shared).property.value {
+                Value::List(list) if list.dropdown() => show_as_dropdown(info),
+                Value::Text(text) if text.read_only() => show_read_only(info),
+                _ => {}
+            }
+            if row.side_by_side {
+                show_side_by_side(info);
             }
             info
         }
@@ -674,6 +801,54 @@ pub unsafe fn show_as_dropdown(info: *mut u8) {
                 log!("a list's edit info isn't as expected: lists show as rows of buttons")
             });
         }
+    }
+}
+
+/// Has the row whose edit info is `info` shown read-only (a text box that can't be typed into).
+/// Only if the byte is still false, as `AddProperty` makes it, so that a game update moving it
+/// can't have us write over another field: the row then takes typing, which its value ignores (see
+/// [`set_text`]), and the log says so once.
+///
+/// # Safety
+/// `info` must be a live edit info, as `AddProperty` returns it. Game thread only.
+unsafe fn show_read_only(info: *mut u8) {
+    static MOVED: Once = Once::new();
+    // SAFETY: per the contract; the edit info (0xD8 bytes) holds a byte at this offset.
+    unsafe {
+        let read_only = info.add(EDIT_INFO_READ_ONLY);
+        if read_only.read() == 0 {
+            read_only.write(1);
+        } else {
+            MOVED.call_once(|| {
+                log!("an edit info's read-only byte isn't as expected: read-only rows take typing")
+            });
+        }
+    }
+}
+
+/// Has the row whose edit info is `info` show its name left of its value, whatever the panel's
+/// orientation, as the game's Created row in the vehicle browser. Only if the game still reads the
+/// override where it did ([`ORIENTATION_READ`]; logged once if not).
+///
+/// # Safety
+/// `info` must be a live edit info, as `AddProperty` returns it. Game thread only.
+unsafe fn show_side_by_side(info: *mut u8) {
+    static CHECKED: OnceLock<bool> = OnceLock::new();
+    let found = *CHECKED.get_or_init(|| match ORIENTATION_READ.locate() {
+        Ok(_) => true,
+        Err(reason) => {
+            log!("rows can't be shown side by side ({reason}): their panel's orientation stays");
+            false
+        }
+    });
+    if !found {
+        return;
+    }
+    // SAFETY: per the contract; the edit info (0xD8 bytes) ends with the optional orientation,
+    // two bytes the game's own reflection writes the same way.
+    unsafe {
+        info.add(EDIT_INFO_ORIENTATION).write(HORIZONTAL);
+        info.add(EDIT_INFO_ORIENTATION_SET).write(1);
     }
 }
 
@@ -734,6 +909,8 @@ pub struct Row {
     when: Option<fn() -> bool>,
     /// Its name made each time it's listed, instead of `name`.
     label: Option<&'static dyn Label>,
+    /// Whether its name shows left of its value whatever the panel's orientation.
+    side_by_side: bool,
 }
 
 impl Row {
@@ -750,6 +927,17 @@ impl Row {
     pub fn labelled(self, label: &'static dyn Label) -> Self {
         Self {
             label: Some(label),
+            ..self
+        }
+    }
+
+    /// The row, its name left of its value even in a vertical panel (the vehicle browser's
+    /// details), like the game's Created row there.
+    // Only the vehicle menu's rows use it (for now).
+    #[cfg_attr(not(feature = "vehicle-menu"), allow(dead_code))]
+    pub fn side_by_side(self) -> Self {
+        Self {
+            side_by_side: true,
             ..self
         }
     }
@@ -982,6 +1170,79 @@ unsafe extern "C" fn choice_items(
             name.release();
         }
     }
+}
+
+unsafe extern "C" fn compare_strings(
+    _this: *const Property,
+    a: *const FString,
+    b: *const FString,
+) -> bool {
+    // SAFETY: the game passes two values of the property's type, live strings.
+    unsafe { (*a).to_string() == (*b).to_string() }
+}
+
+unsafe extern "C" fn get_text(
+    this: *const Property,
+    _container: *const c_void,
+    out: *mut Text,
+) -> bool {
+    // SAFETY: `this` is one of our properties, `out` the caller's live `FText`, which gets a
+    // reference of its own to ours (ours given back after).
+    unsafe {
+        let property = &*this;
+        let Value::Text(editable) = property.value else {
+            return false;
+        };
+        let text = property.texts.text(&editable.text());
+        text.assign_to(out);
+        text.release();
+    }
+    true
+}
+
+unsafe extern "C" fn set_text(
+    this: *const Property,
+    _container: *const c_void,
+    value: *const Text,
+) -> bool {
+    // SAFETY: `this` is one of our properties.
+    let property = unsafe { &*this };
+    let Value::Text(editable) = property.value else {
+        return false;
+    };
+    if editable.read_only() || value.is_null() {
+        return false;
+    }
+    // SAFETY: the game passes its live text; the copy is a reference of ours, given up by `string`.
+    let typed = unsafe { property.texts.string(Text::copy_of(value)) };
+    if !editable.set_text(&typed) {
+        return false;
+    }
+    (property.changed)();
+    true
+}
+
+unsafe extern "C" fn export_nothing(
+    _this: *const Property,
+    out: *mut FString,
+    _container: *const c_void,
+) -> *mut FString {
+    // SAFETY: the caller passes room for the result string, which it then owns: the game's empty
+    // string has no characters to free.
+    unsafe { out.write(FString::allocated("")) };
+    out
+}
+
+unsafe extern "C" fn refuse(_this: *const Property, _argument: *const c_void) -> bool {
+    false
+}
+
+unsafe extern "C" fn refuse_import(
+    _this: *const Property,
+    _container: *const c_void,
+    _text: *const u16,
+) -> bool {
+    false
 }
 
 unsafe extern "C" fn compare_numbers(

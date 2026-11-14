@@ -986,6 +986,46 @@ impl Function {
         }
     }
 
+    /// Checks that the function's parameters are, in order, properties of `kinds` (e.g. before
+    /// calling it with all of them zero).
+    #[cfg_attr(not(feature = "vehicle-menu"), allow(dead_code))]
+    pub fn parameter_kinds(&self, kinds: &[&'static str]) -> Result<(), String> {
+        // SAFETY: a live function record; its property records live as long as it.
+        unsafe {
+            let found: Vec<*const FProperty> = properties(self.function.cast()).collect();
+            let fits = found.len() == kinds.len()
+                && found
+                    .iter()
+                    .zip(kinds)
+                    .all(|(&parameter, kind)| is_kind(parameter, kind));
+            if fits {
+                return Ok(());
+            }
+            let names: Vec<String> = found
+                .iter()
+                .map(|&parameter| name_text(&(*parameter).field.name_private))
+                .collect();
+            Err(format!(
+                "{}: expected parameters of {kinds:?}, it has [{}]",
+                self.name,
+                names.join(", ")
+            ))
+        }
+    }
+
+    /// The offsets of the function's parameters, checked to be, in order, properties of `kinds`.
+    /// For a function whose parameter names are unknown.
+    #[cfg_attr(not(feature = "vehicle-menu"), allow(dead_code))]
+    pub fn parameter_offsets(&self, kinds: &[&'static str]) -> Result<Vec<usize>, String> {
+        self.parameter_kinds(kinds)?;
+        // SAFETY: a live function record; its property records live as long as it.
+        Ok(unsafe {
+            properties(self.function.cast())
+                .map(|parameter| (*parameter).offset_internal as usize)
+                .collect()
+        })
+    }
+
     /// Calls the function on `object` with `parameters`, which receives the return value and out
     /// parameters.
     ///
